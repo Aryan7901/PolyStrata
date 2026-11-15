@@ -491,6 +491,14 @@ before it installs a model.
   free pool (an RX 7600 showed 48 MiB free after releasing 1 GiB, [#13](https://github.com/VecSzn/PolyStrata/issues/13)), so a long prompt was refused
   with "no VRAM for the attention cache". With the caches whole, 32K of context fits on 8 GB beside 4,592 of
   Qwen3.6's 10,496 experts (4.4 GiB).
+- On Linux a card whose BAR does not cover its VRAM (a PC without Resizable BAR; the kernel log says
+  `Detected VRAM RAM=8176M, BAR=256M`) cannot use a mapping the moment ROCm returns from making it: amdgpu writes the
+  page tables with GPU jobs there, and ROCm's map does not wait for them. The engine faulted when the expert cache
+  grew after the first request (`Memory Fault Error ... kernel: __amd_rocclr_fillBufferAligned`, then `an illegal
+  memory access was encountered` from every request), in every start on two RX 5700 XT with the default reserve.
+  The engine now waits after it maps a piece (`Engine::vmm_settle()`: an ordinary allocation, which the kernel does
+  wait for). `STRATA_VMM_SETTLE=0` leaves the wait out. An engine from before that runs there with
+  `--vram-reserve-mib 512`, which keeps the cache from growing.
 - Opt-in `--vram-pool` (strata-poly, one card, VMM): the engine claims the card's VRAM once at load, as 2 MiB
   handles, and keeps it for the whole run. The attention caches and the expert cache trade handles of that pool as the
   context grows and shrinks, and nothing is released to the card, so the "released VRAM never returns" above does not
