@@ -2038,6 +2038,23 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     endif()
     set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
   endif()
+  # Navi 12 / Navi 14 (gfx1011, gfx1012) have the signed dot4 that llama.cpp's ggml_cuda_dp4a leaves to RDNA1's SDWA
+  # sequence (its vendors/hip.h counts gfx1012 as RDNA1); include/strata/hip_compat/intrinsics.hpp has the
+  # measurement.  A HIP build for either has the checkout's common.cuh take __builtin_amdgcn_sdot4 there as well: the
+  # same products.  The checkout is downloaded, not part of this tree, so it is patched here, once, by its exact line;
+  # STRATA_GFX1012_SDWA_DOT=ON (cmake/hip_backend.cmake) leaves it as it is.
+  if(STRATA_ENABLE_HIP AND CMAKE_HIP_ARCHITECTURES MATCHES "gfx101[12]" AND NOT STRATA_GFX1012_SDWA_DOT)
+    set(_strata_cc ${_strata_mmq}/common.cuh)
+    file(READ ${_strata_cc} _strata_cc_text)
+    set(_strata_cc_old "#if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)\n    c = __builtin_amdgcn_sdot4")
+    set(_strata_cc_new "#if defined(CDNA) || defined(RDNA2) || defined(__gfx906__) || defined(__gfx1011__) || defined(__gfx1012__)\n    c = __builtin_amdgcn_sdot4")
+    string(FIND "${_strata_cc_text}" "${_strata_cc_old}" _strata_cc_at)
+    if(_strata_cc_at GREATER -1)
+      string(REPLACE "${_strata_cc_old}" "${_strata_cc_new}" _strata_cc_text "${_strata_cc_text}")
+      file(WRITE ${_strata_cc} "${_strata_cc_text}")
+      message(STATUS "gfx1011/gfx1012: ${_strata_cc}'s ggml_cuda_dp4a takes the signed dot4")
+    endif()
+  endif()
   set(_strata_poly_mmq_instances "")
   foreach(_t q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k iq1_s iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl
              iq4_xs)
