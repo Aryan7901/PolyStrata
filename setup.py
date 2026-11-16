@@ -6802,13 +6802,15 @@ def poly_tail_skip(cfg: dict, cfg_path: Path | None = None) -> None:
 def poly_kv_whole(cfg: dict, cfg_path: Path | None = None) -> None:
     """A config of strata-poly on an AMD card gets --kv-whole: ROCm keeps the VRAM that cuMemUnmap() and
     cuMemRelease() gave back (issue #13), so the attention caches take theirs at load instead of as the
-    conversation grows, where the expert cache's VRAM would be lost to them.  A config that has it keeps it."""
+    conversation grows, where the expert cache's VRAM would be lost to them.  A config that has it keeps it.  A config
+    with --vram-pool is left as it is: the pool keeps the card's VRAM for the whole run and moves it between the caches,
+    so nothing is given back to ROCm, and --kv-whole would take the whole context's VRAM from the experts at load."""
     a = cfg["args"]
     try:
         meta = json.loads((Path(cfg["exe"]).parent / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    if meta.get("backend") != "hip" or "--kv-whole" in a:
+    if meta.get("backend") != "hip" or "--kv-whole" in a or "--vram-pool" in a:
         return
     a.append("--kv-whole")
     ok("AMD card: --kv-whole, the attention caches take their VRAM at load (ROCm keeps what the expert cache gives "
