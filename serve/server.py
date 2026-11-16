@@ -3707,7 +3707,7 @@ class Service:
             for e in self.models():
                 if e["current"] or e["status"] == "unavailable":
                     continue
-                other = {"id": e["id"], "object": "model",
+                other = {"id": e["id"], "object": "model", "source": "preset",   # llama-server's router: loads on use
                          "status": {"value": "loading" if e["status"] == "loading" else "unloaded"},
                          **({"meta": {"n_ctx": e["context"]}} if e["context"] else {}),
                          "architecture": {"input_modalities": ["text", "image"] if e["multimodal"] else ["text"],
