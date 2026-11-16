@@ -2733,9 +2733,9 @@ void Engine::load(const Options& o) {
         vmm_ = cuMemGetAllocationGranularity(&grain_, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM) == CUDA_SUCCESS &&
                grain_ > 0;
     }
-    pool_on_ = opt_.vram_pool && vmm_ && opt_.kv_grow && !split_;
+    pool_on_ = opt_.vram_pool && vmm_ && opt_.kv_grow;
     if (opt_.vram_pool && !pool_on_)
-        std::fprintf(stderr, "strata-poly: --vram-pool needs VMM, growing attention caches and one card: off\n");
+        std::fprintf(stderr, "strata-poly: --vram-pool needs VMM and growing attention caches: off\n");
     if (pool_on_) pg_ = up_to(size_t(2) << 20, grain_);
 
     // the token table stays in the file, a row a token, and embed() reads a row in whatever type it has
