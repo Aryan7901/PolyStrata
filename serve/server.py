@@ -829,8 +829,11 @@ class StrataEngine:
 
     @property
     def disk_sessions(self) -> bool:
-        """SAVE / RESTORE: the Strata project's engine has them, strata-poly does not (issue 114)."""
-        return Path(str(self.spawn[0])).stem.lower() not in ("strata-poly", "strata-glm")
+        """SAVE / RESTORE: the Strata project's engine has them.  strata-poly says so in its INFO line (sessions=1);
+        one from before that, and strata-glm, answer them with a refusal (issue 114)."""
+        if Path(str(self.spawn[0])).stem.lower() not in ("strata-poly", "strata-glm"):
+            return True
+        return bool((self.info or {}).get("sessions"))
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
@@ -3712,7 +3715,9 @@ class Service:
                 # under the FIFO: a model switch replaces the engine there (issue 114: strata-poly got the command and
                 # its reply made the server end it)
                 if not getattr(self.engine, "disk_sessions", True):
-                    return error(501, "slot save/restore is not available with strata-poly, this model's engine")
+                    return error(501, "slot save/restore is not available with this model's engine "
+                                      f"({Path(str(self.engine.spawn[0])).stem}); strata-poly has it after "
+                                      "0.1.45-poly.9")
                 with self.status_lock:
                     self.status.update(busy=True, phase="saving the session" if action == "save"
                                        else "restoring a session", started=time.time(), first_token=None,

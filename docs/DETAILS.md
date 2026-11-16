@@ -1419,6 +1419,30 @@ more than 16 MiB apart. A symbolic link, a second hard link and a file with one 
 `--rope-freq-base` refused the file and then answered; a save with a RAM floor above the machine's RAM was refused as
 `memory` before any copy, the file it would have replaced untouched. The times are single runs.
 
+**strata-poly's session files.** strata-poly takes the same two requests and answers them in the same lines, with a
+file format of its own (the two engines do not read each other's files). A file holds the conversation in the engine
+as it stands: its tokens, its last two checkpoints (where its last turn began and the end of its prompt) with the
+state at its end as a third, and every token's rows in the attention caches. An edit before those checkpoints is read
+from the start after a restore. The rows go from the card to the file, and back, 16 MiB at a time, so a save or a
+restore holds no copy of the conversation in RAM; a restore holds the three states. A file is bound to the engine
+version, to the model's files (each one's size and its first and last MiB), to `--kv` and to the sizes of a row and of
+a state; the file ends in a hash of its bytes. A restore reads the file once: a file of another model or engine is
+refused before anything changes, and one whose hash fails at its end leaves the engine with no conversation, so the
+next request reads its prompt from the start. The conversation that was in the engine is parked first when the
+conversation cache has room for it. A save writes `NAME.part` beside the file and renames it; it does not flush the
+file to the disk, so a file cut short by a power loss fails its hash. It leaves 4096 MiB of the disk free (`507`
+otherwise). Not with `--batch` (the config's `"parallel"`). The server asks an engine for sessions only when its `INFO`
+line says `sessions=1`, so a strata-poly from before this answers `501`.
+
+Measured on an RTX PRO 6000 that other jobs were using, the engine held to 8.9 GB of it (4,127 of the 10,240 routed
+experts in VRAM, the split frozen with `STRATA_FREEZE_EXPERTS=1`), Qwen3.6 UD-Q3_K_M, NVMe, Linux, two runs: a
+conversation of 24,063 tokens is a file of 659 MiB (20 KiB a token and three states of 63 MiB), saved in 0.56 s and
+restored in the same engine in 0.33 s. A new engine process restored it in 1.5 s with the file out of the page cache
+and in 0.32 s with the file in it, where reading the prompt from its start took 2.8-2.9 s. For 8,063 tokens: 346 MiB,
+0.29-0.30 s, 0.22-0.25 s, 0.8 s, 0.22-0.24 s, and 1.3 s to read. In both engines the next turn went on from the file's
+last token and wrote the 64 tokens the first engine wrote without a restore. After a file with one bit changed was
+refused, the engine wrote what a new engine writes for the same prompt.
+
 **Current limits (v1):** one request at a time unless `"parallel": N` is set (opt-in batch slots, up to N requests
 decoded together: [BATCHING.md](BATCHING.md)), and one conversation cached at a time (switching between two chats
 re-reads the other one unless the opt-in cache above is enabled, or each conversation keeps its own batch slot); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /

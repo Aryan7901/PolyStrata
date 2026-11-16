@@ -8,6 +8,7 @@
 #include "conversations.hpp"
 #include "engine.hpp"
 #include "guesses.hpp"
+#include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -21,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -76,6 +79,12 @@ constexpr int kCopyMatch = 8;
 // the time the piece took.  A piece is a call (max_rows()) while slots write, so that they are not held up long,
 // and this many calls while none does, as Strata's engine reads its chunks.
 constexpr int kPiece = 8;
+
+// A session file (SAVE, RESTORE) starts with this, moves its rows this many bytes at a time, each followed by a
+// SESSION line, and a SAVE leaves this much of its disk free, the default of the other engine's.
+constexpr char kSessionMagic[8] = {'P', 'O', 'L', 'Y', 'S', 'E', 'S', '1'};
+constexpr size_t kSessionPiece = 16u << 20;
+constexpr uint64_t kSessionFreeMib = 4096;
 
 struct Sampling {
     float temperature = 0.f;   // 0: the most likely token
@@ -612,13 +621,178 @@ struct Slot {
     Clock::time_point t0;
 };
 
+// What a session file is bound to: this engine version, the model's files (each one's size, first and last MiB,
+// read from where the engine has them mapped) and what decides the bytes of a row and of a state.  A change in
+// the middle of a model file that keeps its size is not seen.
+uint64_t session_binds(const Engine& engine) {
+    strata::core::SessionIdentityBuilder b(0x504f4c5953455353ull);
+    b.str("engine", STRATA_VERSION);
+    for (const auto& [data, size] : engine.model_views()) {
+        const size_t edge = std::min<size_t>(size, 1u << 20);
+        b.u64("size", size);
+        b.bytes("head", data, edge);
+        b.bytes("tail", data + (size - edge), edge);
+    }
+    b.i64("kv", engine.kv_format());
+    b.u64("row", engine.row_bytes());
+    b.u64("state", engine.state_bytes());
+    return b.digest();
+}
+
+// SAVE <path> | RESTORE <path> between requests, answered as the Strata project's engine answers them
+// (docs/DETAILS.md, Session files): SAVED / RESTORED <tokens> <bytes> <ms>, SESSION <done> <total> on the way, and
+// SERR <invalid|storage|memory|io> 0 <reason> for a file that is refused or fails, after which the engine goes on.
+// The file: kSessionMagic, what it is bound to (session_binds()), Conversations::save()'s bytes, and a hash of all
+// that.  It is written beside its name and renamed.  It is not flushed to the disk: a file that a power loss cut
+// short fails its hash and is refused.  False: the engine cannot go on, and FATAL was answered.
+bool session_file(Session& ss, bool save, const std::string& name, bool batch) {
+    namespace fs = std::filesystem;
+    using strata::core::SessionError;
+    using Restored = Conversations<Engine>::Restored;
+    Engine& engine = ss.engine;
+    const Clock::time_point t0 = Clock::now();
+    const auto refuse = [&](SessionError kind, std::string why) {
+        for (char& c : why)
+            if (c == '\n' || c == '\r') c = ' ';
+        std::fprintf(stderr, "strata-poly: session %s %s: %s\n", save ? "save" : "restore", name.c_str(), why.c_str());
+        std::printf("SERR %s 0 %s\n", strata::core::session_error_name(kind), why.c_str());
+        std::fflush(stdout);
+        return true;
+    };
+    if (name.empty()) return refuse(SessionError::invalid, "missing path");
+    if (batch) return refuse(SessionError::invalid, "session files do not support --batch (parallel requests)");
+    const uint64_t binds = session_binds(engine);
+    std::u8string utf8(name.size(), u8'\0');
+    std::memcpy(utf8.data(), name.data(), name.size());
+    const fs::path path(utf8);
+    const uint64_t frame = sizeof kSessionMagic + 8 + 8;   // around save()'s bytes: the magic, the binding, the hash
+    std::error_code ec;
+    strata::core::SessionHasher hash;
+    uint64_t done = 0, said = 0, total = 0;
+    const auto moved = [&] {
+        std::printf("SESSION %llu %llu\n", (unsigned long long) (said = done), (unsigned long long) total);
+        std::fflush(stdout);
+    };
+
+    if (save) {
+        const uint64_t body = ss.kept.save_bytes();
+        if (body == 0 || engine.pos() != (int64_t) ss.kept.seq().size())
+            return refuse(SessionError::invalid, "no complete conversation to save");
+        total = frame + body;
+        const fs::path dir = path.has_parent_path() ? path.parent_path() : fs::path(".");
+        const fs::space_info room = fs::space(dir, ec);
+        if (ec) return refuse(SessionError::io, "the folder of the file: " + ec.message());
+        if (room.available < total + (kSessionFreeMib << 20))
+            return refuse(SessionError::storage,
+                          "the file takes " + std::to_string(total >> 20) + " MiB and has to leave " +
+                              std::to_string(kSessionFreeMib) + " MiB free; the disk has " +
+                              std::to_string(room.available >> 20) + " MiB");
+        fs::path part = path;
+        part += ".part";
+        std::ofstream out(part, std::ios::binary | std::ios::trunc);
+        // a conversation is its owner's to read, as the other engine's session files are (mode 0600)
+        fs::permissions(part, fs::perms::owner_read | fs::perms::owner_write, ec);
+        const auto put = [&](const void* p, size_t n) {
+            out.write((const char*) p, (std::streamsize) n);
+            hash.update(p, n);
+            done += n;
+            if (done - said >= kSessionPiece) moved();
+            return out.good();
+        };
+        std::string why;
+        bool ok = out.is_open() && put(kSessionMagic, sizeof kSessionMagic) && put(&binds, 8), no_memory = false;
+        try {
+            if (ok && !ss.kept.save(kSessionPiece, put)) ok = false, no_memory = out.good();
+        } catch (const std::exception& e) {
+            ok = false;
+            why = e.what();
+        }
+        const uint64_t h = hash.digest();
+        if (ok) out.write((const char*) &h, 8);
+        out.close();
+        ok = ok && !out.fail();
+        if (ok) {
+            fs::rename(part, path, ec);
+            if (ec) ok = false, why = ec.message();
+        }
+        if (!ok) {
+            fs::remove(part, ec);
+            if (no_memory) return refuse(SessionError::memory, "no memory to move the conversation's rows");
+            const fs::space_info left = fs::space(dir, ec);
+            return refuse(!ec && left.available < total ? SessionError::storage : SessionError::io,
+                          why.empty() ? "the file cannot be written" : why);
+        }
+        done = total;
+        moved();
+        std::fprintf(stderr, "strata-poly: session saved: %zu tokens, %llu MiB in %.0f ms\n", ss.kept.seq().size(),
+                     (unsigned long long) (total >> 20), ms_since(t0));
+        std::printf("SAVED %zu %llu %.1f\n", ss.kept.seq().size(), (unsigned long long) total, ms_since(t0));
+        std::fflush(stdout);
+        return true;
+    }
+
+    total = fs::file_size(path, ec);
+    if (ec) return refuse(SessionError::io, "the file cannot be read: " + ec.message());
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return refuse(SessionError::io, "the file cannot be opened");
+    const auto get = [&](void* p, size_t n) {
+        in.read((char*) p, (std::streamsize) n);
+        if ((size_t) in.gcount() != n) return false;
+        hash.update(p, n);
+        done += n;
+        if (done - said >= kSessionPiece) moved();
+        return true;
+    };
+    char magic[sizeof kSessionMagic];
+    uint64_t bound = 0, want = 0;
+    if (total < frame || !get(magic, sizeof magic) || std::memcmp(magic, kSessionMagic, sizeof magic) != 0)
+        return refuse(SessionError::invalid, "not a strata-poly session file");
+    if (!get(&bound, 8) || bound != binds)
+        return refuse(SessionError::invalid, "the file was saved with another model, engine version or --kv");
+    Restored r = Restored::other;
+    try {
+        r = ss.kept.restore(total - frame, engine.max_context(), kSessionPiece, get);
+        if (r == Restored::ok) {
+            in.read((char*) &want, 8);
+            if (in.gcount() != 8 || want != hash.digest()) {
+                ss.kept.drop();
+                engine.reset();
+                r = Restored::cut;
+            }
+        }
+    } catch (const std::exception& e) {
+        // the engine's state is unknown now, as after a request that failed
+        ss.kept.drop();
+        try {
+            engine.reset();
+        } catch (const std::exception& again) {
+            std::printf("FATAL %s\n", again.what());
+            std::fflush(stdout);
+            return false;
+        }
+        return refuse(SessionError::io, std::string(e.what()) + "; the engine holds no conversation now");
+    }
+    if (r == Restored::other)
+        return refuse(SessionError::invalid, "the file is not a whole session of this model within --max-context");
+    if (r == Restored::memory) return refuse(SessionError::memory, "no memory for the session's checkpoints");
+    if (r == Restored::cut)
+        return refuse(SessionError::invalid, "the file is damaged; the engine holds no conversation now");
+    done = total;
+    moved();
+    std::fprintf(stderr, "strata-poly: session restored: %zu tokens, %llu MiB in %.0f ms\n", ss.kept.seq().size(),
+                 (unsigned long long) (total >> 20), ms_since(t0));
+    std::printf("RESTORED %zu %llu %.1f\n", ss.kept.seq().size(), (unsigned long long) total, ms_since(t0));
+    std::fflush(stdout);
+    return true;
+}
+
 int serve(Session& ss) {
     Engine& engine = ss.engine;
     std::vector<Slot> slots((size_t) engine.sequences() - 1);
     engine.trim();
     std::printf("INFO context=%d expert_slots=%d expert_cache_mib=%lld pool_workers=%d conversation_cache_mib=%lld "
                 "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_free_mib=%lld vram_elastic=1 "
-                "batch_slots=%d engine=" STRATA_VERSION "\n",
+                "batch_slots=%d sessions=1 engine=" STRATA_VERSION "\n",
                 engine.max_context(), engine.cached_experts(), (long long) (engine.cached_gib() * 1024.0),
                 engine.threads(), (long long) ss.flags.o.park_mib, ss.flags.o.park_slots, ss.flags.min_free_mib,
                 (long long) engine.vram_free_mib(), (int) slots.size());
@@ -843,11 +1017,11 @@ int serve(Session& ss) {
             std::fflush(stdout);
             continue;
         }
-        // Disk sessions are the Strata engine's.  Refused in the session protocol's own words: a bare ERR is a
-        // reply out of step there, and the server ended this engine for it (issue 114).
+        // A refusal is in the session protocol's own words: a bare ERR is a reply out of step there, and the server
+        // ended this engine for it (issue 114).
         if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
-            std::printf("SERR invalid 0 strata-poly keeps no disk sessions\n");
-            std::fflush(stdout);
+            const bool save = line[0] == 'S';
+            if (!session_file(ss, save, line.substr(save ? 5 : 8), !slots.empty())) return 1;
             continue;
         }
         if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {

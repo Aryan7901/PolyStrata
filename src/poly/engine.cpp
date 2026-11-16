@@ -1466,6 +1466,10 @@ float* Engine::fbuf(size_t n) {
     return p;
 }
 
+std::vector<std::pair<const uint8_t*, size_t>> Engine::model_views() const {
+    return gg_ ? gg_->views() : std::vector<std::pair<const uint8_t*, size_t>>{};
+}
+
 int64_t Engine::meta_u(const char* key, int64_t fallback) const {
     const MetaValue* v = gg_ ? gg_->get(key) : nullptr;
     return v && v->is_num() ? (int64_t) v->u : fallback;

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <functional>
 #include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -186,6 +187,115 @@ public:
         s.stamp = ++clock_;
     }
 
+    // A session file's part of the conversation in the engine, to come back to in another run of the engine
+    // (SAVE and RESTORE in main.cpp, which bind the file to the model and hash it).  The bytes, in order: a Saved,
+    // the tokens, each checkpoint's position and state with the state at the conversation's end as the last,
+    // then the rows in pieces of Saved::piece_rows rows, each as the engine's save_rows() writes it.
+    //
+    // Of the conversation's checkpoints a file has the last two: where its last turn began and the end of its
+    // prompt, which is where its next turn goes on from when not from its end.  A state is 63 MiB of Qwen3.6's,
+    // and with all of them the file of a 24K conversation was half states.  An edit before those two is read
+    // from the start after a restore.
+    struct Saved {
+        uint64_t row_bytes, state_bytes, tokens, prompt, marks, piece_rows;
+    };
+    /// What save() writes for the conversation as it stands; 0: the engine holds none.
+    uint64_t save_bytes() const {
+        const Slot& s = cur();
+        const uint64_t n = (uint64_t) len(s);
+        return n == 0 ? 0 : sizeof(Saved) + n * 4 + marks_saved(s) * (8 + e_.state_bytes()) + n * e_.row_bytes();
+    }
+    /// put(data, bytes) gets save_bytes() bytes, the rows in pieces of `piece` bytes at most, and returns false
+    /// to stop.  The engine must be at the conversation's end.  The conversation stays as it is.  False: put
+    /// stopped, or there was no memory for a piece.
+    template<class Put>
+    bool save(size_t piece, Put&& put) {
+        const Slot& s = cur();
+        const int64_t n = len(s);
+        const size_t row = e_.row_bytes(), state = e_.state_bytes();
+        const int64_t per = std::max<int64_t>((int64_t) (piece / std::max<size_t>(row, 1)), 1);
+        const Saved head{row, state, (uint64_t) n, (uint64_t) s.prompt, marks_saved(s), (uint64_t) per};
+        const std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[std::max((size_t) per * row, state)]);
+        if (n < 1 || !buf || !put(&head, sizeof head) || !put(s.seq.data(), (size_t) n * 4)) return false;
+        for (size_t k = first_saved(s); k < s.marks.size(); ++k) {
+            const Checkpoint& m = s.marks[k];
+            if (!m.state->data() || !put(&m.pos, 8) || !put(m.state->data(), state)) return false;
+        }
+        if (!at_end(s)) {
+            e_.save_state(buf.get());
+            if (!put(&n, 8) || !put(buf.get(), state)) return false;
+        }
+        for (int64_t first = 0; first < n; first += per) {
+            const int64_t m = std::min(per, n - first);
+            e_.save_rows(first, m, buf.get());
+            if (!put(buf.get(), (size_t) m * row)) return false;
+        }
+        return true;
+    }
+
+    enum class Restored {
+        ok,
+        other,    ///< not what save() writes for this engine and `bytes`, or longer than `most` tokens; nothing changed
+        memory,   ///< no memory for it; nothing changed
+        cut,      ///< get() ended inside the rows: the engine holds no conversation now
+    };
+    /// What save() wrote, `bytes` of it from get(data, bytes), becomes the conversation in the engine, with its
+    /// checkpoints.  The one that was there is parked if it can be.  The caller that then finds the bytes were
+    /// not the saved ones (a hash) calls drop() and resets the engine.
+    template<class Get>
+    Restored restore(uint64_t bytes, int64_t most, size_t piece, Get&& get) {
+        const size_t row = e_.row_bytes(), state = e_.state_bytes();
+        Saved head;
+        if (bytes < sizeof head || !get(&head, sizeof head) || head.row_bytes != row || head.state_bytes != state ||
+            head.tokens == 0 || head.tokens > (uint64_t) most || head.prompt > head.tokens || head.marks == 0 ||
+            head.marks > 64 || head.piece_rows == 0 ||
+            head.piece_rows > std::max<uint64_t>(piece / std::max<size_t>(row, 1), 1) ||
+            bytes != sizeof head + head.tokens * 4 + head.marks * (8 + state) + head.tokens * row)
+            return Restored::other;
+        const int64_t n = (int64_t) head.tokens, per = (int64_t) head.piece_rows;
+        // The checkpoints are taken as a request's are (mark()), without asking CacheOptions::admit: that is for
+        // what parking adds.  On a PC whose RAM the model fills, the question refused every restore.
+        Slot in;
+        const std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[(size_t) per * row]);
+        try {
+            in.seq.resize((size_t) n);
+        } catch (const std::bad_alloc&) {
+            return Restored::memory;
+        }
+        if (!buf) return Restored::memory;
+        if (!get(in.seq.data(), (size_t) n * 4)) return Restored::other;
+        for (uint64_t k = 0; k < head.marks; ++k) {
+            int64_t pos = 0;
+            const int64_t after = in.marks.empty() ? 0 : in.marks.back().pos;
+            if (!get(&pos, 8) || pos <= after || pos > n || (pos == n) != (k + 1 == head.marks)) return Restored::other;
+            const BlobPtr b = blob(state);
+            if (!b) return Restored::memory;
+            if (!get(b->data(), state)) return Restored::other;
+            in.marks.push_back({pos, b});
+        }
+        // from here the engine holds the file's conversation, or none
+        leave();
+        e_.reset();
+        for (int64_t first = 0; first < n; first += per) {
+            const int64_t m = std::min(per, n - first);
+            if (!get(buf.get(), (size_t) m * row)) {
+                e_.reset();
+                return Restored::cut;
+            }
+            e_.load_rows(buf.get(), first, m, first, m);
+        }
+        e_.load_state(in.marks.back().state->data(), n);
+        while (!in.marks.empty() && in.marks.size() > (size_t) std::max(o_.checkpoints, 0)) {
+            std::vector<int64_t> pos;
+            for (const Checkpoint& m : in.marks) pos.push_back(m.pos);
+            in.marks.erase(in.marks.begin() + (std::ptrdiff_t) drop_of(pos));
+        }
+        in.prompt = (int64_t) head.prompt;
+        in.stamp = ++clock_;
+        slots_[cur_] = std::move(in);
+        return Restored::ok;
+    }
+
     /// Between requests: what the parked conversations hold leaves the process.  On the laptop four parked
     /// conversations of Qwen3.6 held 1.1 to 1.7 GB, one of 29K tokens 1.05 GB.  The one in the engine keeps its
     /// states in memory: every request saves one (63 MB of Qwen3.6's), and the next request most likely goes on
@@ -232,6 +342,14 @@ private:
     const Slot& cur() const { return slots_[cur_]; }
     static int64_t len(const Slot& s) { return (int64_t) s.seq.size(); }
     static int64_t saved(const Slot& s) { return s.rows.empty() ? 0 : s.rows.back().first + s.rows.back().keep; }
+    // The checkpoints save() writes: the last two before the conversation's end, and one at its end, which is
+    // the conversation's own when it has one there.
+    static bool at_end(const Slot& s) { return !s.marks.empty() && s.marks.back().pos == len(s); }
+    static size_t first_saved(const Slot& s) {
+        const size_t keep = at_end(s) ? 3 : 2;
+        return s.marks.size() > keep ? s.marks.size() - keep : 0;
+    }
+    static uint64_t marks_saved(const Slot& s) { return s.marks.size() - first_saved(s) + (at_end(s) ? 0 : 1); }
 
     static int64_t common(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
         size_t n = 0;
