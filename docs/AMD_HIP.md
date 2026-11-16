@@ -1009,8 +1009,8 @@ at capture time. It allocates no VRAM.
   reference its error is about 1e-8 on outputs of 0.005 to 0.03, the same size
   as the old kernels' (8e-9).
 * `=2` also quantizes each query to int8 in blocks of 32 values and computes
-  the scores with integer dot products (`dp4a`; on gfx1010 and gfx1012 the
-  same SDWA sequence the other kernels use). Its error against FP64 is
+  the scores with integer dot products (`dp4a`; on gfx1010 the same SDWA
+  sequence the other kernels use, on gfx1012 its native `v_dot4_i32_i8`). Its error against FP64 is
   1.2e-5 to 5.7e-5 on the same outputs, about 0.2% of the largest value. That
   is a different rounding of the query, not a reordering: judge it as you
   would a lower-precision attention. `=1` is the choice when exactness matters.
