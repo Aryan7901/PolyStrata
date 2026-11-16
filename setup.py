@@ -947,6 +947,25 @@ def say(msg=""):
     print(msg, flush=True)
 
 
+def colours() -> bool:
+    """Whether the menus may print ANSI colours: stdout is a terminal that takes them and NO_COLOR is not set.  A
+    Windows console prints the escape codes as text ("<-[36m") until virtual terminal processing is turned on for
+    it, which this does; a console that refuses (before Windows 10 1511) gets none."""
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return False
+    if not WIN:
+        return os.environ.get("TERM") != "dumb"
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        out = k32.GetStdHandle(-11)                    # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        return bool(k32.GetConsoleMode(out, ctypes.byref(mode))
+                    and k32.SetConsoleMode(out, mode.value | 0x0004))   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
@@ -8211,7 +8230,8 @@ def main() -> int:
     # ---- 2. the questions
     step(2, "your choices")
     fams = menu_families(hip)
-    cyan, reset = ("\033[36m", "\033[0m") if sys.stdout.isatty() else ("", "")
+    coloured = colours()
+    cyan, reset = ("\033[36m", "\033[0m") if coloured else ("", "")
     if a.family:
         family = a.family
     else:
@@ -8271,7 +8291,7 @@ def main() -> int:
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
         label = f"{m:8s}"
-        if sys.stdout.isatty():
+        if coloured:
             label = f"\033[35m{label}\033[0m"
         say(f"  {i}) {label}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(installed or recommended_size(family, names, ram)) + 1)
