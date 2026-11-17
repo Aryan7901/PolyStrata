@@ -6486,6 +6486,26 @@ def poly_verdict(d, ram, vram_gb, hip, windows=False) -> str:
         f"wants ~{need:.0f} GB of RAM on this card: with {ram:.0f} its experts are read from the SSD")
 
 
+# --kv for a model of strata-poly (docs/Q8_KV.md): the formats its architecture's attention caches have beside
+# fp16, the default.  The other engine's own are STRATA_KV.
+POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "minicpmv", "kolibri", "flint", "lfm25"),
+           "int8": ("gemma4",), "int8k": ("gemma4",)}
+STRATA_KV = ("int8", "q4_0", "k8v4")
+
+
+def poly_saved_kv(paths) -> str | None:
+    """--kv of an earlier run config of this model (the first of `paths` there is), or None."""
+    for p in paths:
+        if p is None or not p.is_file():
+            continue
+        try:
+            args = json.loads(p.read_text(encoding="utf-8-sig")).get("args")
+        except (OSError, ValueError, AttributeError):
+            continue
+        return flag_value(args, "--kv") if isinstance(args, list) else None
+    return None
+
+
 def poly_saved_conv(paths) -> int | str | None:
     """--conversation-cache-mib of an earlier run config of this model (the first of `paths` there is): MiB, or "auto";
     0 when that config has none; None without an earlier config: setup then asks."""
@@ -6865,7 +6885,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     unused = [flag for flag, given in (
         ("--vision", not sees and a.vision not in (None, "no", "none")),
         ("--vision-tokens", not sees and a.vision_tokens is not None),
-        ("--kv", a.kv), ("--kv-streaming", a.kv_streaming != "auto"), ("--rope-scaling", a.rope_scaling),
+        ("--kv", a.kv and a.kv != "fp16" and family not in POLY_KV.get(a.kv, ())),
+        ("--kv-streaming", a.kv_streaming != "auto"), ("--rope-scaling", a.rope_scaling),
         ("--rope-scale", a.rope_scale is not None), ("--low-ram", a.low_ram != "auto"),
         ("--resident-budget-gib", a.resident_budget_gib is not None),
         ("--draft-vocab", a.draft_vocab), ("--layer-split", a.layer_split and not multi), ("--calibrate", a.calibrate),
@@ -6965,6 +6986,11 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
 
     # the conversation cache: asked once, then kept as the model's run config has it
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    # the attention caches' format (issue 183): --kv when this model has that one, else what its run config had;
+    # --kv fp16 goes back to the default
+    kv = a.kv or poly_saved_kv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
+    if family not in POLY_KV.get(kv, ()):
+        kv = None
     conv = poly_saved_conv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
     if conv is None:
         say()
@@ -7134,6 +7160,9 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
            "that much less)")
     if fam.get("tail_skip"):
         args += ["--tail-skip", str(fam["tail_skip"])]
+    if kv:
+        args += ["--kv", kv]
+        ok(f"attention caches stored as {kv} (--kv in the config, docs/Q8_KV.md; --kv fp16 at setup takes it out)")
     if not multi and poly_batch(fam, d, vram, ctx):
         args += ["--prompt-batch", "2048"]
         ok("prompts are read 2,048 tokens at a time (--prompt-batch in the config)")
@@ -7783,9 +7812,11 @@ def main() -> int:
     ap.add_argument("--rope-scale", type=float,
                     help="the extension factor (default: the final context over the trained 262144, at least 1 - "
                          "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
+    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16", "q8_0", "int8k"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell)")
+                         "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell). For a model of strata-poly "
+                         "(docs/Q8_KV.md): q8_0 (half the KV cache's VRAM: Qwen3.6, Ornith, Tiel Coder, MiniCPM-V, "
+                         "Kolibri, Flint, LFM2.5), int8 or int8k (Gemma 4), fp16 (the default)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
     ap.add_argument("--vision-tokens", type=int, metavar="N",
@@ -8267,6 +8298,8 @@ def main() -> int:
         say(f"  Its license: {fam['license']}")
     if fam.get("engine") == "poly":                     # another engine: its own questions and steps
         return poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, adopted)
+    if a.kv and a.kv not in STRATA_KV:
+        fail(f"{fam['title']} has no --kv {a.kv}", "its KV cache is int8 (the default), q4_0 or k8v4")
     say()
     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
