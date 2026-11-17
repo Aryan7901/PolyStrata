@@ -85,7 +85,7 @@ HF_REVISIONS = {
     "peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP": "bbe9e566f39e4fc9652ac66b71968289a03c520a",        # 2026-09-10
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "unsloth/DeepSeek-V4-Flash-0731-GGUF": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",               # 2026-10-15
-    "unsloth/LFM2.5-24B-A2B-GGUF": "faa77113e93335b63423e9e8d33395f86eaf8946",                        # 2026-10-15
+    "unsloth/LFM2.5-24B-A2B-GGUF": "aacc77834f6aa568c93b4dbd6d295059736be98c",                        # 2026-10-20
     "LiquidAI/LFM2.5-24B-A2B-GGUF": "0912d33141f77e10705345a6732bfd83f0252fdc",                       # 2026-10-15
     "unsloth/flint-GGUF": "20468edfc38ab43d6914cc88b08cbecb05d0fc62",                                 # 2026-10-21
     "openbmb/MiniCPM-V-4.7-35B-A3B-gguf": "77f6d8cb08b2b115ce27d2e2ac1359e126921689",                   # 2026-10-12
