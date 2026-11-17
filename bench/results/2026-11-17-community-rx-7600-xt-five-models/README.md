@@ -1,4 +1,4 @@
-﻿# Five models on a Radeon RX 7600 XT
+# Five models on a Radeon RX 7600 XT
 
 Measured on 2026-11-17: RX 7600 XT 16 GiB, Ryzen 7 5700X, 63.9 GiB RAM, Windows 10, HIP. Project commit acd46131, project version 0.1.45. These are measurements of the installed configurations, not a controlled comparison of model quality or quantization alone.
 
