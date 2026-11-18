@@ -1286,6 +1286,23 @@ def linux_hybrid_pmu(root: str = "/sys/devices"):
     return (p, e) if p and e else None
 
 
+def rdna1_poly_args() -> list[str]:
+    """strata-poly's settings for a gfx1012 card (STRATA_EXPERIMENTAL_GFX1012), measured on a Radeon Pro 5500M beside an
+    i9-9980HK (8 cores, 16 threads; Tiel Coder UD-IQ3_XXS through the server, six coding prompts): with 16 threads (the
+    engine's default, every logical CPU) it wrote 26.4 tokens/s at 81% CPU, with one a physical core 34.8-38.3 at 45-48%;
+    --kv q8_0 holds 64K of context in the VRAM 32K takes in fp16.  docs/RADEON_PRO_5500M.md."""
+    args = ["--kv", "q8_0"]
+    physical = None
+    try:
+        import psutil                                  # installed into .venv by step 3
+        physical = psutil.cpu_count(logical=False)
+    except Exception:
+        pass
+    if physical and physical < (os.cpu_count() or 0):
+        args += ["--threads", str(physical)]
+    return args
+
+
 def hybrid_pool_workers(cores) -> int | None:
     """#642 (Hardin22's measurement): on a hybrid CPU the expert pool runs best on the P-cores but the host loop's one
     plus HALF of the E-cores - an E-core runs the expert kernels ~2.2x slower and each layer waits for its slowest
@@ -2736,6 +2753,7 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
                 "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1032": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1010": "https://rocm.nightlies.amd.com/v2/gfx101X-dgpu/",  # RDNA1: run on Windows only so far
+                "gfx1012": "https://rocm.nightlies.amd.com/v2/gfx101X-dgpu/",  # RX 5500 XT / Pro 5500M: only with STRATA_EXPERIMENTAL_GFX1012=1
                 "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/",       # Strix Halo (docs/STRIX_HALO.md)
                 "gfx1150": "https://rocm.nightlies.amd.com/v2/gfx1150/",       # Strix Point: only with STRATA_EXPERIMENTAL_GFX1150=1
                 "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with STRATA_EXPERIMENTAL_GFX1103=1
@@ -2772,9 +2790,14 @@ GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
 # build one with `STRATA_HIP_ARCHS=gfx1150 tools\hip\build_windows.bat` and start setup with `--prebuilt dist\`.
 # Unset: unchanged.
 GFX1150_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1150") == "1"
+# STRATA_EXPERIMENTAL_GFX1012=1 (opt-in, unvalidated beyond one card): Navi 14 (RDNA1, gfx1012: RX 5500 XT, Radeon Pro
+# 5500M), with its native v_dot4_i32_i8 (include/strata/hip_compat/intrinsics.hpp).  On Windows strata-poly is compiled
+# here as for gfx1010 (the whl-next index has a gfx1012 device wheel).  docs/RADEON_PRO_5500M.md.  Unset: unchanged.
+GFX1012_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1012") == "1"
 AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx1010",
              "gfx1151") \
-            + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ())
+            + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ()) \
+            + (("gfx1012",) if GFX1012_OPT_IN else ())
 # The exact (bit-identical) speed switches the engine turns on by default on gfx1151 (src/core/arch_defaults.cpp), less
 # STRATA_HCD_EXACT: that one copies the gfx1151 hipBLASLt table's solutions 1176 / 1177, and the gfx1103 table
 # (tools/hip/gfx1103-hipblaslt-100401.txt) picks others, so it would only report that it cannot run.  A gfx1103 install
@@ -2805,6 +2828,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)",
              "gfx1032": "AMD Radeon RX 6600 / 6600 XT / 6650 XT (gfx1032)",
              "gfx1010": "AMD Radeon RX 5600 XT / 5700 / 5700 XT (gfx1010)",
+             "gfx1012": "AMD Radeon RX 5500 XT / Pro 5500M (gfx1012)",
              "gfx1151": "AMD Radeon 8060S / 8050S / 8040S (Ryzen AI Max, Strix Halo, gfx1151)",
              # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
              "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
@@ -3287,6 +3311,7 @@ _WIN_AMD_DID = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100",        
                 0x73DF: "gfx1031",                                                  # RX 6700 XT / 6750 XT / 6800M (#881)
                 0x73FF: "gfx1032", 0x73EF: "gfx1032",                               # RX 6600 / 6600 XT, RX 6650 XT (issue 121)
                 0x731F: "gfx1010",                                                  # RX 5600 XT / 5700 / 5700 XT (Navi 10)
+                **({0x7340: "gfx1012"} if GFX1012_OPT_IN else {}),                  # Navi 14: RX 5500 XT / 5500M, Radeon Pro 5500M / 5300M
                 **AMD_IGPU_PCI}                                                     # Ryzen APUs: 0x1586 = Strix Halo (gfx1151)
 _WIN_AMD_NAME = ((re.compile(r"\b80[456]0S\b", re.I), "gfx1151"),                   # Radeon 8060S / 8050S / 8040S
                  (re.compile(r"\b8[89]0M\b", re.I), "gfx1150"),                     # Radeon 890M / 880M
@@ -3299,7 +3324,8 @@ _WIN_AMD_NAME = ((re.compile(r"\b80[456]0S\b", re.I), "gfx1151"),               
                  (re.compile(r"RX\s*7600|W7600|W7500", re.I), "gfx1102"),
                  (re.compile(r"RX\s*6800(?!\s*[MS])|RX\s*6900|RX\s*6950|W6800", re.I), "gfx1030"),
                  (re.compile(r"RX\s*66[05]0", re.I), "gfx1032"),
-                 (re.compile(r"RX\s*5[67]00|W5700", re.I), "gfx1010"))             # RDNA1 Navi 10; the RX 5500 is gfx1012
+                 (re.compile(r"RX\s*5[67]00|W5700", re.I), "gfx1010")) + \
+    (((re.compile(r"RX\s*5500|Pro\s*5[35]00M|W5500", re.I), "gfx1012"),) if GFX1012_OPT_IN else ())   # Navi 14, opt-in
 _DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
 
@@ -5385,6 +5411,18 @@ def carry_over(old: dict, cfg: dict) -> list[str]:
     return kept
 
 
+def warm_start_into(cfg: dict, a) -> None:
+    """--warm-start [FILE]: the run config's "warm_start" (serve/server.py's Service.start_warm).  Written only when
+    given: an earlier config's is carried over (write_setup_config)."""
+    w = getattr(a, "warm_start", None)
+    if w is None:
+        return
+    cfg["warm_start"] = w if w is True else str(Path(w).expanduser().resolve())
+    ok("warm start: the server keeps an agent's system prompt with its tools and has it ready when it starts"
+       + ("" if w is True else f" (the one in {cfg['warm_start']}"
+          + ("" if Path(cfg["warm_start"]).is_file() else ", once the agent has written it") + ")"))
+
+
 def flag_value(args: list, flag: str):
     """The value after `flag` in an argument list, or None."""
     for i, a in enumerate(args[:-1]):
@@ -6963,10 +7001,17 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     ok(f"size: {model}")
     tag = fam["tag"] + custom_gguf_tag(_sg, model)
 
+    # STRATA_EXPERIMENTAL_GFX1012 (the RX 5500 XT / Radeon Pro 5500M): the q8_0 attention caches take half the VRAM,
+    # so 64K costs the expert cache what 32K in fp16 does, and the experts outside VRAM run on one thread a physical
+    # core (rdna1_poly_args()).  Measured on a Radeon Pro 5500M (8 GB) beside an i9-9980HK: docs/RADEON_PRO_5500M.md.
+    rdna1 = bool(hip) and gpu.get("arch") == "gfx1012"
     if a.context:
         ctx = a.context
         if not 16 <= ctx <= 1048576:
             fail(f"--context {ctx}: {title} takes 16 to 1048576 tokens")
+    elif rdna1:
+        ctx = 65536
+        say("  Context: 64K tokens (the attention caches in q8_0 take the VRAM 32K takes in fp16; --context sets it)")
     else:
         say()
         say("  Context length = how much text the model can see at once (your chat, files, tool output).")
@@ -7174,6 +7219,11 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         args += ["--threads", str(threads)]
         ok(f"hybrid CPU ({cores[0]} performance + {cores[1]} efficiency cores): {threads} CPU threads for the experts "
            "outside VRAM (--threads in the config)")
+    elif rdna1:
+        extra = rdna1_poly_args()
+        args += extra
+        ok("Radeon RX 5500 XT / Pro 5500M: " + " ".join(extra) + " (the attention caches in q8_0, one CPU thread a "
+           "physical core)")
     base = custom_gguf_tag(_sg, model) if _sg else None
     cfg = {"exe": str(eng / POLY_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": base.lower() if base else f"{fam['name']}-{model.lower()}",
@@ -7219,6 +7269,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     for line in poly_parallel_note(a.parallel, d, vram):
         (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
     poly_kv_whole(cfg)
+    warm_start_into(cfg, a)
     write_setup_config(cfg_path, cfg, earlier)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")
@@ -7634,6 +7685,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         else:
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
+    warm_start_into(cfg, a)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")
@@ -7912,6 +7964,12 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
+    ap.add_argument("--warm-start", nargs="?", const=True, metavar="FILE",
+                    help="an agent's system prompt with its tools is ready when the server starts (\"warm_start\" in "
+                         "the run config, opt-in): the server keeps the one the last agent sent, and strata-poly keeps "
+                         "it in memory beside the conversations. FILE: a chat request (JSON with messages and tools, "
+                         "as /v1/chat/completions takes them) whose system prompt it is, so the first start has it too; "
+                         "it may be written later (by the agent): until then the server starts without it")
     ap.add_argument("--replicas", type=int, metavar="N",
                     help="several GPUs: run N independent engines, each on its own equal group of the chosen cards (2 "
                          "replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more total "
@@ -8994,6 +9052,7 @@ def main() -> int:
             say("  " + line)
     for line in bench_tips(cfg["args"], cfg.get("env"), ram, MODELS[model]["ram_gb"], gpu.get("vram_gb", 0.0), vision, WIN):
         say("  " + line)
+    warm_start_into(cfg, a)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
