@@ -85,6 +85,8 @@ constexpr int kPiece = 8;
 constexpr char kSessionMagic[8] = {'P', 'O', 'L', 'Y', 'S', 'E', 'S', '1'};
 constexpr size_t kSessionPiece = 16u << 20;
 constexpr uint64_t kSessionFreeMib = 4096;
+constexpr uint64_t kSessionFrame = sizeof kSessionMagic + 8 + 8;   // around the conversation's bytes: the magic,
+                                                                   // what the file is bound to, the hash
 
 struct Sampling {
     float temperature = 0.f;   // 0: the most likely token
@@ -355,6 +357,7 @@ struct Session {
     strata::spec::DraftPolicy policy;
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
     int piece_calls = kPiece;             // generate()'s pieces when it is given `between`
+    std::string pinned;                   // --pinned-session: the file serve() pins before its first request
 
     Session(Engine& e, std::vector<int32_t> eos_ids, const CacheFlags& f, int lookup)
         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
@@ -639,6 +642,62 @@ uint64_t session_binds(const Engine& engine) {
     return b.digest();
 }
 
+// A session file's name as the server sends it and a command line gives it: UTF-8.
+std::filesystem::path session_path(const std::string& name) {
+    std::u8string utf8(name.size(), u8'\0');
+    std::memcpy(utf8.data(), name.data(), name.size());
+    return std::filesystem::path(utf8);
+}
+
+// Whether a file of `total` bytes starts as this engine's session files do: the magic and the binding, read with
+// get().  Returns what is wrong with it, or nothing.
+template<class Get>
+std::string session_starts(uint64_t total, uint64_t binds, Get&& get) {
+    char magic[sizeof kSessionMagic];
+    uint64_t bound = 0;
+    if (total < kSessionFrame || !get(magic, sizeof magic) || std::memcmp(magic, kSessionMagic, sizeof magic) != 0)
+        return "not a strata-poly session file";
+    if (!get(&bound, 8) || bound != binds) return "the file was saved with another model, engine version or --kv";
+    return {};
+}
+
+// --pinned-session FILE, before the first request: the file's conversation becomes the pinned one
+// (Conversations::pin()), a system prompt that was read once and saved.  A file that cannot be used is named on
+// stderr and the engine starts without it; the first request that brings the prompt reads it then.
+void pin_session(Session& ss, const std::string& name) {
+    namespace fs = std::filesystem;
+    using Restored = Conversations<Engine>::Restored;
+    const Clock::time_point t0 = Clock::now();
+    const auto no = [&](const std::string& why) {
+        ss.kept.unpin();
+        std::fprintf(stderr, "strata-poly: --pinned-session %s: %s; the engine starts without it\n", name.c_str(),
+                     why.c_str());
+    };
+    std::error_code ec;
+    const fs::path path = session_path(name);
+    const uint64_t total = fs::file_size(path, ec);
+    if (ec) return no("the file cannot be read: " + ec.message());
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return no("the file cannot be opened");
+    strata::core::SessionHasher hash;
+    const auto get = [&](void* p, size_t n) {
+        in.read((char*) p, (std::streamsize) n);
+        if ((size_t) in.gcount() != n) return false;
+        hash.update(p, n);
+        return true;
+    };
+    if (const std::string why = session_starts(total, session_binds(ss.engine), get); !why.empty()) return no(why);
+    const Restored r = ss.kept.pin(total - kSessionFrame, ss.engine.max_context(), kSessionPiece, get);
+    if (r == Restored::other) return no("the file is not a whole session of this model within --max-context");
+    if (r == Restored::memory) return no("no memory for it");
+    uint64_t want = 0;
+    if (r == Restored::ok) in.read((char*) &want, 8);
+    if (r != Restored::ok || in.gcount() != 8 || want != hash.digest()) return no("the file is damaged");
+    std::fprintf(stderr, "strata-poly: pinned session: %lld tokens, %zu MiB of rows and states beside the conversation "
+                         "cache, read in %.0f ms; a prompt that starts with them goes on from there\n",
+                 (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes() >> 20, ms_since(t0));
+}
+
 // SAVE <path> | RESTORE <path> between requests, answered as the Strata project's engine answers them
 // (docs/DETAILS.md, Session files): SAVED / RESTORED <tokens> <bytes> <ms>, SESSION <done> <total> on the way, and
 // SERR <invalid|storage|memory|io> 0 <reason> for a file that is refused or fails, after which the engine goes on.
@@ -662,10 +721,8 @@ bool session_file(Session& ss, bool save, const std::string& name, bool batch) {
     if (name.empty()) return refuse(SessionError::invalid, "missing path");
     if (batch) return refuse(SessionError::invalid, "session files do not support --batch (parallel requests)");
     const uint64_t binds = session_binds(engine);
-    std::u8string utf8(name.size(), u8'\0');
-    std::memcpy(utf8.data(), name.data(), name.size());
-    const fs::path path(utf8);
-    const uint64_t frame = sizeof kSessionMagic + 8 + 8;   // around save()'s bytes: the magic, the binding, the hash
+    const fs::path path = session_path(name);
+    const uint64_t frame = kSessionFrame;
     std::error_code ec;
     strata::core::SessionHasher hash;
     uint64_t done = 0, said = 0, total = 0;
@@ -743,12 +800,9 @@ bool session_file(Session& ss, bool save, const std::string& name, bool batch) {
         if (done - said >= kSessionPiece) moved();
         return true;
     };
-    char magic[sizeof kSessionMagic];
-    uint64_t bound = 0, want = 0;
-    if (total < frame || !get(magic, sizeof magic) || std::memcmp(magic, kSessionMagic, sizeof magic) != 0)
-        return refuse(SessionError::invalid, "not a strata-poly session file");
-    if (!get(&bound, 8) || bound != binds)
-        return refuse(SessionError::invalid, "the file was saved with another model, engine version or --kv");
+    uint64_t want = 0;
+    if (const std::string why = session_starts(total, binds, get); !why.empty())
+        return refuse(SessionError::invalid, why);
     Restored r = Restored::other;
     try {
         r = ss.kept.restore(total - frame, engine.max_context(), kSessionPiece, get);
@@ -789,13 +843,14 @@ bool session_file(Session& ss, bool save, const std::string& name, bool batch) {
 int serve(Session& ss) {
     Engine& engine = ss.engine;
     std::vector<Slot> slots((size_t) engine.sequences() - 1);
+    if (!ss.pinned.empty()) pin_session(ss, ss.pinned);
     engine.trim();
     std::printf("INFO context=%d expert_slots=%d expert_cache_mib=%lld pool_workers=%d conversation_cache_mib=%lld "
                 "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_free_mib=%lld vram_elastic=1 "
-                "batch_slots=%d sessions=1 engine=" STRATA_VERSION "\n",
+                "batch_slots=%d sessions=1 pinned_tokens=%lld engine=" STRATA_VERSION "\n",
                 engine.max_context(), engine.cached_experts(), (long long) (engine.cached_gib() * 1024.0),
                 engine.threads(), (long long) ss.flags.o.park_mib, ss.flags.o.park_slots, ss.flags.min_free_mib,
-                (long long) engine.vram_free_mib(), (int) slots.size());
+                (long long) engine.vram_free_mib(), (int) slots.size(), (long long) ss.kept.pinned_tokens());
     std::printf("READY %d stop\n", engine.max_context());
     std::fflush(stdout);
 
@@ -1391,6 +1446,9 @@ void usage() {
                  "  --conversation-cache-min-tokens N   a conversation shorter than this is not parked (default 1024)\n"
                  "  --conversation-cache-min-free-mib N park only while this much physical RAM stays free (default\n"
                  "                         2560)\n"
+                 "  --pinned-session FILE  --serve: a session file (SAVE) whose conversation stays for the whole run,\n"
+                 "                         a system prompt read once: a prompt that starts with it goes on from\n"
+                 "                         its end, whatever took the engine since; it is never pushed out\n"
                  "  --batch N              N answers written together, each in a sequence of its own with its own\n"
                  "                         state and attention rows (default 0 = one at a time; at most 8);\n"
                  "                         --slots N is the same\n"
@@ -1445,7 +1503,7 @@ int main(int argc, char** argv) {
     bool want_serve = false;
     long long max_new = 32;
     int top_probs = 0, lookup = 3, image_pad = -1, check = 0;
-    std::string images;
+    std::string images, pinned;
     std::vector<int32_t> ids, eos, follow;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1475,6 +1533,7 @@ int main(int argc, char** argv) {
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
         else if (a == "--vram-pool") o.vram_pool = true;
         else if (a == "--expert-profile") o.profile = val();
+        else if (a == "--pinned-session") pinned = val();
         else if (a == "--no-gpu-experts") o.gpu_experts = false;
         else if (a == "--any-node") o.stay_near = false;
         else if (a == "--lock-experts") o.lock_experts = true;
@@ -1620,6 +1679,7 @@ int main(int argc, char** argv) {
                                      "(--conversation-cache-mib N asks for one anyway)\n");
         }
         Session ss(engine, eos, cache, lookup);
+        ss.pinned = pinned;
         int rc = 0;
         if (want_serve) {
             rc = serve(ss);

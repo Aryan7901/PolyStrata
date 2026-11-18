@@ -1434,6 +1434,28 @@ file to the disk, so a file cut short by a power loss fails its hash. It leaves 
 otherwise). Not with `--batch` (the config's `"parallel"`). The server asks an engine for sessions only when its `INFO`
 line says `sessions=1`, so a strata-poly from before this answers `501`.
 
+**A pinned session (`strata-poly --pinned-session FILE`).** A system prompt that every chat starts with can be read
+once, saved as above, and given to the engine at its start. Its conversation then stays for the engine's whole run:
+its rows and states are kept in memory beside the conversation cache, outside `--conversation-cache-mib` and its slots
+(between requests they leave the process for a temporary file, as a parked conversation's do), and nothing pushes it
+out. A prompt that starts with it goes on from a copy of it, at the last of its checkpoints the prompt still shares, so
+a new chat reads only its own turn: after the engine's start, after other conversations took the engine, after a long
+chat that began with the same system prompt, and with the conversation cache off. The file is checked as a restore
+checks one. A file that does not fit (another model, engine version or `--kv`, or damaged) is named in the log and the
+engine starts without it; the `INFO` line says `pinned_tokens=N`. To make the file through the server, send one chat
+request with the system prompt and a short question and save slot 0: the checkpoint where the question's turn begins
+is the end of the system prompt, and that is where new chats go on from. Setup does not write the option; it goes into
+the run config's `args`.
+
+On the card and with the settings of the measurement below, one run each: with a system turn of 8,005 tokens the first
+token of a new engine's first question came after 0.26 s in place of 1.56 s (fp16; q8_0 0.26 s in place of 1.53 s), and
+after 0.19 to 0.24 s where the cold engine had to read the system turn again (1.07 to 1.52 s): after a 16,000-token
+conversation of another kind, after a 16,000-token chat that began with the system turn, and with the conversation
+cache on after six other conversations. With 2,005 tokens: 0.26 to 0.30 s in place of 0.88 to 0.92 s, and 0.18 to
+0.23 s in place of 0.81 to 0.85 s. The 32 tokens of every answer were the cold engine's. The file is 345 MiB for 8,005
+tokens (fp16; 272 MiB as q8_0) and 165 MiB for 2,005 (146 MiB), read in 0.12 to 0.32 s at the start; the engine's VRAM
+is the same, and its own RAM after the first question 0 to 90 MiB more.
+
 Measured on an RTX PRO 6000 that other jobs were using, the engine held to 8.9 GB of it (4,127 of the 10,240 routed
 experts in VRAM, the split frozen with `STRATA_FREEZE_EXPERTS=1`), Qwen3.6 UD-Q3_K_M, NVMe, Linux, two runs: a
 conversation of 24,063 tokens is a file of 659 MiB (20 KiB a token and three states of 63 MiB), saved in 0.56 s and
