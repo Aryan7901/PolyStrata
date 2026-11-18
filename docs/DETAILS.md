@@ -930,7 +930,7 @@ print(r.choices[0].message.content)
 - **Reading an agent's prompt start when the server starts (opt-in).** After a restart an agent's first request
   reads its whole prompt again. Claude Code's was 16,651 tokens in a test (11.1 s with Qwen3.6 on an 8 GB laptop),
   and 14,452 of them were the system prompt and the tool list, which every session in the same folder sends again.
-  `"warm_start": true` in `strata-<model>.json` keeps the first turn of the last request
+  `"warm_start": true` in `strata-<model>.json` (setup's `--warm-start`) keeps the first turn of the last request
   with tools (the system prompt with the tools, when that is 2,048 tokens or more) in `strata-<model>.warm-start`
   next to the config, and reads it when the server starts: 7.9 s for those 14,452 tokens. Claude Code's first
   request then had 12,288 tokens in common with the kept start and read the other 4,363 in 3.5 s. A request that
@@ -940,7 +940,7 @@ print(r.choices[0].message.content)
 
   A first turn that leaves the kept one after 2,048 tokens or more (a date or a folder written near its end) keeps
   the part the two have in common, which is what the next chat starts with too. `"warm_start": "agent.json"`
-  names a chat request, a JSON file with `messages` and `tools` as
+  (setup's `--warm-start agent.json`) names a chat request, a JSON file with `messages` and `tools` as
   `/v1/chat/completions` takes them, whose first turn is the start: an installation that knows its agent's system
   prompt has it ready from the first start on, and a changed file is read at the next start. The file may come
   later (the agent can write it): until it is there the server starts as it would without it.
