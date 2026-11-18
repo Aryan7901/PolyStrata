@@ -930,13 +930,52 @@ print(r.choices[0].message.content)
 - **Reading an agent's prompt start when the server starts (opt-in).** After a restart an agent's first request
   reads its whole prompt again. Claude Code's was 16,651 tokens in a test (11.1 s with Qwen3.6 on an 8 GB laptop),
   and 14,452 of them were the system prompt and the tool list, which every session in the same folder sends again.
-  `"warm_start": true` in `strata-<model>.json` keeps the first turn of the last request with tools (the system
-  prompt with the tools, when that is 2,048 tokens or more) in `strata-<model>.warm-start` next to the config, and
-  reads it when the server starts: 7.9 s for those 14,452 tokens. Claude Code's first request then had 12,288
-  tokens in common with the kept start and read the other 4,363 in 3.5 s. A request that comes in during that read
-  stops it and goes first (one sent 3 s after the start waited
+  `"warm_start": true` in `strata-<model>.json` keeps the first turn of the last request
+  with tools (the system prompt with the tools, when that is 2,048 tokens or more) in `strata-<model>.warm-start`
+  next to the config, and reads it when the server starts: 7.9 s for those 14,452 tokens. Claude Code's first
+  request then had 12,288 tokens in common with the kept start and read the other 4,363 in 3.5 s. A request that
+  comes in during that read stops it and goes first (one sent 3 s after the start waited
   0.5 s), and the part read stays cached. It is off by default because the read keeps the GPU busy at every start,
   also when no agent comes.
+
+  A first turn that leaves the kept one after 2,048 tokens or more (a date or a folder written near its end) keeps
+  the part the two have in common, which is what the next chat starts with too. `"warm_start": "agent.json"`
+  names a chat request, a JSON file with `messages` and `tools` as
+  `/v1/chat/completions` takes them, whose first turn is the start: an installation that knows its agent's system
+  prompt has it ready from the first start on, and a changed file is read at the next start. The file may come
+  later (the agent can write it): until it is there the server starts as it would without it.
+
+  With strata-poly answering one request at a time, the server also saves the kept start as a session file,
+  `strata-<model>.warm-start-<hash>.bin` next to the config, right after it read it, and has the engine pin it
+  (a pinned session, further down). A later start takes it from the file and reads nothing, and so does an engine
+  the server starts again after an unload. A new chat then goes on from the end of the system prompt whatever the
+  engine read in between. The file is written again at the next start when the kept start changed, and when the
+  engine refuses it (another engine version, model file or `--kv`).
+
+  Measured through the server on the card of the session-file measurement below (Qwen3.6 UD-Q3_K_M, the engine held
+  to 8.9 GB, the split of the experts frozen, a system prompt of placeholder text and one tool, 32 tokens greedy,
+  fp16 and q8_0, one run each). With 8,284 tokens the first token of a new chat came after 0.24 to 0.43 s, where a
+  server without `"warm_start"` took 1.49 to 1.74 s: right after the start, after a 16,000-token conversation of
+  another kind, and with the conversation cache on after six other conversations. Where that server still had a
+  checkpoint near the end of the system prompt it took 0.53 to 0.62 s. With 2,284 tokens: 0.24 to 0.31 s in place
+  of 0.83 to 1.06 s (0.68 to 0.69 s). At the first start the read, the save and the pin took 1.2 to 2.2 s; the
+  file is 212 to 350 MiB, and a later start pins it in 0.2 to 0.3 s. Before this, the warm start's read was kept
+  like any prompt (0.8 s for 2,284 tokens, 1.5 s for 8,284): with 8,284
+  tokens even the chats right after the first went on from 8,192 (0.51 to 0.55 s), because the conversation cache
+  had let the checkpoint at the end of the system prompt go.
+
+  With the system prompt and the seven tools of a real agent, taken from its first request (12,541 tokens, thinking
+  on as the agent asks): 0.24 to 0.38 s in place of 1.88 to 2.12 s, and in place of 0.62 to 0.95 s where the server
+  without the setting went on from 10,240 or 12,288 tokens. The file is 433 MiB (318 MiB as q8_0). The warm start
+  without the file went on from 10,240 from the second chat on (0.83 to 0.90 s).
+
+  The answers were the same as before the file: in all 37 cases a pinned server gave the 32 tokens of a server that
+  read the system prompt itself and the question from its end, whatever ran in between. They can differ from a
+  server without `"warm_start"`, which reads the system prompt and the question in one go: with the placeholder
+  prompt 10 of 24 answers parted somewhere in their first 170 characters (in the same places with fp16 and q8_0),
+  with the real one 8 of 12. The engine gives the same tokens
+  for the same reads (two such servers agreed in 12 of 12), but where a read starts changes its numbers slightly,
+  and that already happens today whenever a request goes on from a checkpoint.
 - **Streaming.** With `"stream": true` everything arrives as it is made: the thinking, the answer, and tool calls
   (the tool's name first, then its arguments piece by piece, like OpenAI and Anthropic do). While the model reads a
   long prompt the stream sends keep-alives, so agents do not time out; the server window prints progress every
@@ -1442,10 +1481,10 @@ out. A prompt that starts with it goes on from a copy of it, at the last of its 
 a new chat reads only its own turn: after the engine's start, after other conversations took the engine, after a long
 chat that began with the same system prompt, and with the conversation cache off. The file is checked as a restore
 checks one. A file that does not fit (another model, engine version or `--kv`, or damaged) is named in the log and the
-engine starts without it; the `INFO` line says `pinned_tokens=N`. To make the file through the server, send one chat
-request with the system prompt and a short question and save slot 0: the checkpoint where the question's turn begins
-is the end of the system prompt, and that is where new chats go on from. Setup does not write the option; it goes into
-the run config's `args`.
+engine starts without it; the `INFO` line says `pinned_tokens=N`. `PIN <path>` pins a file between requests as the
+option does at the start, in place of one pinned before, and answers `PINNED <tokens> <bytes> <ms>` or `SERR` as a
+session file's. The server uses it for `"warm_start"` (above): it reads the agent's system prompt once, saves it and
+pins it, and at later starts pins the file.
 
 On the card and with the settings of the measurement below, one run each: with a system turn of 8,005 tokens the first
 token of a new engine's first question came after 0.26 s in place of 1.56 s (fp16; q8_0 0.26 s in place of 1.53 s), and
