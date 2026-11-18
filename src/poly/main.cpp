@@ -661,24 +661,26 @@ std::string session_starts(uint64_t total, uint64_t binds, Get&& get) {
     return {};
 }
 
-// --pinned-session FILE, before the first request: the file's conversation becomes the pinned one
-// (Conversations::pin()), a system prompt that was read once and saved.  A file that cannot be used is named on
-// stderr and the engine starts without it; the first request that brings the prompt reads it then.
-void pin_session(Session& ss, const std::string& name) {
+// --pinned-session FILE before the first request, and PIN <path> between requests: the file's conversation becomes
+// the pinned one (Conversations::pin()), a system prompt that was read once and saved, in place of one pinned
+// before.  Returns what is wrong with the file, or nothing; then nothing is pinned.  `io`: it could not be read.
+std::string pin_session(Session& ss, const std::string& name, bool& io) {
     namespace fs = std::filesystem;
     using Restored = Conversations<Engine>::Restored;
     const Clock::time_point t0 = Clock::now();
+    io = false;
     const auto no = [&](const std::string& why) {
         ss.kept.unpin();
-        std::fprintf(stderr, "strata-poly: --pinned-session %s: %s; the engine starts without it\n", name.c_str(),
-                     why.c_str());
+        return why;
     };
     std::error_code ec;
     const fs::path path = session_path(name);
     const uint64_t total = fs::file_size(path, ec);
+    io = true;
     if (ec) return no("the file cannot be read: " + ec.message());
     std::ifstream in(path, std::ios::binary);
     if (!in.is_open()) return no("the file cannot be opened");
+    io = false;
     strata::core::SessionHasher hash;
     const auto get = [&](void* p, size_t n) {
         in.read((char*) p, (std::streamsize) n);
@@ -696,6 +698,7 @@ void pin_session(Session& ss, const std::string& name) {
     std::fprintf(stderr, "strata-poly: pinned session: %lld tokens, %zu MiB of rows and states beside the conversation "
                          "cache, read in %.0f ms; a prompt that starts with them goes on from there\n",
                  (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes() >> 20, ms_since(t0));
+    return {};
 }
 
 // SAVE <path> | RESTORE <path> between requests, answered as the Strata project's engine answers them
@@ -843,7 +846,14 @@ bool session_file(Session& ss, bool save, const std::string& name, bool batch) {
 int serve(Session& ss) {
     Engine& engine = ss.engine;
     std::vector<Slot> slots((size_t) engine.sequences() - 1);
-    if (!ss.pinned.empty()) pin_session(ss, ss.pinned);
+    if (!ss.pinned.empty()) {
+        // A file that cannot be used is named and the engine starts without it: the first request that brings the
+        // prompt reads it then.
+        bool io = false;
+        if (const std::string why = pin_session(ss, ss.pinned, io); !why.empty())
+            std::fprintf(stderr, "strata-poly: --pinned-session %s: %s; the engine starts without it\n",
+                         ss.pinned.c_str(), why.c_str());
+    }
     engine.trim();
     std::printf("INFO context=%d expert_slots=%d expert_cache_mib=%lld pool_workers=%d conversation_cache_mib=%lld "
                 "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_free_mib=%lld vram_elastic=1 "
@@ -1077,6 +1087,23 @@ int serve(Session& ss) {
         if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
             const bool save = line[0] == 'S';
             if (!session_file(ss, save, line.substr(save ? 5 : 8), !slots.empty())) return 1;
+            continue;
+        }
+        // PIN <path>: the start's --pinned-session, between requests (a server that has just saved the prompt).
+        // PINNED <tokens> <bytes> <ms>, or SERR as a session file's
+        if (line.rfind("PIN ", 0) == 0) {
+            const Clock::time_point t0 = Clock::now();
+            bool io = false;
+            const std::string why = slots.empty() ? pin_session(ss, line.substr(4), io)
+                                                  : "session files do not support --batch (parallel requests)";
+            if (why.empty()) {
+                std::printf("PINNED %lld %zu %.1f\n", (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes(),
+                            ms_since(t0));
+            } else {
+                std::fprintf(stderr, "strata-poly: session pin %s: %s\n", line.c_str() + 4, why.c_str());
+                std::printf("SERR %s 0 %s\n", io ? "io" : "invalid", why.c_str());
+            }
+            std::fflush(stdout);
             continue;
         }
         if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
