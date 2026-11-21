@@ -1672,9 +1672,11 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))
         throw std::runtime_error("--kv int8 and --kv int8k are Gemma 4's; for a qwen35moe or kolibri1 model use "
                                  "--kv q8_0 (this is a '" + name + "' model)");
-    // moe() weighs the picks as a softmax of their scores, which is how only this architecture's router does
-    if (o.cache_bias > 0.f && !qwen35)
-        throw std::runtime_error("--cache-bias is supported for qwen35moe models; this is a '" + name + "' model");
+    // moe() weighs the picks with reweight(): a softmax of their scores (qwen35moe's router) or the architecture's own
+    // (inkling2: sigmoid, normalized)
+    if (o.cache_bias > 0.f && !qwen35 && name != "inkling2")
+        throw std::runtime_error("--cache-bias is supported for qwen35moe and inkling2 models; this is a '" + name +
+                                 "' model");
     const auto make = [&]() -> std::unique_ptr<Engine> {
         if (name == "glm5-next" || name == "glm5next") return std::make_unique<Glm5Next>();   // Unsloth: no hyphen
         if (qwen35) return std::make_unique<Qwen35>();
@@ -4004,6 +4006,13 @@ void Engine::pool_queue(const Layer& L, size_t e, int32_t s, bool first) {
 }
 
 // One token's router scores with Options::cache_bias added to the ones of the experts in VRAM.
+void Engine::reweight(int, const float* scores, const int* ids, float* w) const {
+    float mx = scores[ids[0]], sum = 0.f;
+    for (int k = 1; k < n_used_; ++k) mx = std::max(mx, scores[ids[k]]);
+    for (int k = 0; k < n_used_; ++k) sum += w[k] = std::exp(scores[ids[k]] - mx);
+    for (int k = 0; k < n_used_; ++k) w[k] /= sum;
+}
+
 const float* Engine::biased(const Layer& L, const float* scores) {
     for (int e = 0; e < n_expert_; ++e) bias_rl_[(size_t) e] = scores[e] + (L.slot[(size_t) e] ? opt_.cache_bias : 0.f);
     return bias_rl_.data();
@@ -4099,14 +4108,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             const float* scores = h_rl_ + (size_t) (at + t) * n_expert_;
             route(il, opt_.cache_bias > 0.f ? biased(L, scores) : scores, tok_ ? tok_[at + t] : -1, ids, w,
                   route_tmp_.data());
-            if (opt_.cache_bias > 0.f) {
-                // --cache-bias: the biased scores chose the experts; the weights are the router's own, a softmax of
-                // the scores it gave the chosen ones
-                float mx = scores[ids[0]], sum = 0.f;
-                for (int k = 1; k < n_used_; ++k) mx = std::max(mx, scores[ids[k]]);
-                for (int k = 0; k < n_used_; ++k) sum += w[k] = std::exp(scores[ids[k]] - mx);
-                for (int k = 0; k < n_used_; ++k) w[k] /= sum;
-            }
+            if (opt_.cache_bias > 0.f) reweight(il, scores, ids, w);   // the biased scores chose; the weights are the router's own
             float w_all = 0.f;
             for (int k = 0; k < n_used_; ++k) w_all += w[k];
             for (int k = 0; k < n_used_; ++k) {

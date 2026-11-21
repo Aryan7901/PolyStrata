@@ -957,6 +957,17 @@ void Inkling2::finish_logits(float* logits, int rows) {
 
 // What ggml's MoE graph does for this model: sigmoid gates, the n_used largest of gate + bias, and weights from
 // the bare gates, made to sum to one and scaled.
+// --cache-bias: the chosen experts' weights as route() gives them, from the unbiased logits
+void Inkling2::reweight(int, const float* logits, const int* ids, float* w) const {
+    float sum = 0.f;
+    for (int k = 0; k < n_used_; ++k) sum += w[k] = 1.f / (1.f + std::exp(-logits[ids[k]]));
+    const float denom = std::max(sum, kMinWeightSum);
+    for (int k = 0; k < n_used_; ++k) {
+        w[k] /= denom;
+        if (w_scale_ != 0.f) w[k] *= w_scale_;
+    }
+}
+
 // INK_PREDICT_LOG: run il's choice for x from its file layer's router in the mapped file (F32), as route() picks
 int Inkling2::predict_route(int il, const float* x, int* ranked, int n) const {
     if (il < 0 || il >= (int) blocks_.size()) return 0;
