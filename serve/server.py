@@ -3066,11 +3066,18 @@ def hip_env_guard(env: dict, cfg: dict) -> list[str]:
 def vision_env(cfg: dict, env: dict) -> dict:
     """The image encoder's environment: the engine's, unless the config's vision section names its own "cuda_device"
     (numbered like nvidia-smi) - then the encoder runs on that card alone, so a spare GPU can hold it while the engine
-    keeps all of its own cards' VRAM (#408, Efs-O).  Without it, nothing changes."""
-    dev = (cfg.get("vision") or {}).get("cuda_device")
-    if dev is None:
+    keeps all of its own cards' VRAM (#408, Efs-O) - or its own "env" variables.  Without them, nothing changes."""
+    vis = cfg.get("vision") or {}
+    dev = vis.get("cuda_device")
+    if dev is None and not vis.get("env"):
         return env
     env = dict(env)
+    # the encoder's own settings (a Vulkan build on an integrated GPU: GGML_VK_VISIBLE_DEVICES keeps it off the card
+    # the engine fills)
+    for k, v in (vis.get("env") or {}).items():
+        env[str(k)] = str(v)
+    if dev is None:
+        return env
     if cfg.get("backend") == "hip":
         env["HIP_VISIBLE_DEVICES"] = str(dev)
     else:
@@ -3436,7 +3443,9 @@ class Service:
         # the template leaves that to the program
         # A template that writes the marker alone (MiniCPM-V 4.7's, like Gemma 4's) has no token before it to tell
         # an image's marker from the same text in a message: the first ones are the images (prepare()).
+        # Inkling 2 gives a picture a message block of its own: <|content_image|><|unused_200054|><|end_message|>
         self.image_marks = ("<|image|>", None, ("<|image>", "<image|>")) if self.call_format == "gemma" else \
+            ("<|unused_200054|>", "<|content_image|>", None) if self.call_format == "inkling" else \
             (IMAGE_PAD, VISION_START if VISION_START in getattr(self.template, "source", VISION_START) else None, None)
         # #567: a prompt re-encodes only what follows the last special token it shares with a recent prompt (the
         # same ids as a full encode: tools/strata_tokenizer.py PromptEncoder).  Tokenizers without resume points

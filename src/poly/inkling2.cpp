@@ -545,10 +545,25 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         for (int i = 0; i < n; ++i) off[i] = (long long) (seq_state(rows_of_[i].seq, state_) - state_);
         ink_set_offsets(row_off_, off, n, st_);
     }
-    if (il == 0) {   // the token's embedding, normed
+    if (il == 0) {   // the token's embedding, normed; a picture's rows go in as the encoder made them (llama.cpp
+                     // norms only tokens).  Row t is at pos_ + t here: a batch with a picture's rows is not replayed
+                     // from a recording, and step()'s rows (rows_of_) are tokens an answer writes
         ink_rows(cur, rs, tmp_, n_embd_, n_embd_, n, false, st_);
         rms_norm(tmp_, fp(tok_norm_), tmp_, n_embd_, n, rms_eps_, st_);
-        ink_rows(tmp_, n_embd_, cur, rs, n_embd_, n, false, st_);
+        if (images_.empty() || rows_of_) {
+            ink_rows(tmp_, n_embd_, cur, rs, n_embd_, n, false, st_);
+        } else {
+            for (int a = 0; a < n;) {   // the normed rows back for each run of text rows
+                if (image_at(pos_ + a)) {
+                    ++a;
+                    continue;
+                }
+                int b = a;
+                while (b < n && !image_at(pos_ + b)) ++b;
+                ink_rows(tmp_ + (size_t) a * n_embd_, n_embd_, cur + (size_t) a * rs, rs, n_embd_, b - a, false, st_);
+                a = b;
+            }
+        }
     }
     if (B.restart) {   // a later pass: the pass before's blocks to the bank, and the stream from the loop's start
         for (const auto& [from, to] : bank_)
