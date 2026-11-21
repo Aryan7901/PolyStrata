@@ -862,17 +862,32 @@ int Inkling2::predict_route(int il, const float* x, int* ranked, int n) const {
     const TensorInfo* t = gg_->find(blk(B.file, "ffn_gate_inp.weight"));
     if (!t || t->type != kTypeF32 || B.probs_b.size() != (size_t) n_expert_) return 0;
     const float* W = (const float*) home(*t).data(*t);   // n_expert rows of n_embd
-    std::vector<std::pair<float, int>> pick((size_t) n_expert_);
+    std::vector<float> logits((size_t) n_expert_);
     for (int e = 0; e < n_expert_; ++e) {
         const float* row = W + (size_t) e * n_embd_;
         float s = 0.f;
         for (int i = 0; i < n_embd_; ++i) s += row[i] * x[i];
-        pick[(size_t) e] = {1.f / (1.f + std::exp(-s)) + B.probs_b[(size_t) e], e};
+        logits[(size_t) e] = s;
     }
-    n = std::min(n, n_expert_);
-    std::partial_sort(pick.begin(), pick.begin() + n, pick.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    for (int k = 0; k < n; ++k) ranked[k] = pick[(size_t) k].second;
-    return n;
+    return rank_route(il, logits.data(), ranked, n);
+}
+
+// The experts run il's router ranks first by these scores, as route() picks them: by sigmoid plus the bias.
+int Inkling2::rank_route(int il, const float* logits, int* ranked, int n) const {
+    if (il < 0 || il >= (int) blocks_.size() || blocks_[(size_t) il].probs_b.size() != (size_t) n_expert_) return 0;
+    const std::vector<float>& bias = blocks_[(size_t) il].probs_b;
+    n = std::min(n, std::min(n_expert_, 32));
+    float best[32];
+    int m = 0;
+    for (int e = 0; e < n_expert_; ++e) {   // the n best in one pass
+        const float s = 1.f / (1.f + std::exp(-logits[e])) + bias[(size_t) e];
+        if (m == n && s <= best[n - 1]) continue;
+        int at = m < n ? m++ : n - 1;
+        for (; at > 0 && best[at - 1] < s; --at) best[at] = best[at - 1], ranked[at] = ranked[at - 1];
+        best[at] = s;
+        ranked[at] = e;
+    }
+    return m;
 }
 
 void Inkling2::route(int il, const float* logits, int32_t, int* ids, float* w, float* probs) const {

@@ -656,6 +656,21 @@ Engine::~Engine() {
         follower_.join();
     }
     if (swap_st_) cudaStreamSynchronize(cs(swap_st_));
+    if (pf_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> l(pf_m_);
+            pf_quit_ = true;
+        }
+        pf_cv_.notify_all();
+        pf_thread_.join();
+    }
+    if (pf_st_) {
+        cudaStreamSynchronize(cs(pf_st_));
+        for (int il = 0; il < (int) layers_.size(); ++il)
+            for (int e = 0; e < n_expert_ && !pf_pinned_.empty(); ++e) pf_unpin(il, e);
+        for (int fd : pf_fds_)
+            if (fd >= 0) ::close(fd);
+    }
     if (up_) cudaStreamSynchronize(cs(up_));
     if (rs_) cudaStreamSynchronize(cs(rs_));
     if (st_) cudaStreamSynchronize(cs(st_));
@@ -687,6 +702,11 @@ Engine::~Engine() {
         if (e) cudaEventDestroy((cudaEvent_t) e);
     for (int j = 0; j < n_swap_; ++j)
         if (swap_[(size_t) j].done) cudaEventDestroy(swap_[(size_t) j].done);
+    for (PfSlot& S : pf_)
+        for (void* e : {S.done, S.freed})
+            if (e) cudaEventDestroy((cudaEvent_t) e);
+    if (pf_st_) cudaStreamDestroy(cs(pf_st_));
+    if (pf_ev_) cudaEventDestroy((cudaEvent_t) pf_ev_);
     for (void* g : graphs_) cudaGraphExecDestroy((cudaGraphExec_t) g);
     blas_destroy(blas_);
     if (swap_st_) cudaStreamDestroy(cs(swap_st_));
@@ -2817,6 +2837,7 @@ void Engine::load(const Options& o) {
     if (block_guess_) std::fprintf(stderr, "strata-poly: STRATA_BLOCK_GUESS: the model guesses its own blocks\n");
     alloc();
     if (!opt_.profile.empty()) read_profile(opt_.profile, (int) layers_.size(), n_expert_, prior_);
+    pf_setup();
     fill_expert_cache();
     ensure_stage();
     // The weights and the expert cache are written on st_ now (h2d(), zero_vram()): the load is not over until
@@ -2827,6 +2848,7 @@ void Engine::load(const Options& o) {
     for (const auto& [p, n] : uploaded_) drop_pages(p, n);
     uploaded_ = {};
     after_load();
+    pf_pin_all();
     // A card of a split that has less free beside its layers than the reserve it keeps by default runs out of VRAM
     // in a later request, where one card alone can do nothing else.  It may be that another program held VRAM when
     // the split was made.  A larger reserve asked for (--vram-reserve-mib) only leaves the card without experts.
@@ -3519,6 +3541,9 @@ const Stats& Engine::stats() const {
         all_stats_.swapped_experts += s.swapped_experts;
         all_stats_.tail_experts += s.tail_experts;
         all_stats_.igpu_experts += s.igpu_experts;
+        all_stats_.prefetch_hits += s.prefetch_hits;
+        all_stats_.prefetch_copies += s.prefetch_copies;
+        all_stats_.prefetch_late += s.prefetch_late;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
     }
@@ -4051,6 +4076,342 @@ void Engine::pool_read(const Layer& L, PoolRead& r) {
            read_file(p + L.gu2(), L.exp_down + r.e * L.d_bytes, L.d_bytes);
 }
 
+// ---- predictive prefetch (INK_PREFETCH; engine.hpp, at pf_) ----
+
+int Engine::rank_route(int il, const float* logits, int* ranked, int n) const {
+    (void) il;
+    n = std::min(n, n_expert_);
+    std::vector<int> ids((size_t) n_expert_);
+    std::iota(ids.begin(), ids.end(), 0);
+    std::partial_sort(ids.begin(), ids.begin() + n, ids.end(),
+                      [logits](int a, int b) { return logits[a] != logits[b] ? logits[a] > logits[b] : a < b; });
+    std::copy(ids.begin(), ids.begin() + n, ranked);
+    return n;
+}
+
+namespace {
+// A layer's slot as fill_expert_cache() sizes it: whole blocks of each of its types, and kTail behind.
+size_t slot_size(const Layer& L) {
+    const size_t unit = std::lcm(std::lcm(std::lcm(ggml_type_size((ggml_type) L.gu_type), ggml_type_size((ggml_type) L.u_type)),
+                                          ggml_type_size((ggml_type) L.d_type)),
+                                 size_t(8));
+    return (L.gu2() + L.d_bytes + kTail + unit - 1) / unit * unit;
+}
+// Whether a layer's experts can go through the ring: the card computes their types (as the cache's), and their spans in
+// the file (expert_bytes()) lie as a slot has them, gate, up and down one behind the other.
+bool ringable(const Layer& L) {
+    if (!L.moe || !kernels::native_mmvq_supported((int) L.gu_type) || !kernels::native_mmvq_supported((int) L.u_type) ||
+        !kernels::native_mmvq_supported((int) L.d_type))
+        return false;
+    size_t at = 0;
+    expert_bytes(L, 0, 1, [&](const uint8_t*, size_t n) { at += n; });
+    return at == L.gu2() + L.d_bytes;
+}
+}  // namespace
+
+// At load, before the expert cache is filled (the ring's VRAM is not the cache's): INK_PREFETCH=N looks at the next
+// run's N likeliest experts; INK_PREFETCH_CAP the most copies a run asks for (1); INK_PREFETCH_SLOTS the ring's slots
+// (24); INK_PREFETCH_WAIT=0 counts only arrived copies; INK_PREFETCH_LATE=0 asks for the copies as soon as the run has
+// routed, not once its CPU experts are done; INK_PREFETCH_MIN=k only for a run whose likeliest have k outside VRAM.
+// Only the experts outside VRAM at the load are pinned: pinning the cache's too (10.7 GiB, so that the ones it gives up
+// later could be copied) took decode at 100K tokens from 35.6 to 23 tokens/s, and pinning them as they leave it held
+// up the launches (52 to 35 tokens/s at 6K).
+//
+// Measured on the laptop (RTX 5060 8 GB, DDR5-5600): no setting decodes faster than without it.  The CPU's experts
+// are bound by the memory's bandwidth, and a copy reads the same bytes from the same memory: asked beside them it made
+// them 12% slower (asked after them, 3%), and the window in which the memory is idle (the card's part of a run) holds
+// about one copy.  A run with one CPU expert waits for its cached ones anyway, so most copies gain nothing.
+void Engine::pf_setup() {
+#if defined(__linux__) && !defined(STRATA_GPU_METAL)
+    const auto env = [](const char* k, int dflt) {
+        const char* v = std::getenv(k);
+        return v && *v ? std::atoi(v) : dflt;
+    };
+    pf_n_ = std::min(std::max(env("INK_PREFETCH", 0), 0), 32);
+    if (pf_n_ == 0 || n_moe_ == 0 || !opt_.gpu_experts || split_ || hi_ - lo_ < 2) {
+        pf_n_ = 0;
+        return;
+    }
+    pf_cap_ = std::max(env("INK_PREFETCH_CAP", 1), 0);
+    pf_wait_ = env("INK_PREFETCH_WAIT", 1) != 0;
+    const int slots = std::min(std::max(env("INK_PREFETCH_SLOTS", 24), 2), 512);
+    for (const Layer& L : layers_)
+        if (ringable(L)) pf_bytes_ = pf_bytes_ ? std::min(pf_bytes_, slot_size(L)) : slot_size(L);
+    if (pf_bytes_ == 0) {
+        pf_n_ = 0;
+        return;
+    }
+    const size_t ne = (size_t) n_expert_, page = page_bytes();
+    pf_ring_ = (uint8_t*) dmalloc((size_t) slots * pf_bytes_, "the prefetch ring");
+    zero_vram(pf_ring_, (size_t) slots * pf_bytes_);
+    pf_.resize((size_t) slots);
+    uint8_t* edges = (uint8_t*) hmalloc((size_t) slots * kPfEdges * page, "pinned memory");
+    for (int v = 0; v < slots; ++v) {
+        PfSlot& S = pf_[(size_t) v];
+        cudaEvent_t a = nullptr, b = nullptr;
+        ck(cudaEventCreateWithFlags(&a, cudaEventDisableTiming), "cudaEventCreate");
+        ck(cudaEventCreateWithFlags(&b, cudaEventDisableTiming), "cudaEventCreate");
+        S.done = a;
+        S.freed = b;
+        S.edge = edges + (size_t) v * kPfEdges * page;
+    }
+    cudaStream_t st = nullptr;
+    ck(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "cudaStreamCreate");
+    pf_st_ = st;
+    cudaEvent_t ev = nullptr;
+    ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+    pf_ev_ = ev;
+    pf_of_.assign(layers_.size() * ne, -1);
+    pf_pinned_.assign(layers_.size() * ne, 0);
+    pf_late_ = env("INK_PREFETCH_LATE", 1) != 0;
+    pf_min_ = env("INK_PREFETCH_MIN", 1);
+    pf_issued_.reset(new std::atomic<uint32_t>[(size_t) slots]);
+    for (int v = 0; v < slots; ++v) pf_issued_[(size_t) v].store(0);
+    pf_thread_ = std::thread([this] { pf_loop(); });
+    pf_dev_ = (float*) dmalloc(8 * kCpuRows * ne * sizeof(float), "scratch");
+    h_pf_ = (float*) hmalloc(8 * kCpuRows * ne * sizeof(float), "pinned memory");
+    // The prefetched layers' expert tensors mapped again where they are, private and writable, so that pf_pin() can
+    // register their pages: the same file at the same offsets, so every pointer into them reads what it read.
+    std::vector<std::pair<uintptr_t, uintptr_t>> spans;
+    for (const Layer& L : layers_)
+        if (ringable(L) && slot_size(L) <= pf_bytes_)
+            expert_bytes(L, 0, n_expert_, [&](const uint8_t* p, size_t n) {
+                spans.emplace_back((uintptr_t) p / page * page, ((uintptr_t) p + n + page - 1) / page * page);
+            });
+    std::sort(spans.begin(), spans.end());
+    std::vector<std::pair<uintptr_t, uintptr_t>> merged;
+    for (const auto& sp : spans)
+        if (!merged.empty() && sp.first <= merged.back().second) merged.back().second = std::max(merged.back().second, sp.second);
+        else merged.push_back(sp);
+    const auto views = gg_->views();
+    std::vector<int>& fds = pf_fds_;
+    fds.assign(views.size(), -1);
+    size_t bytes = 0;
+    for (const auto& [a, b] : merged) {
+        const auto [file, off] = gg_->place((const uint8_t*) a);
+        if (file < 0 || off % page != 0 || off + (b - a) > views[(size_t) file].second + page) continue;
+        int& fd = fds[(size_t) file];
+        if (fd < 0) fd = ::open(gg_->paths()[(size_t) file].c_str(), O_RDONLY);
+        if (fd < 0) break;
+        void* m = mmap((void*) a, b - a, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED, fd, (off_t) off);
+        if (m != (void*) a) throw std::runtime_error("INK_PREFETCH: mapping the experts again failed");
+        pf_maps_.emplace_back((const uint8_t*) a, b - a);
+        bytes += b - a;
+    }
+    std::fprintf(stderr, "strata-poly: INK_PREFETCH=%d: a ring of %d slots of %.2f MiB, at most %d copies a run, %s; %.1f GiB of "
+                         "experts mapped to be pinned\n", pf_n_, slots, (double) pf_bytes_ / (1 << 20), pf_cap_,
+                 pf_wait_ ? "the card waits for a copy asked" : "only copies that arrived count", (double) bytes / (1 << 30));
+#endif
+}
+
+// The whole pages of expert e of layer il registered (pinned): they become private copies of the file's, which
+// the CPU's experts read as before and the card copies from.  False when it cannot be.
+bool Engine::pf_pin(int il, int e) {
+#if defined(__linux__) && !defined(STRATA_GPU_METAL)
+    const size_t x = (size_t) il * n_expert_ + (size_t) e;
+    if (pf_pinned_[x]) return true;
+    const Layer& L = layers_[(size_t) il];
+    const size_t page = page_bytes();
+    void* done[3];
+    int k = 0;
+    bool ok = true;
+    expert_bytes(L, e, e + 1, [&](const uint8_t* p, size_t n) {
+        const uintptr_t a = ((uintptr_t) p + page - 1) / page * page, b = ((uintptr_t) p + n) / page * page;
+        bool mapped = false;
+        for (const auto& [m, len] : pf_maps_) mapped = mapped || (a >= (uintptr_t) m && b <= (uintptr_t) m + len);
+        if (!ok || !mapped || b <= a || k == 3) {
+            ok = false;
+            return;
+        }
+        if (cudaHostRegister((void*) a, b - a, cudaHostRegisterDefault) != cudaSuccess) {
+            cudaGetLastError();
+            ok = false;
+            return;
+        }
+        done[k++] = (void*) a;
+        // the file cache's copy of those pages is no one's now (a mapped page stays): it goes, not something else
+        const auto [file, off] = gg_->place((const uint8_t*) a);
+        if (file >= 0 && pf_fds_[(size_t) file] >= 0)
+            posix_fadvise(pf_fds_[(size_t) file], (off_t) off, (off_t) (b - a), POSIX_FADV_DONTNEED);
+    });
+    if (!ok)
+        for (int j = 0; j < k; ++j) cudaHostUnregister(done[j]);
+    pf_pinned_[x] = ok;
+    return ok;
+#else
+    (void) il, (void) e;
+    return false;
+#endif
+}
+
+// pf_pin() undone, for an expert the cache took: its private copies go too, and the mapping reads the file again.
+void Engine::pf_unpin(int il, int e) {
+#if defined(__linux__) && !defined(STRATA_GPU_METAL)
+    const size_t x = (size_t) il * n_expert_ + (size_t) e;
+    if (!pf_pinned_[x]) return;
+    cudaStreamSynchronize(cs(pf_st_));   // no copy still reads them (also from ~Engine(): nothing here throws)
+    const size_t page = page_bytes();
+    expert_bytes(layers_[(size_t) il], e, e + 1, [&](const uint8_t* p, size_t n) {
+        const uintptr_t a = ((uintptr_t) p + page - 1) / page * page, b = ((uintptr_t) p + n) / page * page;
+        if (b <= a) return;
+        cudaHostUnregister((void*) a);
+        madvise((void*) a, b - a, MADV_DONTNEED);
+    });
+    pf_pinned_[x] = 0;
+#else
+    (void) il, (void) e;
+#endif
+}
+
+// At the end of the load: every prefetched layer's expert that the cache does not have, pinned.
+void Engine::pf_pin_all() {
+    if (pf_n_ <= 0) return;
+    const auto t0 = Clock::now();
+    int n = 0, failed = 0;
+    for (int il = 0; il < (int) layers_.size(); ++il) {
+        const Layer& L = layers_[(size_t) il];
+        if (!ringable(L) || slot_size(L) > pf_bytes_) continue;
+        for (int e = 0; e < n_expert_; ++e)
+            if (!L.slot[(size_t) e]) (pf_pin(il, e) ? n : failed) += 1;
+    }
+    std::fprintf(stderr, "strata-poly: INK_PREFETCH: %d experts outside VRAM pinned (%.1f GiB) in %.0f ms%s\n", n,
+                 (double) n * (double) pf_bytes_ / (1 << 30), ms_since(t0),
+                 failed ? (", " + std::to_string(failed) + " could not be").c_str() : "");
+}
+
+// After run il's router and its copy (ev_): the next MoE run's router on run il's experts' input, copied out by pf_ev_
+// (a part of the buffers for each of ev_row_, as moe_router()'s read ahead).  Behind ev_, so the host's wait for the
+// router does not wait for this too: there it cost 3% of the decode speed.
+void Engine::predict_next(int il, int n) {
+    if (pf_n_ <= 0 || block_pass_ || n > kCpuRows) return;
+    int j = il + 1;
+    while (j < hi_ && !has_moe(layers_[(size_t) j])) ++j;
+    if (j >= hi_) return;
+    const Layer& N = layers_[(size_t) ex(j)];
+    if (batched(N, n)) return;
+    size_t part = 0;
+    for (size_t q = 0; q < 8; ++q)
+        if (ev_ == ev_row_[q]) part = q;
+    const size_t ne = (size_t) n_expert_, at = part * kCpuRows * ne;
+    next_scores(N, pf_dev_ + at, n);
+    ck(cudaMemcpyAsync(h_pf_ + at, pf_dev_ + at, (size_t) n * ne * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
+       "prefetch scores");
+    ck(cudaEventRecord((cudaEvent_t) pf_ev_, cs(st_)), "prefetch scores");
+}
+
+// In run `run`'s moe(), once it has routed: the next MoE run's likeliest experts by predict_next()'s scores, each
+// token's first, then each one's second, and so on; those VRAM lacks go to the ring slots used longest ago, at most
+// pf_cap_ of them.  A slot this call uses or asked for is not taken.  The copies themselves are pf_loop()'s: asked
+// here, their dozen calls a run held this thread up by 3% of the decode speed.
+void Engine::pf_issue(int run, int n, size_t part) {
+    int j = run + 1;
+    while (j < hi_ && !has_moe(layers_[(size_t) j])) ++j;
+    if (j >= hi_) return;
+    const int xi = ex(j);
+    const Layer& L = layers_[(size_t) xi];
+    if (batched(L, n) || !ringable(L) || slot_size(L) > pf_bytes_) return;
+    ck(cudaEventSynchronize((cudaEvent_t) pf_ev_), "prefetch scores");
+    const size_t ne = (size_t) n_expert_;
+    int ranked[kCpuRows][32], m[kCpuRows];
+    for (int r = 0; r < n; ++r) m[r] = rank_route(j, h_pf_ + (part * kCpuRows + (size_t) r) * ne, ranked[r], pf_n_);
+    // INK_PREFETCH_MIN=k: only for a run whose likeliest experts have k outside VRAM.  A run with one CPU expert is
+    // the card's to wait for anyway (its cached experts take longer than the CPU's one), so a copy for it gains little.
+    if (pf_min_ > 1) {
+        int outside = 0;
+        for (int r = 0; r < n; ++r)
+            for (int q = 0; q < std::min(m[r], n_used_); ++q)
+                outside += !L.slot[(size_t) ranked[r][q]] && pf_of_[(size_t) xi * ne + (size_t) ranked[r][q]] < 0;
+        if (outside < pf_min_ * n) return;
+    }
+    PfJob jobs[kCpuRows * 32];
+    int copies = 0;
+    for (int q = 0; q < pf_n_ && copies < pf_cap_; ++q)
+        for (int r = 0; r < n && copies < pf_cap_; ++r) {
+            if (q >= m[r]) continue;
+            const int e = ranked[r][q];
+            const size_t x = (size_t) xi * ne + (size_t) e;
+            if (L.slot[(size_t) e] || pf_of_[x] >= 0) continue;
+            // one that left the cache after the load is not pinned: pinning it then (cudaHostRegister() on the copier's
+            // thread) held up this thread's launches, and decode fell from 52 to 35 tokens/s
+            if (!pf_pinned_[x]) continue;
+            int v = -1;
+            for (int s = 0; s < (int) pf_.size(); ++s)
+                if (pf_[(size_t) s].tick < pf_tick_ && (v < 0 || pf_[(size_t) s].tick < pf_[(size_t) v].tick)) v = s;
+            if (v < 0) break;
+            PfSlot& S = pf_[(size_t) v];
+            if (S.il >= 0) pf_of_[(size_t) S.il * ne + (size_t) S.e] = -1;
+            jobs[copies++] = {v, xi, e, ++S.gen, S.read};
+            S.il = xi;
+            S.e = e;
+            S.tick = pf_tick_;
+            S.read = false;
+            pf_of_[x] = (int16_t) v;
+            ++stats_.prefetch_copies;
+        }
+    if (copies == 0) return;
+    {
+        std::lock_guard<std::mutex> l(pf_m_);
+        pf_jobs_.insert(pf_jobs_.end(), jobs, jobs + copies);
+        pf_pending_.fetch_add(copies, std::memory_order_release);
+    }
+    pf_cv_.notify_one();
+}
+
+// The copier: each job's expert from its pinned pages into its ring slot, on pf_st_, after the card's last read of
+// the slot; the bytes of its partial pages through the slot's pinned buffer.  pf_issued_ says which of the slot's
+// assignments has its copy asked, which moe() waits for before it counts the slot (an event not yet recorded would
+// read as arrived).
+void Engine::pf_loop() {
+#if defined(__linux__) && !defined(STRATA_GPU_METAL)
+    cudaSetDevice(device_);   // a thread starts on card 0
+    const size_t page = page_bytes();
+    for (;;) {
+        PfJob job;
+        // a while on the lookout before it sleeps: woken, the thread took tens of microseconds of a copy's window
+        for (int spin = 0; spin < 20000 && pf_pending_.load(std::memory_order_acquire) == 0; ++spin) _mm_pause();
+        {
+            std::unique_lock<std::mutex> lk(pf_m_);
+            pf_cv_.wait(lk, [&] { return pf_quit_ || !pf_jobs_.empty(); });
+            if (pf_quit_) return;
+            pf_pending_.fetch_sub(1, std::memory_order_relaxed);
+            job = pf_jobs_.front();
+            pf_jobs_.pop_front();
+        }
+        PfSlot& S = pf_[(size_t) job.v];
+        const Layer& L = layers_[(size_t) job.il];
+        // the edge pages' last upload has left them (asked many runs ago: this does not wait)
+        cudaError_t err = cudaEventSynchronize((cudaEvent_t) S.done);
+        if (err == cudaSuccess && job.after_read) err = cudaStreamWaitEvent(cs(pf_st_), (cudaEvent_t) S.freed, 0);
+        uint8_t* dst = pf_ring_ + (size_t) job.v * pf_bytes_;
+        size_t at = 0;
+        int k = 0;
+        const auto put = [&](size_t to, const void* src, size_t bytes) {
+            if (err == cudaSuccess && bytes) err = cudaMemcpyAsync(dst + to, src, bytes, cudaMemcpyHostToDevice, cs(pf_st_));
+        };
+        expert_bytes(L, job.e, job.e + 1, [&](const uint8_t* p, size_t len) {
+            const uintptr_t a = ((uintptr_t) p + page - 1) / page * page, b = ((uintptr_t) p + len) / page * page;
+            const size_t head = a - (uintptr_t) p, tail = (uintptr_t) p + len - b;
+            if (head) {
+                std::memcpy(S.edge + (size_t) k * page, p, head);
+                put(at, S.edge + (size_t) k++ * page, head);
+            }
+            put(at + head, (const void*) a, b - a);
+            if (tail) {
+                std::memcpy(S.edge + (size_t) k * page, (const void*) b, tail);
+                put(at + head + (b - a), S.edge + (size_t) k++ * page, tail);
+            }
+            at += len;
+        });
+        if (err == cudaSuccess) err = cudaEventRecord((cudaEvent_t) S.done, cs(pf_st_));
+        if (err != cudaSuccess) {
+            std::fprintf(stderr, "strata-poly: INK_PREFETCH copy: %s\n", cudaGetErrorString(err));
+            std::abort();   // the card waits for this copy: nothing could go on
+        }
+        pf_issued_[(size_t) job.v].store(job.gen, std::memory_order_release);
+    }
+#endif
+}
+
 // The routed experts of tokens that come a few at a time.  moe_router() is on its way, with ev_ behind it.  True
 // when experts were computed on the CPU: their sum waits in h_cpu_ for moe_add().  `first` is run once, by the
 // thread that hands the cached experts to the card and ahead of them.
@@ -4064,6 +4425,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         rekeep();
         pool_reseed();
     }
+    ++pf_tick_;
     if (prefetch_k_ > 0 && !block_pass_ && n <= 16) {   // as moe_router() asked for it
         size_t part = 0;
         for (size_t q = 0; q < 8; ++q)
@@ -4090,6 +4452,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         int32_t host_e[kCpuRows * kMaxUsed], host_k[kCpuRows * kMaxUsed];   // a host entry's expert and its place
         float host_rel[kCpuRows * kMaxUsed];   // and its weight's share of its token's experts' weight
         int n_host = 0, n_cached = 0;
+        int pf_used[kCpuRows * kMaxUsed], n_pf_used = 0;   // the ring slots it computes from
         for (int t = 0; t < m; ++t) {
             int ids[kMaxUsed];
             float w[kMaxUsed];
@@ -4122,12 +4485,30 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     cached[n_cached++] = {s, we, at + t, (int) e};
                     continue;
                 }
+                // INK_PREFETCH: from the ring, when its copy was asked (and, with INK_PREFETCH_WAIT=0, has arrived)
+                if (const int v = pf_n_ > 0 ? pf_of_[(size_t) il * n_expert_ + e] : -1; v >= 0) {
+                    PfSlot& S = pf_[(size_t) v];
+                    const std::atomic<uint32_t>& issued = pf_issued_[(size_t) v];
+                    if (pf_wait_)   // the copier asks for it in microseconds
+                        while (issued.load(std::memory_order_acquire) != S.gen) _mm_pause();
+                    if (pf_wait_ || (issued.load(std::memory_order_acquire) == S.gen &&
+                                     cudaEventQuery((cudaEvent_t) S.done) == cudaSuccess)) {
+                        cached[n_cached++] = {pf_ring_ + (size_t) v * pf_bytes_, we, at + t, (int) e};
+                        if (S.tick != pf_tick_) pf_used[n_pf_used++] = v;
+                        S.tick = pf_tick_;
+                        ++stats_.prefetch_hits;
+                        continue;
+                    }
+                    ++stats_.prefetch_late;
+                }
                 host_e[n_host] = (int32_t) e;
                 host_k[n_host] = k;
                 host[n_host++] = {L.exp_gate + e * L.gu_stride, L.exp_up + e * L.u_stride, L.exp_down + e * L.d_bytes,
                                   we, t, L.h_s_gate.empty() ? 1.f : L.h_s_gate[e], L.h_s_up.empty() ? 1.f : L.h_s_up[e]};
             }
         }
+        // INK_PREFETCH_LATE=0: the next run's likeliest experts asked for now, beside this run's experts
+        if (pf_n_ > 0 && !pf_late_ && cur_run_ >= 0 && at == 0 && n <= kCpuRows && !block_pass_) pf_issue(cur_run_, n, 0);
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
         // adds little to any of them, so it is not computed.  The others keep the weights the router gave them.
         // Options::skip_weight in place of the places: one whose weight is under that share of its token's experts'
@@ -4164,6 +4545,9 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         const std::function<void()> launch = [&] {
             if (split_) cudaSetDevice(device_);   // one of the experts' threads, which every card's engine shares
             if (first && at == 0) (*first)();
+            if (pf_wait_)   // the ring's copies this call computes from
+                for (int i = 0; i < n_pf_used; ++i)
+                    ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) pf_[(size_t) pf_used[i]].done, 0), "prefetch copy");
             const size_t ff = (size_t) n_ff_exp_, q8_row = kernels::native_q8_1_bytes(n_ff_exp_);
             // the scratch holds rows_ experts' values, and a launch's down rows stay inside one add_scaled's kSumRows
             const int most = kernels::native_mmvq_slots_wide() ? kSlots : 8;
@@ -4211,6 +4595,11 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     sum.w[k] = c.w;
                     if (k == kSumRows - 1 || i0 + j == n_cached - 1) add_scaled(sum, k + 1, n_embd_, st_);
                 }
+            }
+            for (int i = 0; i < n_pf_used; ++i) {   // a later copy into the slot waits for these reads
+                PfSlot& S = pf_[(size_t) pf_used[i]];
+                ck(cudaEventRecord((cudaEvent_t) S.freed, cs(st_)), "prefetch ring");
+                S.read = true;
             }
 #if defined(STRATA_GPU_METAL)
             if (opt_.metal_optimize && n_host > 0)
@@ -4418,6 +4807,10 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         pool_reads_.clear();
         stats_.cpu_ms += ms_since(t0);
     }
+    // INK_PREFETCH: the next run's likeliest experts asked for once this run's CPU experts are done (the default,
+    // INK_PREFETCH_LATE=1), so that the copies read the memory while the card works and the CPU waits: asked beside the
+    // CPU's experts they made those 12% slower
+    if (pf_n_ > 0 && pf_late_ && cur_run_ >= 0 && n <= kCpuRows && !block_pass_) pf_issue(cur_run_, n, 0);
     return any_host;
 }
 
@@ -5040,6 +5433,7 @@ void Engine::run(const int32_t* tokens, int n) {
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
         if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
+        predict_next(il, m);   // INK_PREFETCH
     };
     const auto tail = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
@@ -5177,8 +5571,10 @@ void Engine::run(const int32_t* tokens, int n) {
         up(il, n, (size_t) n - 1);
         if (!has_moe(L)) continue;
         Layer& X = layers_[(size_t) ex(il)];
+        cur_run_ = il;
         if (batched(X, n)) moe_rows(X, ex(il), n);
         else if (!on_card(il, n, (size_t) n - 1) && moe(X, ex(il), n)) moe_add(n);
+        cur_run_ = -1;
         tail(il, n, (size_t) n - 1);
     }
 }

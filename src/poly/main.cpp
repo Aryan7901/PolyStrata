@@ -1292,6 +1292,11 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                  st.route_wait_ms / (double) std::max<int64_t>(st.tokens, 1), (long long) st.swapped_experts,
                  (long long) st.tail_experts, (long long) r.guessed_right, (long long) r.guessed,
                  (long long) st.igpu_experts);
+    if (st.prefetch_copies > 0)
+        std::fprintf(stderr, "INK_PREFETCH: %lld experts from the ring (%.1f%% of uses), %lld copies, %lld needed before "
+                             "they arrived\n",
+                     (long long) st.prefetch_hits, 100.0 * (double) st.prefetch_hits / experts,
+                     (long long) st.prefetch_copies, (long long) st.prefetch_late);
     return 0;
 }
 

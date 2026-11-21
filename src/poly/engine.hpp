@@ -192,6 +192,10 @@ struct Stats {
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
     int64_t igpu_experts = 0;      ///< CPU experts the integrated GPU computed (INK_IGPU)
+    int64_t prefetch_hits = 0;     ///< INK_PREFETCH: experts outside the cache computed on the card from the ring
+                                   ///< (counted in gpu_experts too)
+    int64_t prefetch_copies = 0;   ///< experts copied into the ring
+    int64_t prefetch_late = 0;     ///< ring experts a run needed before their copy had arrived (left to the CPU)
     double cpu_ms = 0, route_wait_ms = 0;
 };
 
@@ -459,6 +463,11 @@ protected:
     /// INK_PREDICT_LOG (a measurement): the experts run il would pick for the MoE input x, best first, up to n of
     /// them, scored from the host's copy of its router; 0 when the architecture cannot.
     virtual int predict_route(int il, const float* x, int* ranked, int n) const { (void) il, (void) x, (void) ranked, (void) n; return 0; }
+    /// INK_PREFETCH: the n experts run il would rank first by its router's scores `logits`, best first.  The engine's
+    /// own: by the scores; an architecture whose routing adds a bias or a gate of its own ranks as it routes.
+    virtual int rank_route(int il, const float* logits, int* ranked, int n) const;
+    /// INK_PREFETCH: the scores of layer L's router for the experts' input (xn_) of n tokens, into y (on the card).
+    virtual void next_scores(const Layer& L, float* y, int n) { lin(L.gate_inp, xn_, y, n, xq_); }
     /// A prompt batch's routing on the card: n tokens' experts and weights from their scores in rl_, n_used_ a token
     /// into ids and w (on the card), what route() gives them up to the last bits of a weight.  False: the host routes.
     virtual bool route_card(int il, int n, int32_t* ids, float* w) {
@@ -658,6 +667,15 @@ protected:
     int64_t kv_rows_for(int64_t end) const;   ///< the rows cover() maps for `end`
     void held_is_budget();
     void settle_swaps();
+    /// INK_PREFETCH (see pf_ below): the ring and its stream, at load; the next MoE run's router on run il's experts'
+    /// input, in a layer's head; the copies of that run's likeliest experts, in moe(); and the pinning of experts.
+    void pf_setup();
+    void pf_pin_all();
+    bool pf_pin(int il, int e);
+    void pf_unpin(int il, int e);
+    void predict_next(int il, int n);
+    void pf_issue(int run, int n, size_t part);
+    void pf_loop();
 #if defined(STRATA_GPU_METAL)
     virtual std::optional<uint64_t> metal_host_available() const;
     size_t metal_host_headroom();
@@ -1065,6 +1083,65 @@ protected:
     std::vector<int64_t> use_, prior_;   ///< routed count per (layer, expert): this run, and the profile's
     Stats stats_;
     bool stream_stage_ = false;         ///< opt-in streaming CPU stores into the existing expert upload buffers
+
+    // Predictive prefetch, opt-in (INK_PREFETCH=N; the knobs at pf_setup()).  After a run's router the card also scores
+    // the next MoE run's router on this run's experts' input (predict_next()), which names most of the experts that run
+    // will route to.  Once the run's CPU experts are done, moe() hands the likeliest of its N best that VRAM lacks (at
+    // most INK_PREFETCH_CAP) to a thread of its own (pf_loop()), which copies them into a small ring of VRAM slots
+    // (gate | up | down, as a cache slot) on a stream of its own; the next run computes on the card, with the cached
+    // ones, each of its CPU experts that the ring holds, and the rest stay the CPU's.  Measured, it is no faster on the
+    // laptop it was written for (pf_setup() says why), so it stays off.
+    //
+    // The copies need pinned host memory: the experts live in the mapped file, and this driver neither pins a
+    // read-only mapping (cudaHostRegisterReadOnly is unsupported) nor copies pageable memory fast enough (310 us an
+    // expert idle, 1.2 ms beside the CPU's experts, against 160 us pinned).  So the experts' tensors are mapped again
+    // in place, private and writable (the same bytes, still never written), and each expert outside the cache has its
+    // whole pages registered (pf_pin()): the pages become pinned private copies that the CPU's experts read as before.
+    // The bytes of the pages it shares with its neighbours go through a pinned buffer of the slot's (PfSlot::edge).
+    //
+    // An expert counts as there once its copy was asked (INK_PREFETCH_WAIT=1, the default): the card waits for the copy
+    // before its experts, which keeps which experts the card computes a function of the request (run()).  With
+    // INK_PREFETCH_WAIT=0 only a copy that has arrived counts (an event query), and the split depends on timing.
+    struct PfSlot {
+        int il = -1, e = -1;      ///< the expert it holds (the experts' layer), or -1
+        uint64_t tick = 0;        ///< the moe() call that asked for it or used it last
+        void* done = nullptr;     ///< its copy, on pf_st_
+        void* freed = nullptr;    ///< the card's last read of it, on st_
+        bool read = false;        ///< freed was recorded since the copy
+        uint8_t* edge = nullptr;  ///< pinned: the bytes of its expert's partial pages, kPfEdges pages
+        uint32_t gen = 0;         ///< its assignments so far (pf_issued_)
+    };
+    struct PfJob {   ///< a copy for pf_loop(): slot v gets expert e of layer il, its gen-th assignment
+        int v = 0, il = 0, e = 0;
+        uint32_t gen = 0;
+        bool after_read = false;   ///< after the card's last read of the slot (PfSlot::freed)
+    };
+    static constexpr int kPfEdges = 6;   ///< an expert's partial pages: a head and a tail of each of its spans
+    int pf_n_ = 0;                       ///< the next run's likeliest experts it looks at; 0: off
+    int pf_cap_ = 0;                     ///< the most copies a run asks for
+    bool pf_wait_ = true;
+    int pf_min_ = 1;                     ///< INK_PREFETCH_MIN: the run's likeliest n_used_ must have this many outside VRAM
+    bool pf_late_ = true;                ///< copies asked after the run's CPU experts (INK_PREFETCH_LATE=0: before)
+    std::unique_ptr<std::atomic<uint32_t>[]> pf_issued_;   ///< per slot: the assignment whose copy pf_loop() asked
+    std::deque<PfJob> pf_jobs_;
+    std::atomic<int> pf_pending_{0};     ///< pf_jobs_' size, which pf_loop() spins on
+    std::mutex pf_m_;
+    std::condition_variable pf_cv_;
+    bool pf_quit_ = false;
+    std::thread pf_thread_;
+    std::vector<PfSlot> pf_;
+    uint8_t* pf_ring_ = nullptr;
+    size_t pf_bytes_ = 0;                ///< a ring slot's: the layers whose slots are larger are not prefetched
+    std::vector<int16_t> pf_of_;         ///< per (layer, expert): its ring slot, or -1
+    std::vector<uint8_t> pf_pinned_;     ///< per (layer, expert): its whole pages are registered (pf_pin_all())
+    std::vector<int> pf_fds_;            ///< the model's files, for posix_fadvise() of what pf_pin() made private
+    void* pf_st_ = nullptr;
+    float* pf_dev_ = nullptr;            ///< the next run's scores: a part of kCpuRows rows for each of ev_row_
+    float* h_pf_ = nullptr;              ///< pinned
+    void* pf_ev_ = nullptr;              ///< marks predict_next()'s copy
+    uint64_t pf_tick_ = 0;
+    int cur_run_ = -1;                   ///< the run moe() is called for, where run() knows it; else -1
+    std::vector<std::pair<const uint8_t*, size_t>> pf_maps_;   ///< the experts' tensors mapped again (pf_setup())
 };
 
 }  // namespace strata::poly
