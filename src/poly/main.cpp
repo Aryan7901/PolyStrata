@@ -1438,7 +1438,10 @@ void usage() {
                  "                         different answers; qwen35moe's, kolibri1's and Flint's); int8 / int8k (Gemma 4's:\n"
                  "                         the same Q8_0 rule with the codes and their deltas in two arrays, so a\n"
                  "                         reader takes four codes to a load; int8k keeps the keys' side\n"
-                 "                         quantized and the values' in fp16)\n"
+                 "                         quantized and the values' in fp16); k8v4 / k4v4 (Inkling 2's: q8_0\n"
+                 "                         keys, or 4-bit, and 4-bit values, each 4-bit side rotated by a\n"
+                 "                         Walsh-Hadamard matrix first: about a quarter or a half less KV VRAM\n"
+                 "                         than q8_0)\n"
 #if defined(STRATA_GPU_METAL)
                  "                         Metal default: q8_0 for a compatible Qwen35MoE geometry, else fp16\n"
 #endif
@@ -1573,8 +1576,10 @@ int main(int argc, char** argv) {
             else if (fmt == "q8_0") o.kv_format = KvFmt::kQ8_0;
             else if (fmt == "int8") o.kv_format = KvFmt::kInt8;
             else if (fmt == "int8k") o.kv_format = KvFmt::kInt8K;
+            else if (fmt == "k8v4") o.kv_format = KvFmt::kK8V4;
+            else if (fmt == "k4v4") o.kv_format = KvFmt::kK4V4;
             else {
-                std::fprintf(stderr, "strata-poly: --kv %s: unknown format (use fp16, q8_0, int8 or int8k)\n",
+                std::fprintf(stderr, "strata-poly: --kv %s: unknown format (use fp16, q8_0, int8, int8k, k8v4 or k4v4)\n",
                              fmt.c_str());
                 std::exit(2);
             }

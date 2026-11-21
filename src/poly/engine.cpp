@@ -1664,6 +1664,9 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         name != "inkling2")
         throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and inkling2 models; "
                                  "this is a '" + name + "' model");
+    if ((o.kv_format == KvFmt::kK8V4 || o.kv_format == KvFmt::kK4V4) && name != "inkling2")
+        throw std::runtime_error("--kv k8v4 and --kv k4v4 are supported for inkling2 models; this is a '" + name +
+                                 "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))

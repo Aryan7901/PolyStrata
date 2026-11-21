@@ -28,6 +28,7 @@ constexpr float kMinWeightSum = 6.103515625e-5f;   // the floor ggml's MoE graph
 constexpr float kMixEps = 1e-6f;                   // the graph's norms over the depth and in the loop's controllers
 constexpr float kHeadMargin = 12.f;                // the output's shortlist: within this of the best (Q4_0) logit
 constexpr int kHeadCap = 1024;                     // tokens a row's shortlist takes at most
+constexpr int kV4Block = 64;                       // k8v4 and k4v4: the values are rotated in blocks of this many
 
 int64_t of_layer(const MetaValue& v, int il) {
     if (v.type != MetaType::ARRAY) return (int64_t) v.u;
@@ -447,8 +448,10 @@ void Inkling2::alloc_caches() {
     ring_ = std::min(opt_.max_context, window_ + rows_);
     keep_ = std::min(window_, ring_);
     const size_t row = (size_t) n_kv_ * dim_;
-    if (q8()) {   // a row: its codes, and in an array of their own its scales (store_q8)
-        const size_t code = row, scale = row / 32 * sizeof(uint16_t), per = 2 * (code + scale);
+    if (q8()) {   // a row: its codes (store_q8's, or ink_store_q4's at half the bytes), and in an array of their own
+                  // its scales
+        const size_t kcode = v4() == 2 ? row / 2 : row, vcode = v4() ? row / 2 : row;
+        const size_t scale = row / 32 * sizeof(uint16_t), per = kcode + vcode + 2 * scale;
         size_t rings = 0;
         for (const Block& B : blocks_)
             if (B.swa) rings += (size_t) ring_ * per;
@@ -459,16 +462,16 @@ void Inkling2::alloc_caches() {
             B.state = state_ + (size_t) il * state_per_;
             if (B.swa) {
                 B.k_codes = (int8_t*) kv;
-                kv += (size_t) ring_ * code;
+                kv += (size_t) ring_ * kcode;
                 B.v_codes = (int8_t*) kv;
-                kv += (size_t) ring_ * code;
+                kv += (size_t) ring_ * vcode;
                 B.k_sc = (uint16_t*) kv;
                 kv += (size_t) ring_ * scale;
                 B.v_sc = (uint16_t*) kv;
                 kv += (size_t) ring_ * scale;
             } else {
-                B.k_codes = (int8_t*) kv_alloc(code, 1);
-                B.v_codes = (int8_t*) kv_alloc(code, 1);
+                B.k_codes = (int8_t*) kv_alloc(kcode, 1);
+                B.v_codes = (int8_t*) kv_alloc(vcode, 1);
                 B.k_sc = (uint16_t*) kv_alloc(scale, 1);
                 B.v_sc = (uint16_t*) kv_alloc(scale, 1);
             }
@@ -664,6 +667,12 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         head_norm_rope(v_, dim_, nullptr, vraw_, dim_, n_kv_, 0, 1.f, pos_, n, rms_eps_, st_);
         const float* k = k_;
         const int ring = B.swa ? ring_ : 0;
+        // INK_KV4_CHECK=1 (k8v4 or k4v4, with --no-graphs): the same attention over Q8_0 caches of the rows
+        // INK_KV_SIM's 4-bit simulation gives, and of the rows themselves, to compare the real cache's output with
+        static const bool kv4_check_env = std::getenv("INK_KV4_CHECK") != nullptr;
+        const bool kv4_check = kv4_check_env && v4() && !rows && !at;
+        // k4v4: the keys are rotated by the head, and so are the queries (q.k is the same)
+        if (v4() == 2 && rows) ink_hadamard(q_, qgr, hq, n, dim_, st_);
         if (rows) {   // each row into its own sequence's caches at its own position, and its attention there
             for (int i = 0; i < n; ++i) {
                 const Row& r = rows_of_[i];
@@ -679,8 +688,10 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                     int8_t* vcode = (int8_t*) seq_buf(r.seq, B.v_codes);
                     uint16_t* ksc = (uint16_t*) seq_buf(r.seq, B.k_sc);
                     uint16_t* vsc = (uint16_t*) seq_buf(r.seq, B.v_sc);
-                    store_q8_at(kr, kcode, ksc, kvw, ai, 1, ring, st_);
-                    store_q8_at(vr, vcode, vsc, kvw, ai, 1, ring, st_);
+                    if (v4() == 2) ink_store_q4(kr, (uint8_t*) kcode, ksc, kvw, 0, ai, 1, ring, dim_, st_);
+                    else store_q8_at(kr, kcode, ksc, kvw, ai, 1, ring, st_);
+                    if (v4()) ink_store_q4(vr, (uint8_t*) vcode, vsc, kvw, 0, ai, 1, ring, kV4Block, st_);
+                    else store_q8_at(vr, vcode, vsc, kvw, ai, 1, ring, st_);
                     kc = kcode, vc = vcode, ks = ksc, vs = vsc;
                 } else {
                     uint16_t* kcache = (uint16_t*) seq_buf(r.seq, B.keys);
@@ -696,7 +707,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                 ink_attend(q_ + (size_t) i * qgr, qgr, kc, vc, rel + (size_t) i * qgr, qgr, fp(B.rel_table), n_rel_,
                            B.swa ? window_ : extent_, sink_ + (size_t) i * n_head_, att_ + (size_t) i * hq, part_, dim_,
                            n_head_, n_kv_, 1.f / std::sqrt((float) dim_), r.pos, 1, B.swa ? window_ : 0, ring, st_, ai,
-                           sized, ks, vs);
+                           sized, ks, vs, v4());
             }
         }
         // INK_KV_SIM=v4|v4r|k4v4r|k4r (a quality experiment, with --no-graphs): the rows a 4-bit cache would give
@@ -706,7 +717,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         static size_t sim_n = 0;
         for (int side = 0; side < 2 && q8() && !rows; ++side) {
             const float* x = side ? vraw_ : k;
-            if (!kv_sim.empty() && kv_sim.find(side ? "v4" : "k4") != std::string::npos) {
+            if (!kv_sim.empty() && !v4() && kv_sim.find(side ? "v4" : "k4") != std::string::npos) {
                 const size_t need = (size_t) n * kvw;
                 if (need > sim_n) {
                     if (sim_buf) cudaFree(sim_buf);
@@ -719,7 +730,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             }
             int8_t* codes = side ? B.v_codes : B.k_codes;
             uint16_t* sc = side ? B.v_sc : B.k_sc;
-            if (at) {
+            if (side ? v4() > 0 : v4() == 2) {   // 4-bit: rotated (the values in blocks of 64, the keys by the head)
+                ink_store_q4(x, (uint8_t*) codes, sc, kvw, pos_, at, n, ring, side ? kV4Block : dim_, st_);
+            } else if (at) {
                 store_q8_at(x, codes, sc, kvw, at, n, ring, st_);
             } else if (!B.swa) {
                 store_q8(x, codes, sc, kvw, pos_, n, st_);
@@ -742,11 +755,14 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                 if (head < n) store_f16(x + (size_t) head * kvw, cache, kvw, 0, n - head, st_);
             }
         }
+        if (kv4_check) kv4_shadow(B, il, n, k, vraw_, qgr, rel, ring);
+        if (v4() == 2 && !rows) ink_hadamard(q_, qgr, hq, n, dim_, st_);
         const int room_rows = at ? (B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n)) : 0;
         if (!rows) ink_attend(q_, qgr, q8() ? (const void*) B.k_codes : B.keys, q8() ? (const void*) B.v_codes : B.vals, rel, qgr,
                    fp(B.rel_table), n_rel_, B.swa ? window_ : extent_, sink_, att_, part_, dim_, n_head_, n_kv_,
                    1.f / std::sqrt((float) dim_), pos_, n, B.swa ? window_ : 0, ring, st_, at, room_rows,
-                   q8() ? B.k_sc : nullptr, q8() ? B.v_sc : nullptr);
+                   q8() ? B.k_sc : nullptr, q8() ? B.v_sc : nullptr, v4());
+        if (kv4_check) kv4_compare(B, il, n);
         mul_sigmoid(att_, gate, hq, n, qgr, false, st_);
         lin(B.wo, att_, tmp_, n);
         if (rows) ink_conv_rows(tmp_, n_embd_, B.state + 2 * keep * kvw, row_off_, fp(B.attn_conv), nullptr, 1, ao_, n_embd_,
@@ -770,6 +786,92 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     dbg("ffn_in", il, xn_, n_embd_);
     Layer& X = layers_[(size_t) ex(il)];   // the experts' layer: this one, or the loop's first run of it
     if (!batched(X, n)) moe_router(X, n);
+}
+
+// INK_KV4_CHECK: the run's attention over two Q8_0 caches beside the real 4-bit one - of the rows INK_KV_SIM's
+// simulation gives for the 4-bit sides ([0]) and of the rows themselves ([1]); the keys where they are Q8_0 are the
+// real cache's - into shadow_out_.  After the real cache's stores, before the queries are rotated.
+void Inkling2::kv4_shadow(const Block& B, int il, int n, const float* k, const float* v, int qgr, const float* rel,
+                          int ring) {
+    const int kvw = n_kv_ * dim_, hq = n_head_ * dim_;
+    if (shadow_.empty()) {
+        shadow_.resize(blocks_.size());
+        ck(cudaMalloc(&shadow_rows_, (size_t) rows_ * kvw * sizeof(float)), "INK_KV4_CHECK");
+        ck(cudaMalloc(&shadow_out_, 2 * (size_t) rows_ * hq * sizeof(float)), "INK_KV4_CHECK");
+    }
+    const size_t cap = B.swa ? (size_t) ring_ : (size_t) opt_.max_context;
+    for (Shadow& sh : shadow_[(size_t) il]) {
+        if (sh.vc) continue;
+        const auto get = [&](size_t bytes) {
+            void* p = nullptr;
+            ck(cudaMalloc(&p, cap * bytes), "INK_KV4_CHECK");
+            return p;
+        };
+        sh.vc = (int8_t*) get(kvw);
+        sh.vs = (uint16_t*) get(kvw / 32 * sizeof(uint16_t));
+        if (v4() == 2) {
+            sh.kc = (int8_t*) get(kvw);
+            sh.ks = (uint16_t*) get(kvw / 32 * sizeof(uint16_t));
+        }
+    }
+    for (int j = 0; j < 2; ++j) {
+        Shadow& sh = shadow_[(size_t) il][(size_t) j];
+        for (int side = 0; side < 2; ++side) {
+            if (side == 0 && v4() != 2) continue;
+            const float* x = side ? v : k;
+            if (j == 0) {
+                ink_kv_sim(x, shadow_rows_, n, kvw, side ? kV4Block : dim_, 1, st_);
+                x = shadow_rows_;
+            }
+            int8_t* codes = side ? sh.vc : sh.kc;
+            uint16_t* sc = side ? sh.vs : sh.ks;
+            if (!B.swa) {
+                store_q8(x, codes, sc, kvw, pos_, n, st_);
+            } else {
+                const int a = (int) (pos_ % ring_), head = std::min(n, ring_ - a);
+                store_q8(x, codes, sc, kvw, a, head, st_);
+                if (head < n) store_q8(x + (size_t) head * kvw, codes, sc, kvw, 0, n - head, st_);
+            }
+        }
+        ink_attend(q_, qgr, v4() == 2 ? sh.kc : B.k_codes, sh.vc, rel, qgr, fp(B.rel_table), n_rel_,
+                   B.swa ? window_ : extent_, sink_, shadow_out_ + (size_t) j * rows_ * hq, part_, dim_, n_head_, n_kv_,
+                   1.f / std::sqrt((float) dim_), pos_, n, B.swa ? window_ : 0, ring, st_, nullptr, 0,
+                   v4() == 2 ? sh.ks : B.k_sc, sh.vs);
+    }
+}
+
+// INK_KV4_CHECK: the real cache's attention output (att_) against the two shadows', summed by kind of call (a prompt
+// batch or a token) and run (full or window); printed after each prompt batch and every 50 tokens.
+void Inkling2::kv4_compare(const Block& B, int il, int n) {
+    const size_t m = (size_t) n * n_head_ * dim_, hq = (size_t) n_head_ * dim_;
+    std::vector<float> real(m), sim(m), raw(m);
+    ck(cudaMemcpyAsync(real.data(), att_, m * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)), "INK_KV4_CHECK");
+    ck(cudaMemcpyAsync(sim.data(), shadow_out_, m * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)), "INK_KV4_CHECK");
+    ck(cudaMemcpyAsync(raw.data(), shadow_out_ + (size_t) rows_ * hq, m * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
+       "INK_KV4_CHECK");
+    ck(cudaStreamSynchronize(cs(st_)), "INK_KV4_CHECK");
+    double* e = shadow_err_[n > 8 ? 0 : 1][B.swa ? 1 : 0];
+    for (size_t i = 0; i < m; ++i) {
+        const double a = real[i], b = sim[i], c = raw[i];
+        e[0] += (a - b) * (a - b);
+        e[1] += b * b;
+        e[2] += (b - c) * (b - c);
+        e[3] += (a - c) * (a - c);
+        e[4] += c * c;
+        e[5] = std::max(e[5], std::fabs(a - b));
+    }
+    if (il != n_layer_ - 1) return;
+    static int tokens = 0;
+    if (n <= 8 && ++tokens % 50 != 0) return;
+    const char* kind[2] = {"prompt", "decode"};
+    const char* run[2] = {"full", "window"};
+    for (int c = n > 8 ? 0 : 1, r = 0; r < 2; ++r) {
+        const double* x = shadow_err_[c][r];
+        if (x[4] <= 0) continue;
+        std::fprintf(stderr, "INK_KV4_CHECK %s to pos %lld, %s runs: real vs sim rel err %.3g (max abs %.3g); sim vs q8 "
+                     "%.3g; real vs q8 %.3g\n", kind[c], (long long) (pos_ + n), run[r], std::sqrt(x[0] / x[1]), x[5],
+                     std::sqrt(x[2] / x[4]), std::sqrt(x[3] / x[4]));
+    }
 }
 
 // The experts' sum through its convolution, into the residual.
@@ -941,8 +1043,8 @@ int Inkling2::head_key(int il, int n) const { return blocks_[(size_t) il].swa ? 
 std::vector<std::pair<uint8_t*, size_t>> Inkling2::arrays(const Block& B) const {
     const size_t row = (size_t) n_kv_ * dim_;
     if (q8())
-        return {{(uint8_t*) B.k_codes, row}, {(uint8_t*) B.k_sc, row / 32 * sizeof(uint16_t)},
-                {(uint8_t*) B.v_codes, row}, {(uint8_t*) B.v_sc, row / 32 * sizeof(uint16_t)}};
+        return {{(uint8_t*) B.k_codes, v4() == 2 ? row / 2 : row}, {(uint8_t*) B.k_sc, row / 32 * sizeof(uint16_t)},
+                {(uint8_t*) B.v_codes, v4() ? row / 2 : row}, {(uint8_t*) B.v_sc, row / 32 * sizeof(uint16_t)}};
     return {{(uint8_t*) B.keys, row * sizeof(uint16_t)}, {(uint8_t*) B.vals, row * sizeof(uint16_t)}};
 }
 

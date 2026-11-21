@@ -485,10 +485,24 @@ void ink_set_offsets(long long* dst, const long long* v, int n, void* stream);
 /// ink_attend_floats().  With `at`, the launch is sized for positions below room.
 size_t ink_attend_floats(int rows, int heads, int max_ctx);
 /// With kscales and vscales (Q8_0: an fp16 scale every 32 values), kcache and vcache are int8 codes (store_q8).
+/// v4 = 1: vcache is ink_store_q4's (values rotated in blocks of 64), and each head's output is rotated back before it
+/// is written; v4 = 2: kcache too (keys rotated by the head), and q must come rotated the same way (ink_hadamard).
 void ink_attend(const float* q, int q_stride, const void* kcache, const void* vcache, const float* rel,
                 int rel_stride, const float* table, int n_rel, int extent, const float* sink, float* out, float* part, int dim, int heads, int kv_heads,
                 float scale, int64_t pos, int rows, int window, int ring, void* stream, const long long* at = nullptr,
-                int room = 0, const uint16_t* kscales = nullptr, const uint16_t* vscales = nullptr);
+                int room = 0, const uint16_t* kscales = nullptr, const uint16_t* vscales = nullptr, int v4 = 0);
+/// Inkling's 4-bit cache side (--kv k8v4's values, k4v4's keys and values): each `block` values of a row (64 for
+/// values, 128 - the head - for keys) rotated by the orthonormal Walsh-Hadamard matrix (Sylvester's, no signs: H = H^T
+/// = H^-1, as llama.cpp rotates a cache), then rounded to ggml Q4_0's levels a 32-value block: the block's value of
+/// the largest magnitude over -8 as its fp16 scale (n / 32 a row in `scales`), code = min(15, (int) (x / d + 8.5)),
+/// value = (code - 8) * d.  codes: n / 2 bytes a row, a 32-bit word 8 values with value 2k in nibble k and value
+/// 2k + 1 in nibble k + 4, so that a reader turns a pair into a half2 with one mask.  Row t of x goes to cache row
+/// (at ? *at : pos) + t, modulo ring where ring > 0.  n a multiple of block.
+void ink_store_q4(const float* x, uint8_t* codes, uint16_t* scales, int n, int64_t pos, const long long* at, int rows,
+                  int ring, int block, void* stream);
+/// x <- H x (the orthonormal Walsh-Hadamard matrix) for each `block` (64 or 128) values of the first n of each of
+/// `rows` rows, `stride` floats apart: k4v4's queries, rotated as its keys are.
+void ink_hadamard(float* x, int stride, int n, int rows, int block, void* stream);
 /// y = w x for 1 to 8 tokens of an F32 matrix (n_out rows of n_in, n_in a multiple of 4); false (nothing done) for
 /// other shapes.  For narrow matrices, where the general gemv gives too few blocks.
 bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream);

@@ -22,6 +22,7 @@
 
 #include "engine.hpp"
 
+#include <array>
 #include <initializer_list>
 
 namespace strata::poly {
@@ -85,8 +86,8 @@ private:
         Dev probs_b_dev;
         uint16_t* keys = nullptr;   ///< fp16 rows of n_kv * dim: a ring in a window layer
         uint16_t* vals = nullptr;
-        int8_t* k_codes = nullptr;  ///< --kv q8_0: the same rows as int8 codes and an fp16 scale every 32 values
-        int8_t* v_codes = nullptr;
+        int8_t* k_codes = nullptr;  ///< --kv q8_0: the same rows as int8 codes and an fp16 scale every 32 values;
+        int8_t* v_codes = nullptr;  ///< k8v4: the values' as ink_store_q4's 4-bit codes (half the bytes), k4v4: both
         uint16_t* k_sc = nullptr;
         uint16_t* v_sc = nullptr;
         float* state = nullptr;     ///< the convolutions' past inputs: k, v, the attention's output, the experts' sum
@@ -104,10 +105,27 @@ private:
     /// The loop's message controller of module m on rows of x (n_embd a token, contiguous), in place.
     void control(Block& B, int m, float* x, const float* msg, int n);
     void plan();
-    bool q8() const { return opt_.kv_format == KvFmt::kQ8_0; }
-    /// A run's cache as arrays of rows, keys' side first: (the array, its bytes a row).  fp16: one a side; q8_0: the
-    /// codes and the scales a side.
+    /// The cache is codes and their scales (q8_0, k8v4, k4v4), not fp16 rows.
+    bool q8() const { return opt_.kv_format == KvFmt::kQ8_0 || v4(); }
+    /// Its 4-bit sides, as ink_attend takes them: 0 none, 1 the values (k8v4), 2 the keys too (k4v4).
+    int v4() const { return opt_.kv_format == KvFmt::kK8V4 ? 1 : opt_.kv_format == KvFmt::kK4V4 ? 2 : 0; }
+    /// A run's cache as arrays of rows, keys' side first: (the array, its bytes a row).  fp16: one a side; q8_0, k8v4
+    /// and k4v4: the codes and the scales a side.
     std::vector<std::pair<uint8_t*, size_t>> arrays(const Block& B) const;
+    /// INK_KV4_CHECK (inkling2.cpp): Q8_0 caches beside a 4-bit one, of the simulated ([0]) and of the plain ([1])
+    /// rows of its 4-bit sides, and the attention over them.
+    struct Shadow {
+        int8_t* kc = nullptr;
+        int8_t* vc = nullptr;
+        uint16_t* ks = nullptr;
+        uint16_t* vs = nullptr;
+    };
+    std::vector<std::array<Shadow, 2>> shadow_;
+    float* shadow_rows_ = nullptr;
+    float* shadow_out_ = nullptr;
+    double shadow_err_[2][2][6] = {};
+    void kv4_shadow(const Block& B, int il, int n, const float* k, const float* v, int qgr, const float* rel, int ring);
+    void kv4_compare(const Block& B, int il, int n);
     /// lin() of an F32 matrix, a prompt batch through cuBLAS's SGEMM.
     void lin_f32(const Dev& w, const float* x, float* y, int n);
 

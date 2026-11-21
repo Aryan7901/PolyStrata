@@ -46,8 +46,9 @@ struct Likeliest;
 /// deltas in two arrays, which a reader can take four codes to a load, and int8k keeps only the keys' side
 /// quantized.  q8_0 is qwen35moe's; int8 and int8k are Gemma 4's - the two readers are not the same arithmetic,
 /// so a model has one or the other rather than a choice between them.  Auto is resolved from model
-/// geometry before allocation on Metal; other backends default to fp16.
-enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3 };
+/// geometry before allocation on Metal; other backends default to fp16.  k8v4 and k4v4 are Inkling 2's: the keys as
+/// q8_0 or 4-bit, the values 4-bit, each 4-bit side rotated first (ink_store_q4).
+enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kK8V4 = 4, kK4V4 = 5 };
 
 struct Options {
 #if defined(STRATA_GPU_METAL)
