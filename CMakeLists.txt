@@ -2088,13 +2088,14 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   # MXFP4 and NVFP4: on RTX 50 llama.cpp's tiles use the FP4 MMA with block scales, which exists only in the
   # arch-specific target, so on CUDA their instances alone are built with 12x -> 12xa, as Strata's W4A4 unit is.  A
   # Blackwell other than 12.0 has no image of them, and Mmq::fits() leaves MXFP4 out there.  NVFP4 takes this
-  # instance only on a 12.0 card with STRATA_PREFILL_NVFP4=w4a4; otherwise its tiles are mmq_nvfp4.cu's int8 ones,
-  # built for the architectures as given.  On HIP there is no NVFP4 prompt product.
+  # instance only on a 12.0 card with STRATA_PREFILL_NVFP4=w4a4; w4a4x2 uses the two-term FP4 product under the
+  # same architecture target. Otherwise its tiles are mmq_nvfp4.cu's int8 ones, built for the architectures
+  # as given. On HIP there is no NVFP4 prompt product.
   set(_strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-mxfp4.cu)
   if(STRATA_ENABLE_HIP)
     list(APPEND _strata_poly_mmq_instances ${_strata_poly_mxfp4})
   else()
-    list(APPEND _strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-nvfp4.cu)
+    list(APPEND _strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-nvfp4.cu src/poly/mmq_nvfp4_x2.cu)
     list(APPEND _strata_poly_mmq_instances src/poly/mmq_nvfp4.cu)
     set(_strata_poly_fp4_archs ${CMAKE_CUDA_ARCHITECTURES})
     list(TRANSFORM _strata_poly_fp4_archs REPLACE "^(12[0-9])$" "\\1a")
@@ -2142,8 +2143,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     # Optional model/state check; run by hand with an MTP GGUF and frozen prompt IDs.
     add_executable(poly_gdn_mma_state_test src/poly/gdn_mma_state_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                    src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp
-                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/igpu.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
-                   src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu src/core/conversation_memory.cpp)
+                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/inkling2_dspark.cpp src/poly/igpu.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
+                   src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu src/poly/kernels_dspark.cu src/core/conversation_memory.cpp)
     target_include_directories(poly_gdn_mma_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(poly_gdn_mma_state_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
                          ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} CUDA::cuda_driver Threads::Threads)
@@ -2151,8 +2152,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
 
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
-                            src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/igpu.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
-                            src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp)
+                            src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/inkling2_dspark.cpp src/poly/igpu.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
+                            src/poly/kernels_dspark.cu src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
   # memory management calls, which the HIP runtime itself provides (hip_compat/cuda.h)
@@ -2176,9 +2177,9 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   # poly_draft_race_test MODEL.gguf [RUNS] [LAYER_SPLIT]
   add_executable(poly_draft_race_test src/poly/draft_race_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
-                                      src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/igpu.cpp
+                                      src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/inkling2_dspark.cpp src/poly/igpu.cpp
                                       src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
-                                      src/core/conversation_memory.cpp)
+                                      src/poly/kernels_dspark.cu src/core/conversation_memory.cpp)
   target_include_directories(poly_draft_race_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                          ${_strata_gpu_include_directories})
   target_link_libraries(poly_draft_race_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base

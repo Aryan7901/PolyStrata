@@ -7,6 +7,7 @@
 // STOP and QUIT in, and RESUME, PP, T, DONE and ERR out.
 #include "conversations.hpp"
 #include "engine.hpp"
+#include "draft_windows.hpp"
 #include "guesses.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -54,6 +55,7 @@ namespace {
 using strata::poly::CacheOptions;
 using strata::poly::Conversations;
 using strata::poly::Engine;
+using strata::poly::DraftWindows;
 using strata::poly::Guesses;
 using strata::poly::KvFmt;
 using strata::poly::Options;
@@ -356,14 +358,15 @@ struct Session {
     strata::spec::SuffixDrafter repeats;
     strata::spec::DraftPolicy policy;
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
+    DraftWindows windows;                 // a drafter that states its drafts' chances: the window (draft_windows.hpp)
     int piece_calls = kPiece;             // generate()'s pieces when it is given `between`
     std::string pinned;                   // --pinned-session: the file serve() pins before its first request
 
     Session(Engine& e, std::vector<int32_t> eos_ids, const CacheFlags& f, int lookup)
         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
-          most(lookup > 0 || e.drafts() ? std::min<int>(e.max_window(), strata::spec::DraftPolicy::kMaxT) : 1),
+          most(lookup > 0 || e.drafts() || e.drafts_blocks() ? std::min<int>(e.max_window(), strata::spec::DraftPolicy::kMaxT) : 1),
           look(lookup > 0 && most > 1),
-          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most) {}
+          repeats(std::max(lookup, 3), 64, (size_t) e.max_context() + 4096), policy(most), windows(most) {}
 
     static CacheOptions with_floor(const CacheFlags& f) {
         CacheOptions o = f.o;
@@ -380,6 +383,10 @@ struct Session {
         int64_t produced = 0, resume = 0, read = 0;
         int64_t gave_way = -1;   // where `between` stopped the read
         int64_t guessed = 0, guessed_right = 0;
+        // a drafter of its own (Engine::draft_block()): rounds, the ones it drafted in, the windows by tokens, its
+        // drafts verified and right, the lookup's
+        int64_t rounds = 0, drafted = 0, by_t[strata::spec::DraftPolicy::kMaxT + 1] = {};
+        int64_t ds_verified = 0, ds_right = 0, lk_verified = 0, lk_right = 0;
         double prompt_ms = 0, decode_ms = 0;
         const char* finish = "length";
     };
@@ -506,6 +513,13 @@ struct Session {
         };
         if (max_new > 0) {
             int32_t w[strata::spec::DraftPolicy::kMaxT], d[strata::spec::DraftPolicy::kMaxT];
+            float chance[strata::spec::DraftPolicy::kMaxT];
+            static const bool draft_backoff = [] {
+                const char* v = std::getenv("STRATA_DRAFT_BACKOFF");
+                return v && std::atoi(v) == 1;
+            }();
+            int draft_rest = 0, draft_misses = 0;
+            double draft_ms = 0.0;   // what asking the drafter takes (a moving mean)
             const int block_window = engine.guesses_at_once() ? most : kBlockWindow;
             int32_t t = pick(engine.logits());   // picked, and not shown yet
             while (show(t)) {
@@ -514,6 +528,69 @@ struct Session {
                 const bool room = engine.pos() + most <= engine.max_context();
                 const int offered = look && room ? repeats.propose(most - 1, w + 1) : 0;
                 const int match = repeats.last_match();
+                ++r.rounds;
+                if (engine.drafts_blocks()) {
+                    // A drafter that drafts a block at once and states each draft's chance (DSpark): the window is
+                    // the one with the most tokens a millisecond expected from the chances and the measured costs
+                    // of each window (DraftWindows), against the repeat's window.  Whether the drafter is asked at
+                    // all is the gate's (guesses.hpp): a block costs a few milliseconds, which text it guesses badly
+                    // does not pay back.  A repeat that fills its window from a match right nine times in ten is
+                    // taken as it is.
+                    const int lk_widest = match >= kCopyMatch ? most : std::min(most, kBlockWindow);
+                    const int k = std::min(offered, lk_widest - 1);
+                    const bool sure = k == lk_widest - 1 && windows.lookup_rate(match) >= 0.9;
+                    // STRATA_DRAFT_BACKOFF=1: after a drafted round that gained no token the drafter rests for 1,
+                    // 2, 4, then 8 rounds, until a drafted round gains one
+                    bool resting = false;
+                    if (room && !sure && draft_rest > 0) {
+                        --draft_rest;
+                        resting = true;
+                    }
+                    const bool ask = room && !sure && !resting && guesses.gate.ask();
+                    // the drafts stop once no window could hold the next one (DraftWindows::may_verify)
+                    const std::function<bool(int)> wanted = [&](int j) { return windows.may_verify(chance, j, most - 1); };
+                    const Clock::time_point drafting = Clock::now();
+                    const int n_d = ask ? engine.draft_block(t, most - 1, d, chance, &wanted) : 0;
+                    if (n_d > 0) draft_ms = draft_ms > 0 ? draft_ms + 0.1 * (ms_since(drafting) - draft_ms) : ms_since(drafting);
+                    const DraftWindows::Pick use =
+                        n_d > 0 ? windows.choose_window(chance, n_d, k, match) : windows.choose_lookup(k, match);
+                    int right = 0;
+                    bool more = true;
+                    if (use.t == 1) {
+                        engine.eval(&t, 1, true);
+                        kept.read(&t, 1);
+                        t = pick(engine.logits());
+                    } else {
+                        w[0] = t;
+                        if (!use.lookup) std::copy(d, d + use.t - 1, w + 1);
+                        engine.window(w, use.t);
+                        t = pick(engine.logits_of(0));
+                        while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
+                        engine.keep(right + 1);
+                        kept.read(w, right + 1);
+                        r.guessed += use.t - 1;
+                        r.guessed_right += right + (more ? 0 : 1);
+                        (use.lookup ? r.lk_verified : r.ds_verified) += use.t - 1;
+                        (use.lookup ? r.lk_right : r.ds_right) += right;
+                    }
+                    ++r.by_t[use.t];
+                    r.drafted += n_d > 0;
+                    // a round that recorded launches took many rounds' time: it says nothing of the rounds to come
+                    const double ms = engine.took_record() ? 0.0 : ms_since(round);
+                    // the costs are a drafted round's: one the drafter was not in counts as if it had drafted
+                    const double as_drafted = ms > 0 && n_d == 0 ? ms + draft_ms : ms;
+                    if (use.lookup) windows.observe(true, use.t, right, match, as_drafted);
+                    else if (n_d > 0) windows.observe_window(chance, use.t, right, as_drafted);
+                    else windows.observe(false, 1, 0, 0, as_drafted);
+                    if (room && !sure && !resting && ms > 0) guesses.gate.saw(ask, right + 1, ms);
+                    if (ask && draft_backoff) {
+                        const bool gained = n_d > 0 && !use.lookup && right > 0;
+                        draft_misses = gained ? 0 : draft_misses + 1;
+                        draft_rest = gained ? 0 : 1 << std::min(draft_misses - 1, 3);
+                    }
+                    if (!more) break;
+                    continue;
+                }
                 const int widest = match >= kCopyMatch ? most : std::min(most, block_window);   // this round's window
                 const int k = std::min(offered, widest - 1);
                 // A repeat that fills the window, from a match of a length that has been right nine times in ten,
@@ -1292,6 +1369,18 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
                  st.route_wait_ms / (double) std::max<int64_t>(st.tokens, 1), (long long) st.swapped_experts,
                  (long long) st.tail_experts, (long long) r.guessed_right, (long long) r.guessed,
                  (long long) st.igpu_experts);
+    if (ss.engine.drafts_blocks()) {   // DSpark: its drafts and windows
+        std::string by;
+        for (int t = 1; t <= strata::spec::DraftPolicy::kMaxT; ++t)
+            if (r.by_t[t]) by += " " + std::to_string(t) + ":" + std::to_string(r.by_t[t]);
+        std::fprintf(stderr,
+                     "dspark: %lld rounds, %.2f tokens a round, drafted in %lld; drafts accepted %lld of %lld (%.1f%%), "
+                     "lookup %lld of %lld; windows by tokens%s; %s\n",
+                     (long long) r.rounds, r.rounds ? (double) r.produced / (double) r.rounds : 0.0,
+                     (long long) r.drafted, (long long) r.ds_right, (long long) r.ds_verified,
+                     r.ds_verified ? 100.0 * (double) r.ds_right / (double) r.ds_verified : 0.0,
+                     (long long) r.lk_right, (long long) r.lk_verified, by.c_str(), ss.engine.draft_report().c_str());
+    }
     return 0;
 }
 
@@ -1426,7 +1515,11 @@ void usage() {
                  "                         (default 3, 0 = never)\n"
                  "  --no-draft             do not run the block that guesses ahead\n"
                  "  --draft-model FILE     a file of the same model to take that block from, when --model has none;\n"
-                 "                         for Gemma 4, its draft model (a gemma4-assistant file)\n"
+                 "                         for Gemma 4, its draft model (a gemma4-assistant file); for Inkling 2,\n"
+                 "                         its DSpark drafter (a dflash GGUF of the official mtp.safetensors): a\n"
+                 "                         block drafts up to 7 tokens, each with a stated chance, and each round\n"
+                 "                         verifies the drafts that pay at the measured cost of a row (off unless\n"
+                 "                         given; INK_DSPARK_SPAN=N: positions its full layer reads, default 8192)\n"
                  "  --draft-vocab N        the block guesses among the vocabulary's first N tokens (default:\n"
                  "                         131072 for Qwen3.6, Ornith and Tiel, all of it for the others; 0 = all)\n"
                  "  --no-graphs            launch a token's kernels one by one (default: a layer's are recorded once\n"

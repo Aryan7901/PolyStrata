@@ -35,6 +35,11 @@ public:
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
+    // DSpark (--draft-model, inkling2_dspark.cpp)
+    int draft_block(int32_t token, int n, int32_t* ids, float* chance,
+                    const std::function<bool(int)>* more = nullptr) override;
+    bool drafts_blocks() const override { return ds_.on; }
+    std::string draft_report() const override;
 
 protected:
     void load_geometry() override;
@@ -68,6 +73,9 @@ protected:
     bool merge_heads() const override;
     bool sees() const override { return true; }   // pictures: rows of Inkling's vision encoder (strata-vision)
     void after_load() override;
+    bool every_output() const override { return ds_.on; }
+    void outputs(int64_t pos, int n, const float* h) override;
+    void shift_rows(ptrdiff_t by) override;
 
 private:
     /// A run's weights beside the ones every architecture has (Layer), and its caches and state.
@@ -164,11 +172,76 @@ private:
     const void* head_dev_ = nullptr;   // the card's address of it
     void head_check(const float* got, const float* h, int rows);
 
+    // ---- DSpark: Thinking Machines' drafter for Inkling 2 (--draft-model, inkling2_dspark.cpp), adapted from Basalt's
+    // (src/models/inkling2/dspark.{hpp,cpp}, https://github.com/jesdga95/basalt, MIT).  For every row it runs the
+    // target leaves the inputs of three of its runs (the taps) and its final normed state; the drafter mixes them into
+    // the keys and values of its three layers' context.  A round's block - the anchor and seven mask rows through the
+    // three layers, then a recurrent Markov head over the target's output matrix - drafts up to seven tokens, each with
+    // the chance the drafter gives it.  The target verifies every draft (window()): only the speed depends on them.
+    struct DsLayer {
+        bool swa = false;
+        Dev wq, wk, wv, wo, gate, up, down, k_ctx, v_ctx;
+        Dev attn_norm, post_norm, dflare_norm, q_norm, k_norm, k_ctx_norm;
+        uint16_t* kc = nullptr;   ///< fp16 keys, kv_heads * dim a cell, position p at cell p % cells
+        uint16_t* vc = nullptr;
+        int cells = 0;
+        int window = 0;           ///< the positions before a block its rows read (with the block's own)
+    };
+    struct Dspark {
+        bool on = false;
+        int layers = 0, block = 8, n_ff = 0, heads = 0, kv_heads = 0, dim = 0, window = 0, rank = 0, span = 0;
+        int targets[3] = {-1, -1, -1};   ///< the runs whose inputs it reads
+        int vocab = 0;                    ///< the output's first rows it drafts among
+        float eps = 1e-6f, theta_scale = 1.f, cap = 0.f;
+        std::vector<DsLayer> L;
+        Dev alpha, mask, norm, markov_norm, w_sp, w_h, w_f, rnn_b, out_b, fold, fold_b;
+        std::vector<float> h_mask;        ///< mask_embd on the host: the block's rows after the anchor
+        uint16_t* w1 = nullptr;           ///< markov_w1 (bf16, rank a token) in pinned host memory: the card's address
+        void* w1_host = nullptr;          ///< and the host's
+        bool folded = false;
+        uint16_t* tap = nullptr;          ///< bf16 rows of the three runs' inputs, rows_ a slot
+        uint16_t* h_tap = nullptr;        ///< pinned: a read's taps while it takes its calls a layer at a time
+        int64_t h_tap_rows = 0;
+        int64_t tap_off = 0;              ///< shift_rows()'s rows
+        float *mix = nullptr, *fr = nullptr, *kb = nullptr, *vb = nullptr, *kr = nullptr;
+        float *x = nullptr, *xn = nullptr, *q = nullptr, *qr = nullptr, *att = nullptr, *tmp = nullptr, *g = nullptr,
+              *u = nullptr, *hh = nullptr, *score = nullptr, *base = nullptr, *ctx = nullptr,
+              *ctx_f = nullptr, *state = nullptr, *latent = nullptr;
+        void* pick = nullptr;             ///< ds_pick()'s scratch
+        size_t score_floats = 0;
+        Likeliest* lk = nullptr;          ///< a block's drafts on the card
+        Likeliest* h_lk = nullptr;        ///< and pinned
+        int32_t* prev = nullptr;          ///< the anchor, on the card
+        float* h_in = nullptr;            ///< pinned: the block's input rows, then the anchor
+        int64_t lo = 0, hi = 0;           ///< the positions whose context the caches hold
+        long long blocks = 0, drafted = 0, commits = 0;
+        double block_ms = 0;
+        // INK_DSPARK_PROF=1: a wait for the card between the phases, and each phase's time: the block's inputs, its
+        // layers before the attention, the attention, after it, the head's base, its context terms, the drafts, and
+        // the context's commit
+        bool prof = false;
+        double ph[8] = {};
+        size_t vram_weights = 0, vram_scratch = 0, vram_own = 0;   ///< the drafter's VRAM, for the load's line
+        bool idle = false;   ///< INK_DSPARK_IDLE=1: loaded and fed, never drafting
+        bool dry = false;    ///< INK_DSPARK_DRY=1: drafts made and thrown away (a block's effect on the rest, for tests)
+    };
+    static constexpr int kDsCommit = 64;   ///< rows a step of the context's commit takes
+    static constexpr int kDsRing = 16;     ///< positions whose Markov context fr keeps
+    Dspark ds_;
+    void ds_geometry();
+    void ds_load();
+    void ds_scratch();
+    void ds_fold();
+    void ds_capture(int il, const float* cur, int rs, int n);
+    void ds_store(const DsLayer& D, const float* k, const float* v, int64_t pos, int n);
+    void ds_mm(const Dev& w, const float* x, float* y, int n);
+
     // device scratch, rows_ tokens
     float *mix_ = nullptr, *msg_ = nullptr, *ctl_ = nullptr, *ctl_h_ = nullptr,
           *ctl_g_ = nullptr, *ctl_f_ = nullptr, *xin_ = nullptr, *q_ = nullptr, *gate_ = nullptr, *rel_ = nullptr,
           *sink_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *vraw_ = nullptr, *v_ = nullptr, *dyn_ = nullptr,
           *att_ = nullptr, *part_ = nullptr, *tmp_ = nullptr;
+    unsigned int* attn_counters_ = nullptr;  ///< completion counters for a token's attention splits
     float* xq3_ = nullptr;           ///< the attention's inputs in Q8_1 (layer_head)
     long long* row_off_ = nullptr;   ///< step(): each row's sequence's state, in floats from the bound one's
 };

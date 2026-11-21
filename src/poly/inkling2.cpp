@@ -108,6 +108,7 @@ Dev Inkling2::msg_queries() {
 
 Inkling2::~Inkling2() {
     if (head_host_) cudaFreeHost(head_host_);
+    if (ds_.w1_host) cudaFreeHost(ds_.w1_host);
     if (igpu_) set_igpu(nullptr);
 }
 
@@ -115,6 +116,11 @@ Inkling2::~Inkling2() {
 // it can take some of a token's CPU experts while the CPU's threads compute the others (igpu.hpp).  RAM holds one copy
 // still: the file's pages of them leave the process.  The Q8_0 layers (20-23) stay where they are, on the CPU.
 void Inkling2::after_load() {
+    if (ds_.on || std::getenv("INK_VRAM_REPORT"))
+        std::fprintf(stderr, "strata-poly: DSpark drafter's VRAM: %.0f MiB of weights, %.0f MiB of scratch, %.0f MiB of "
+                             "caches; the dense arena %.0f MiB, the scratch %.0f MiB in all\n",
+                     ds_.vram_weights / 1048576.0, ds_.vram_scratch / 1048576.0, ds_.vram_own / 1048576.0,
+                     dense_bytes_ / 1048576.0, scratch_at_ * 4.0 / 1048576.0);
     const char* on = std::getenv("INK_IGPU");
     if (!on || std::atoi(on) != 1 || igpu_) return;
     const Act a = act();
@@ -183,6 +189,9 @@ void Inkling2::begin_pass() {
 }
 
 void Inkling2::load_geometry() {
+    // --draft-model is a model of its own (DSpark), not a file of this one with a block in it, which is what
+    // load_shape() would look for
+    std::unique_ptr<Shards> drafter = std::move(dg_);
     load_shape();
     auto find = [&](const char* key) { return meta_in(*gg_, key); };
     auto need = [](bool ok, const char* what) {
@@ -265,6 +274,11 @@ void Inkling2::load_geometry() {
     }
     n_streams_ = next;
     state_per_ = (size_t) (taps_ - 1) * (2 * (size_t) n_kv_ * dim_ + 2 * (size_t) n_embd_);
+    if (drafter) {
+        dg_ = std::move(drafter);
+        block_ = dg_.get();   // the file its tensors are read from (home())
+        ds_geometry();
+    }
 }
 
 // What each run does with the streams, as llama.cpp's graph keeps its list of blocks: a run reads the blocks so far
@@ -327,6 +341,7 @@ void Inkling2::load_layer(int il) {
                 head_dev_ = dev;
             }
         }
+        if (ds_.on) ds_load();
         tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", n_embd_, 1, kF32);
         out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", n_embd_, 1, kF32);
         if (passes_ > 1) msg_query_ = msg_queries();
@@ -439,7 +454,7 @@ void Inkling2::load_layer(int il) {
 size_t Inkling2::recurrent_floats() const { return (size_t) n_layer_ * state_per_; }
 
 // The widest input lin() takes: a loop controller's two normed rows, or the attention's heads.
-int Inkling2::widest() const { return std::max(n_head_ * dim_, 2 * n_embd_); }
+int Inkling2::widest() const { return std::max({n_head_ * dim_, 2 * n_embd_, ds_.on ? ds_.n_ff : 0}); }
 
 // A full run keeps a row a position; a window run a ring of the rows a call can read.  Each run's convolutions keep
 // their past inputs in state_.
@@ -542,6 +557,13 @@ void Inkling2::assign_scratch() {
     dyn_ = fbuf(2 * n * (size_t) taps_ * n_kv_);   // the keys' taps, then the values
     att_ = fbuf(n * hq);
     part_ = fbuf(ink_attend_floats(rows_, n_head_, opt_.max_context));
+    // DSpark verifies drafts with the legacy attention split and reduction order.
+    if (const size_t counters = ds_.on ? 0 : ink_attend_counters(rows_, n_kv_)) {
+        attn_counters_ = (unsigned int*) fbuf(counters);
+        if (attn_counters_)
+            ck(cudaMemsetAsync(attn_counters_, 0, counters * sizeof(*attn_counters_), cs(st_)),
+               "attention completion counters");
+    }
     tmp_ = fbuf(n * e);
     if (head_short_ && !head_ids_) {
         const size_t r = (size_t) std::max(opt_.window, 8);
@@ -555,6 +577,7 @@ void Inkling2::assign_scratch() {
     // call of fewer than kStageRows tokens (layer_head)
     xq3_ = fbuf(3 * (size_t) std::min(rows_, kStageRows - 1) * kernels::native_q8_1_bytes(n_embd_) / sizeof(float));
     if (!row_off_) row_off_ = (long long*) dmalloc(8 * sizeof(long long), "the step's state offsets");
+    if (ds_.on) ds_scratch();
 }
 
 // The loop's message controller of module m (q, k, v, experts): x = (1 - tanh(F h)) x + tanh(G h) msg, where
@@ -663,6 +686,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         copy(prelude_, cur_);
         ink_copies(c, k, rs, n_embd_, n, st_);
     }
+    if (ds_.on) ds_capture(il, cur, rs, n);   // DSpark: the run's input, if it is one of the drafter's
     const bool msgs = B.pass > 0;
     // the messages, four planes of msg_: (q, experts), then (k, v) - one mix of the bank with four queries
     float* const msg_b = msg_ + 2 * plane;
@@ -731,9 +755,14 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         // INK_KV_SIM=v4|v4r|k4v4r|k4r (a quality experiment, with --no-graphs): the rows a 4-bit cache would give
         // back, unrotated or rotated as llama.cpp rotates them (V in blocks of 64, K by the head), into the Q8_0 store
         static const std::string kv_sim = std::getenv("INK_KV_SIM") ? std::getenv("INK_KV_SIM") : "";
-        // a token's keys and values from their products into a Q8_0 cache in one launch (ink_kv_chain): their
+        // a token's keys and values from their products into a Q8_0 or k8v4 cache in one launch (ink_kv_chain): their
         // convolutions, the keys' clip, the values' norm and the stores
-        const bool chain = n == 1 && !rows && q8() && v4() == 0 && kv_sim.empty();
+        static const bool enable_v4_chain = [] {
+            const char* value = std::getenv("INK_KV_CHAIN_V4");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        const bool chain_v4 = v4() == 1 && enable_v4_chain;
+        const bool chain = n == 1 && !rows && q8() && (v4() == 0 || chain_v4) && kv_sim.empty();
         const float alpha = B.swa ? 0.f : log_alpha_;   // the queries' and relative terms' position factor
         float* const dyn_v = dyn_ + (size_t) n * taps_ * n_kv_;   // the values' taps beside the keys'
         if (!all) lin(B.wk, xk, kraw_, n, xq8[1]);
@@ -758,7 +787,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             const InkClip cq{q_, fp(B.q_clip), qk_clip_, alpha, dim_, n_head_};
             const InkClip cr{rel, fp(B.rel_clip), rel_clip_, alpha, n_rel_, n_head_};
             ink_kv_chain(ksd, vsd, n_kv_, dim_, taps_, B.swa ? conv_s : conv_d, qk_clip_, rms_eps_, pos_, at,
-                         B.swa ? ring_ : 0, cq, cr, log_floor_, st_);
+                         B.swa ? ring_ : 0, cq, cr, log_floor_, chain_v4, st_);
         } else if (rows) {
             ink_conv_rows(vin, kv_stride, B.state + keep * kvw, row_off_, fp(B.v_conv), B.swa ? nullptr : dyn_v,
                           n_kv_, v_, kvw, taps_, n, B.swa ? conv_s : conv_d, st_);
@@ -821,7 +850,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                 ink_attend(q_ + (size_t) i * qgr, qgr, kc, vc, rel + (size_t) i * qgr, qgr, fp(B.rel_table), n_rel_,
                            B.swa ? window_ : extent_, sink_ + (size_t) i * n_head_, att_ + (size_t) i * hq, part_, dim_,
                            n_head_, n_kv_, 1.f / std::sqrt((float) dim_), r.pos, 1, B.swa ? window_ : 0, ring, st_, ai,
-                           sized, ks, vs, v4());
+                           sized, ks, vs, v4(), attn_counters_);
             }
         }
         static float* sim_buf = nullptr;
@@ -868,11 +897,14 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         }
         if (kv4_check) kv4_shadow(B, il, n, k, vraw_, qgr, rel, ring);
         if (v4() == 2 && !rows) ink_hadamard(q_, qgr, hq, n, dim_, st_);
-        const int room_rows = at ? (B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n)) : 0;
+        // a few tokens' launches are sized as a recorded one's whether recorded or not (keep() puts tokens through
+        // again unrecorded): a token's attention sums in the same order as in a call of its own
+        const bool size_for_graph = at || (ds_.on && n <= 8);
+        const int room_rows = size_for_graph ? (B.swa ? std::min(window_ + n - 1, opt_.max_context) : room(n)) : 0;
         if (!rows) ink_attend(q_, qgr, q8() ? (const void*) B.k_codes : B.keys, q8() ? (const void*) B.v_codes : B.vals, rel, qgr,
                    fp(B.rel_table), n_rel_, B.swa ? window_ : extent_, sink_, att_, part_, dim_, n_head_, n_kv_,
                    1.f / std::sqrt((float) dim_), pos_, n, B.swa ? window_ : 0, ring, st_, at, room_rows,
-                   q8() ? B.k_sc : nullptr, q8() ? B.v_sc : nullptr, v4());
+                   q8() ? B.k_sc : nullptr, q8() ? B.v_sc : nullptr, v4(), attn_counters_, ds_.on);
         if (kv4_check) kv4_compare(B, il, n);
         if (n < kStageRows) {   // the gate, and the Q8_1 blocks of the product's input, in one launch
             ink_mul_sigmoid_q8(att_, gate, hq, n, qgr, xq3_, st_);
@@ -955,7 +987,7 @@ void Inkling2::kv4_shadow(const Block& B, int il, int n, const float* k, const f
         ink_attend(q_, qgr, v4() == 2 ? sh.kc : B.k_codes, sh.vc, rel, qgr, fp(B.rel_table), n_rel_,
                    B.swa ? window_ : extent_, sink_, shadow_out_ + (size_t) j * rows_ * hq, part_, dim_, n_head_, n_kv_,
                    1.f / std::sqrt((float) dim_), pos_, n, B.swa ? window_ : 0, ring, st_, nullptr, 0,
-                   v4() == 2 ? sh.ks : B.k_sc, sh.vs);
+                   v4() == 2 ? sh.ks : B.k_sc, sh.vs, 0, attn_counters_);
     }
 }
 
@@ -1244,6 +1276,8 @@ void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) {
 }
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
+    // Target snapshots omit DSpark's features and caches. Rebuild their context from the next row.
+    if (ds_.on) ds_.lo = ds_.hi = pos;
     for (const Block& B : blocks_) {
         if (!B.swa) continue;
         for (const auto& [cache, row] : arrays(B)) {

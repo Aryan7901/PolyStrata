@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -323,6 +324,20 @@ public:
     /// the block, since load.  Two or more in one read are back-to-back refills of its pinned input rows.
     int64_t read_draft_calls_for_test() const { return next_ ? next_->read_draft_calls_for_test() : read_draft_calls_; }
     int32_t draft(int32_t token, int i, float* prob);
+    /// A drafter of a model of its own that makes a block of guesses in one pass and states each one's chance
+    /// (Inkling 2's DSpark, --draft-model): up to n guesses at what follows `token` - the token at pos(), picked and
+    /// not fed yet - into ids, and the drafter's probability of each into chance.  Returns how many it made: 0 when
+    /// it has nothing to guess from.  logits() is left alone.  `more`, when given, is asked once draft j is known
+    /// (ids and chance hold drafts 0..j) whether the next one is wanted: false ends the block's drafts there.
+    virtual int draft_block(int32_t token, int n, int32_t* ids, float* chance,
+                            const std::function<bool(int)>* more = nullptr) {
+        (void) token, (void) n, (void) ids, (void) chance, (void) more;
+        return 0;
+    }
+    /// Whether draft_block() guesses.
+    virtual bool drafts_blocks() const { return false; }
+    /// A line on what draft_block() did, for the end of an answer; empty: nothing to say.
+    virtual std::string draft_report() const { return {}; }
     /// Whether a call since the last time this was asked recorded launches for replaying, which takes far longer
     /// than the call does afterwards: its time says nothing of the calls to come.
     bool took_record() {
@@ -478,6 +493,12 @@ protected:
     virtual void router_scores(const Layer& L, int n);
     /// What is done to `rows` rows of logits on the card before they are copied out.
     virtual void finish_logits(float* logits, int rows) { (void) logits, (void) rows; }
+    /// Whether every token of a call needs the model's output (outputs()), and not only the last one's.
+    virtual bool every_output() const { return false; }
+    /// The model's normed outputs h (n_embd a row) of n tokens from position pos, on the card in stream order, after
+    /// eval(), window() and each call of read() when every_output(): what a drafter reads of every row.  The rows of a
+    /// window are all of its tokens', right or not.
+    virtual void outputs(int64_t pos, int n, const float* h) { (void) pos, (void) n, (void) h; }
     /// The logits of `rows` normed outputs h: the output matrix's product, or an architecture's cheaper equal.
     virtual void output_logits(const float* h, float* logits, int rows) { lin(output_, h, logits, rows); }
     /// Whether load() puts the output matrix in VRAM (output_); false: the architecture keeps it where it wants, and
@@ -749,6 +770,7 @@ protected:
     std::vector<Call> calls_;
     float* h_res_ = nullptr;  ///< h_res_rows_ tokens' rows, pinned: as many as the longest read so far that needed it
     int h_res_rows_ = 0;
+    int64_t read_at_ = -1;    ///< while read() takes its calls a layer at a time: its first position, else -1
     void* rs_ = nullptr;      ///< the stream of those copies
     void* ev_in_[2] = {};     ///< marks a call's rows in each half of r_
     void* ev_out_[2] = {};    ///< marks the card done with a call in each half

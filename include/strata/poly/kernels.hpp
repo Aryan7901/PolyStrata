@@ -502,14 +502,15 @@ struct InkClip {
     float limit, alpha;
     int dim, heads;
 };
-/// One token's keys and values from their products to a Q8_0 cache in one launch: what ink_conv() of each side (one
+/// One token's keys and values from their products to the cache in one launch: what ink_conv() of each side (one
 /// row), ink_clip()'s of the keys (no scale, limit k_limit, no position factor), head_norm_rope() of the values (no
 /// weights, no rotation, v_eps) and store_q8_at() of both (row at[0], or pos without at; modulo ring where ring > 0)
-/// give, the same operations; and the clips of q and rel (heads 0: none) with position at[0] or pos and floor_, as
+/// give, with ink_store_q4() in blocks of 64 for the values if values_q4 is set. Also clips q and rel (heads 0: none)
+/// with position at[0] or pos and floor_, as
 /// ink_clip3() makes them.  kv_heads heads of dim (128) values a side.
 void ink_kv_chain(const InkKvSide& k, const InkKvSide& v, int kv_heads, int dim, int taps, float conv_scale,
                   float k_limit, float v_eps, int64_t pos, const long long* at, int ring, const InkClip& q,
-                  const InkClip& rel, float floor_, void* stream);
+                  const InkClip& rel, float floor_, bool values_q4, void* stream);
 /// ink_conv for rows of different sequences, a token each: row t's state is at state + off[t] floats (off on the card).
 void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
                    int heads, float* out, int channels, int taps, int rows, float scale, void* stream);
@@ -524,13 +525,16 @@ void ink_set_offsets(long long* dst, const long long* v, int n, void* stream);
 /// rel: n_rel (at most 16) a head a token; table: extent rows of n_rel.  out: heads * dim a token.  part: scratch of
 /// ink_attend_floats().  With `at`, the launch is sized for positions below room.
 size_t ink_attend_floats(int rows, int heads, int max_ctx);
+/// Number of zero-initialized counters to reserve for INK_ATT_NEW=1 on this device.
+size_t ink_attend_counters(int rows, int kv_heads);
 /// With kscales and vscales (Q8_0: an fp16 scale every 32 values), kcache and vcache are int8 codes (store_q8).
 /// v4 = 1: vcache is ink_store_q4's (values rotated in blocks of 64), and each head's output is rotated back before it
 /// is written; v4 = 2: kcache too (keys rotated by the head), and q must come rotated the same way (ink_hadamard).
 void ink_attend(const float* q, int q_stride, const void* kcache, const void* vcache, const float* rel,
                 int rel_stride, const float* table, int n_rel, int extent, const float* sink, float* out, float* part, int dim, int heads, int kv_heads,
                 float scale, int64_t pos, int rows, int window, int ring, void* stream, const long long* at = nullptr,
-                int room = 0, const uint16_t* kscales = nullptr, const uint16_t* vscales = nullptr, int v4 = 0);
+                int room = 0, const uint16_t* kscales = nullptr, const uint16_t* vscales = nullptr, int v4 = 0,
+                unsigned int* counters = nullptr, bool token_splits = false);
 /// Inkling's 4-bit cache side (--kv k8v4's values, k4v4's keys and values): each `block` values of a row (64 for
 /// values, 128 - the head - for keys) rotated by the orthonormal Walsh-Hadamard matrix (Sylvester's, no signs: H = H^T
 /// = H^-1, as llama.cpp rotates a cache), then rounded to ggml Q4_0's levels a 32-value block: the block's value of
@@ -571,5 +575,46 @@ void ink_rescore_q8(const void* w, const float* h, int n_embd, const int* ids, c
 void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream);
 /// x[r][i] = -inf for i in [from, n) of `rows` rows of n values: a padded vocabulary's tail.
 void ink_fill_tail(float* x, int from, int n, int rows, void* stream);
+
+// ---- Inkling 2's DSpark drafter (kernels_dspark.cu; after Basalt's, MIT)
+
+/// `rows` rows of n floats (src_stride apart) as bf16 rows of n, rounded to the nearest even.
+void ds_tap(const float* src, int src_stride, uint16_t* dst, int n, int rows, void* stream);
+/// The mixes of the target's features: alpha[j * 4 + k] (softmaxed fuse weights, on the card) for mix j and feature
+/// k, and each mix's RMS-norm weights.
+struct DsMix {
+    const float* alpha = nullptr;
+    const float* norm[4] = {};
+    float eps = 1e-6f;
+};
+/// For each of `rows` rows at positions pos0..: m_j = rms(sum_k alpha[j][k] f_k) * norm[j], with f_0..2 the bf16 taps
+/// (tap, tap + slot, tap + 2 slot; n values a row) and f_3 the fp32 final state (fin).  Mixes 0..2 go to out
+/// (j * rows + r rows of n), mix 3 to the ring fr at the row's position % fr_cap.  n up to 4096.
+void ds_mix(const uint16_t* tap, int64_t slot, const float* fin, const DsMix& a, int n, int64_t pos0, float* out,
+            int rows, float* fr, int fr_cap, void* stream);
+/// One step of the Markov head's recurrence: raw = ctx + w_sp [state_in; w1[*prev]] (w_sp: 3 rank rows of 2 rank
+/// bf16, w1: bf16 rows of rank, readable by the card, *prev on the card); gate = sigmoid(raw[0:rank]),
+/// state_out = gate state_in + (1 - gate) tanh(raw[rank:2 rank]), latent = tanh(raw[2 rank:3 rank]).
+void ds_markov(const float* ctx, const uint16_t* w_sp, const uint16_t* w1, const int32_t* prev, int rank,
+               const float* state_in, float* state_out, float* latent, void* stream);
+/// x[i] = cap tanh((x[i] + fl[i] + fb[i]) / cap) for i < n (cap 0: no cap).
+void ds_head(float* x, const float* fl, const float* fb, float cap, int n, void* stream);
+/// A fold's rows from its columns: y holds k values (a multiple of 32) for each of `chunk` rows, column by column
+/// ([k][chunk]); fold gets the chunk's rows as ggml Q8_0 (k / 32 blocks of 34 bytes a row).
+void ds_fold_q8(const float* y, int chunk, int k, void* fold, void* stream);
+/// The same as ggml Q4_0 (k / 32 blocks of 18 bytes a row).
+void ds_fold_q4(const float* y, int chunk, int k, void* fold, void* stream);
+/// A draft's pick: of x[v] = cap tanh((base[v] + fold[v] . latent + fb[v]) / cap), v < n, the first largest and its
+/// softmax probability into *out (on the card).  fold: Q4_0 rows of `rank` values.  scratch: ds_pick_bytes().
+size_t ds_pick_bytes();
+void ds_pick(const float* base, const void* fold, const float* latent, int rank, const float* fb, float cap, int n,
+             void* scratch, Likeliest* out, void* stream);
+/// The drafter block's attention: each of `rows` rows (q: heads * dim a row) reads the keys and values of positions
+/// [lo, hi) - all of them, the block's own included - from fp16 rings of `cells` (kv_heads * dim a cell, position p at
+/// p % cells), heads h / (heads / kv_heads) of a key head.  out: heads * dim a row.  dim 128, and (heads / kv_heads)
+/// * rows a multiple of 8 up to 32.  part: ds_attend_floats() floats.
+size_t ds_attend_floats(int rows, int heads, int kv_heads, int dim, int64_t keys);
+void ds_attend(const float* q, const uint16_t* kc, const uint16_t* vc, int rows, int heads, int kv_heads, int dim,
+               int64_t lo, int64_t hi, int cells, float scale, float* part, float* out, void* stream);
 
 }  // namespace strata::poly

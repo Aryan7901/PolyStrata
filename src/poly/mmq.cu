@@ -17,6 +17,11 @@ namespace strata::poly {
 void nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
 bool nvfp4_w4a8_fits(int64_t w_rows, int cc, size_t smpbo);
 bool nvfp4_w4a8_stream_k(int64_t w_rows, int cc);
+// mmq_nvfp4_x2.cu
+void nvfp4_x2(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
+bool nvfp4_x2_fits(int64_t w_rows, int cc, size_t smpbo);
+void nvfp4_x2_quantize(const float* x, const int32_t* ids, void* xq, float* scale, int64_t cols, int64_t ld,
+                       int64_t pad_cols, int64_t rows, cudaStream_t s);
 #endif
 
 namespace {
@@ -28,22 +33,33 @@ namespace {
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
 
-// NVFP4's prompt products: on RTX 50, with STRATA_PREFILL_NVFP4=w4a4, FP4 x FP4 on its FP4 tensor cores (the
-// instance built for 12.0a, as MXFP4's); otherwise, as on every other card, the weights decoded to int8 times Q8_1
-// rows (mmq_nvfp4.cu).
-bool nvfp4_fp4(int cc) {
-    static const bool asked = [] {
+// On RTX 50, the optional modes multiply one or two terms of FP4 activations on the FP4 tensor cores.
+// W4A8 decodes the weights to int8 and multiplies them by Q8_1 rows.
+enum class Nvfp4Mode { W4A8, W4A4, W4A4x2 };
+
+Nvfp4Mode requested_nvfp4_mode() {
+#if STRATA_POLY_NVFP4
+    static const Nvfp4Mode requested = [] {
         const char* v = std::getenv("STRATA_PREFILL_NVFP4");
-        return v != nullptr && std::string(v) == "w4a4";
+        if (v && std::string(v) == "w4a4") return Nvfp4Mode::W4A4;
+        if (v && std::string(v) == "w4a4x2") return Nvfp4Mode::W4A4x2;
+        return Nvfp4Mode::W4A8;
     }();
-    return asked && cc == GGML_CUDA_CC_BLACKWELL;
+    return requested;
+#else
+    return Nvfp4Mode::W4A8;
+#endif
 }
 
-// The float each row of NVFP4's FP4 rows carries (quantize_mmq_fp4_cuda's scale) goes behind the blocks and the
-// tiles' tail, in the room q8_bytes() leaves: FP4 blocks take half the bytes of Q8_1's.
-float* fp4_scales(void* xq, int64_t rows, int64_t cols) {
-    return (float*) ((char*) xq + (size_t) rows * (size_t) (pad512(cols) / QK_FP4_MMQ) * sizeof(block_fp4_mmq) +
-                     128 * sizeof(block_q8_1_mmq));
+Nvfp4Mode nvfp4_mode(int cc) {
+    return cc == GGML_CUDA_CC_BLACKWELL && blackwell_mma_available(cc) ? requested_nvfp4_mode() : Nvfp4Mode::W4A8;
+}
+
+// The scale of each activation row goes after the FP4 blocks and the tiles' tail.
+float* fp4_scales(void* xq, int64_t rows, int64_t cols, Nvfp4Mode mode) {
+    const size_t terms = mode == Nvfp4Mode::W4A4x2 ? 2 : 1;
+    return (float*) ((char*) xq + terms * (size_t) rows * (size_t) (pad512(cols) / QK_FP4_MMQ) *
+                                  sizeof(block_fp4_mmq) + 128 * sizeof(block_q8_1_mmq));
 }
 
 void ck(const char* what) {
@@ -75,7 +91,11 @@ bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols) {
 #if STRATA_POLY_NVFP4
         case GGML_TYPE_NVFP4:
             if (w_cols % QK_NVFP4 != 0) return false;
-            if (!nvfp4_fp4(dev.cc)) return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
+            switch (nvfp4_mode(dev.cc)) {
+                case Nvfp4Mode::W4A8: return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
+                case Nvfp4Mode::W4A4x2: return nvfp4_x2_fits(w_rows, dev.cc, dev.smpbo);
+                case Nvfp4Mode::W4A4: break;
+            }
             break;
 #endif
         default: return false;
@@ -93,7 +113,13 @@ bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols) {
 
 // the kernels read whole tiles, so the last rows need room behind them
 size_t Mmq::q8_bytes(int64_t rows, int64_t cols) {
-    return (size_t) rows * (size_t) (pad512(cols) / QK8_1_MMQ) * sizeof(block_q8_1_mmq) + 128 * sizeof(block_q8_1_mmq);
+    const size_t bytes = (size_t) rows * (size_t) (pad512(cols) / QK8_1_MMQ) * sizeof(block_q8_1_mmq) +
+                         128 * sizeof(block_q8_1_mmq);
+    // Two FP4 terms fill the Q8_1 payload. Reserve additional space for the row scales.
+    if (requested_nvfp4_mode() == Nvfp4Mode::W4A4x2 &&
+        nvfp4_mode(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) == Nvfp4Mode::W4A4x2)
+        return bytes + ((size_t) rows + 128) * sizeof(float);
+    return bytes;
 }
 
 bool Mmq::half_sums(int type) {
@@ -108,7 +134,13 @@ bool Mmq::split_exact(int type, int64_t w_rows) {
     const bool fallback = w_rows % 128 != 0;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 #if STRATA_POLY_NVFP4
-    if (t == GGML_TYPE_NVFP4 && !nvfp4_fp4(cc)) return !nvfp4_w4a8_stream_k(w_rows, cc);
+    if (t == GGML_TYPE_NVFP4) {
+        switch (nvfp4_mode(cc)) {
+            case Nvfp4Mode::W4A8: return !nvfp4_w4a8_stream_k(w_rows, cc);
+            case Nvfp4Mode::W4A4x2: return false;   // every two-term tile uses stream-k
+            case Nvfp4Mode::W4A4: break;
+        }
+    }
 #endif
     for (int J = 8; J <= 128; J += 8) {
         const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config(t, J, fallback, cc);
@@ -124,10 +156,19 @@ void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     // On Blackwell llama.cpp's MXFP4 tiles take the rows as FP4 blocks, half the bytes of Q8_1's (mmq.cu's
     // use_native_fp4), and so do NVFP4's FP4 ones; the rows of another type, or another card, are Q8_1.
-    const bool nv = t == GGML_TYPE_NVFP4 && nvfp4_fp4(cc);
+    const Nvfp4Mode mode = t == GGML_TYPE_NVFP4 ? nvfp4_mode(cc) : Nvfp4Mode::W4A8;
+#if STRATA_POLY_NVFP4
+    if (mode == Nvfp4Mode::W4A4x2) {
+        nvfp4_x2_quantize(x, ids, xq, fp4_scales(xq, rows, cols, mode), cols, ld, pad512(cols), rows,
+                           (cudaStream_t) stream);
+        ck("mmq quantize");
+        return;
+    }
+#endif
+    const bool nv = mode == Nvfp4Mode::W4A4;
     if ((t == GGML_TYPE_MXFP4 && blackwell_mma_available(cc)) || nv) {
         const bool aligned = (uintptr_t) x % 32 == 0 && ((size_t) ld * sizeof(float)) % 32 == 0;
-        quantize_mmq_fp4_cuda(x, ids, xq, nv ? fp4_scales(xq, rows, cols) : nullptr, t, aligned, cols, ld, rows * ld,
+        quantize_mmq_fp4_cuda(x, ids, xq, nv ? fp4_scales(xq, rows, cols, mode) : nullptr, t, aligned, cols, ld, rows * ld,
                               rows * ld, pad512(cols), rows, 1, 1, (cudaStream_t) stream);
     } else {
         quantize_mmq_q8_1_cuda(x, ids, xq, t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
@@ -170,14 +211,17 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
         STRATA_POLY_MMQ_TYPES(X)
 #undef X
 #if STRATA_POLY_NVFP4
-        case GGML_TYPE_NVFP4:
-            if (nvfp4_fp4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
-                a.y_scale = fp4_scales(const_cast<void*>(xq), total_rows, w_cols);
-                mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
-            } else {
+        case GGML_TYPE_NVFP4: {
+            const Nvfp4Mode mode = nvfp4_mode(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+            if (mode == Nvfp4Mode::W4A8) {
                 nvfp4_w4a8(ctx, a, s);
+            } else {
+                a.y_scale = fp4_scales(const_cast<void*>(xq), total_rows, w_cols, mode);
+                if (mode == Nvfp4Mode::W4A4x2) nvfp4_x2(ctx, a, s);
+                else mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
             }
             break;
+        }
 #endif
         default: throw std::runtime_error("mmq: tensor type " + std::to_string(type) + " is not built");
     }

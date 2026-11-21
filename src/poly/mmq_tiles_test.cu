@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -25,9 +26,14 @@ using strata::poly::Mmq;
 
 namespace {
 
-struct Quant { const char* name; int type; size_t block; };   // ggml_type, bytes of a block of 256 values
+struct Quant {
+    const char* name;
+    int type;     // ggml_type
+    size_t block; // bytes per block
+    int block_cols = 256, matrix_rows = 256, matrix_cols = 512;
+};
 constexpr Quant kQuants[] = {{"Q4_K", 12, 144}, {"Q5_K", 13, 176}, {"Q6_K", 14, 210}};
-constexpr int kRows = 256, kCols = 512;   // a matrix of the shapes the experts have, 256 rows a multiple of 128
+constexpr Quant kNvfp4 = {"NVFP4", 40, 36, 64, 130, 576};  // output tile and K-step tails
 
 bool ok(cudaError_t e, const char* what) {
     if (e != cudaSuccess) std::printf("%s: %s\n", what, cudaGetErrorString(e));
@@ -51,14 +57,16 @@ int tile_of(const std::vector<int>& t, int rows) {
 // to the bit where `exact`, else by more than 8 float epsilons of the case's largest value
 int run_case(const Quant& q, const std::vector<int>& rows, const std::vector<int>& limits, bool exact,
              std::mt19937& rng) {
+    const int kRows = q.matrix_rows, kCols = q.matrix_cols;
     const int n = (int) rows.size();
-    const size_t per = (size_t) kRows * (kCols / 256) * q.block;
+    const size_t per = (size_t) kRows * (kCols / q.block_cols) * q.block;
     std::vector<uint8_t> w(per * n + 4096, 0);   // zero bytes behind the matrices (kTail)
     for (size_t i = 0; i < per * n; ++i) w[i] = (uint8_t) rng();
-    for (size_t b = 0; b < per * n / q.block; ++b) {   // finite block scales: a half of 2^-3 where each type keeps its d
+    for (size_t b = 0; b < per * n / q.block; ++b) {
         uint8_t* p = &w[b * q.block];
-        if (q.type == 14) { p[q.block - 2] = 0; p[q.block - 1] = 0x30; }
-        else { p[0] = 0; p[1] = 0x30; p[2] = 0; p[3] = 0x30; }
+        if (q.type == kNvfp4.type) std::fill_n(p, 4, 0x38);  // UE4M3 scales of 1
+        else if (q.type == 14) { p[q.block - 2] = 0; p[q.block - 1] = 0x30; }
+        else { p[0] = 0; p[1] = 0x30; p[2] = 0; p[3] = 0x30; }  // half scales of 2^-3
     }
     const int total = std::accumulate(rows.begin(), rows.end(), 0);
     std::vector<float> x((size_t) total * kCols);
@@ -67,8 +75,8 @@ int run_case(const Quant& q, const std::vector<int>& rows, const std::vector<int
     for (int e = 0; e < n; ++e) start[(size_t) e + 1] = start[(size_t) e] + rows[(size_t) e];
 
     // the reference: rows by expert, one launch
-    std::vector<int32_t> iota(total), gather_ref(total);
-    std::iota(iota.begin(), iota.end(), 0);
+    std::vector<int32_t> iota(total + 128), gather_ref(total);  // MMQ reads full tiles of output row IDs
+    std::iota(iota.begin(), iota.begin() + total, 0);
     std::iota(gather_ref.begin(), gather_ref.end(), 0);
     // the classes: rows class after class (an expert's rows in order), a bounds array for each class
     const int nclass = (int) limits.size() + 1;
@@ -117,7 +125,8 @@ int run_case(const Quant& q, const std::vector<int>& rows, const std::vector<int
             for (float v : a) big = std::max(big, std::fabs(v));
             const float tol = 8 * FLT_EPSILON * big;
             const auto near = [tol](float u, float v) { return std::fabs(u - v) <= tol; };
-            bad = 0;   // row i of the class layout is row gather_cls[i] of the reference
+            bad = q.type == kNvfp4.type && !(big > 0) ? total : 0;
+            // Row i of the class layout is row gather_cls[i] of the reference.
             for (int i = 0; i < total; ++i) {
                 const float* c = &b[(size_t) i * kRows];
                 const float* r = &a[(size_t) gather_cls[(size_t) i] * kRows];
@@ -140,6 +149,30 @@ int main() {
         return 77;
     }
     std::mt19937 rng(7);
+    const char* nvfp4_mode = std::getenv("STRATA_PREFILL_NVFP4");
+    if (nvfp4_mode && std::strcmp(nvfp4_mode, "w4a4x2") == 0) {
+        int device = 0;
+        cudaDeviceProp prop{};
+        if (!ok(cudaGetDevice(&device), "device") || !ok(cudaGetDeviceProperties(&prop, device), "device properties"))
+            return 1;
+        if (prop.major != 12 || prop.minor != 0) {
+            std::printf("no RTX 50: skipped\n");
+            return 77;
+        }
+        const auto& q = kNvfp4;
+        if (!Mmq::fits(q.type, q.matrix_rows, q.matrix_cols)) {
+            std::printf("FAIL NVFP4: no MMQ tile\n");
+            return 1;
+        }
+        const int bad = run_case(q, {8, 0, 9, 17, 65, 1, 6}, {8, 16, 32}, false, rng);
+        if (bad != 0) {
+            std::printf("FAIL NVFP4: %d rows differ\n", bad);
+            return 1;
+        }
+        std::printf("PASS NVFP4 size classes and tile tails\n");
+        return 0;
+    }
+
     struct Dist { const char* name; std::vector<int> rows; };
     std::vector<Dist> dists;
     {   // many small experts and a few large, as a prompt batch's staged experts are
@@ -159,7 +192,7 @@ int main() {
     const std::vector<std::vector<int>> limits = {{8, 16, 32}, {16}, {4, 8, 12, 16, 24, 32, 48}, {64}};
     int failures = 0, cases = 0;
     for (const Quant& q : kQuants) {
-        const bool exact = Mmq::split_exact(q.type, kRows);
+        const bool exact = Mmq::split_exact(q.type, q.matrix_rows);
         if (!exact) std::printf("%s: this card's MMQ uses stream-k, compared within rounding\n", q.name);
         for (const Dist& d : dists)
             for (const auto& l : limits) {

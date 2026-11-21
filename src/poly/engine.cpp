@@ -5595,10 +5595,11 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         return;
     }
     // The model's output: the last token's for the logits, and every token's for the draft block.
-    if (want_logits || draft_) {
+    const bool every = draft_ || every_output();
+    float* h = draft_ ? hn_ + n_embd_ : xn_;
+    if (want_logits || every) {
         const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump;
-        const int m = draft_ ? n : 1;
-        float* h = draft_ ? hn_ + n_embd_ : xn_;
+        const int m = every ? n : 1;
         const auto tail = [&] {
             output_rows(n - m, m, h);
             dbg("out_norm", n_layer_, h, n_embd_);
@@ -5619,6 +5620,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         if (want_logits) ck(cudaStreamSynchronize(cs(st_)), "eval");
     }
     // behind the logits: the caller has them while the card does this
+    if (every_output()) outputs(pos_, n, h);
     if (draft_) draft_rows(tokens, ahead_pos_ == pos_ && tokens[0] == ahead_tok_ ? 1 : 0, n);
     pos_ += n;
     stats_.tokens += n;
@@ -5770,9 +5772,12 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         fetch(0);
         fetch(1);
     }
-    // a turn for each layer, and one for the model's output, which the draft block keeps a row of
-    const int turns = hi_ - lo_ + (draft_ ? 1 : 0);
+    // a turn for each layer, and one for the model's output, which the draft block keeps a row of (and a drafter
+    // of its own reads every row of: every_output())
+    const bool every = draft_ || (every_output() && hi_ == n_layer_);
+    const int turns = hi_ - lo_ + (every ? 1 : 0);
     shared_ahead_ = true;
+    read_at_ = pos0;
     try {
         for (int k = 0; k < turns; ++k) {
             const int il = lo_ + k;
@@ -5782,6 +5787,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                 if (host) ck(cudaStreamSynchronize(cs(rs_)), "read");
                 ck(cudaStreamSynchronize(cs(st_)), "read");
                 shared_ahead_ = false;
+                read_at_ = -1;
                 r_ = r0;
                 pos_ = pos0;
                 return false;
@@ -5795,9 +5801,14 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                 if (il < n_layer_) {
                     layer(il, call.m);
                 } else {
-                    output_rows(0, call.m, hn_ + n_embd_);
-                    draft_rows(tokens + call.at, ahead_pos_ == pos_ && tokens[call.at] == ahead_tok_ ? 1 : 0, call.m);
-                    ++read_draft_calls_;
+                    float* h = draft_ ? hn_ + n_embd_ : xn_;
+                    output_rows(0, call.m, h);
+                    if (every_output()) outputs(pos_, call.m, h);
+                    if (draft_) {
+                        draft_rows(tokens + call.at, ahead_pos_ == pos_ && tokens[call.at] == ahead_tok_ ? 1 : 0,
+                                   call.m);
+                        ++read_draft_calls_;
+                    }
                 }
                 if (uint8_t* state = call.mark >= 0 ? marks[call.mark].state : nullptr) {
                     ck(cudaStreamSynchronize(cs(st_)), "read");
@@ -5834,11 +5845,13 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     } catch (...) {
         if (host) cudaStreamSynchronize(cs(rs_));
         shared_ahead_ = false;
+        read_at_ = -1;
         r_ = r0;
         pos_ = pos0;
         throw;
     }
     shared_ahead_ = false;
+    read_at_ = -1;
     r_ = r0;
     pos_ = pos0;
     if (next_) {
@@ -5911,6 +5924,8 @@ void Engine::window(const int32_t* tokens, int t) {
     if (timed && !recorded_ && !freeze_experts_) took_way(t, ms_since(t0));
     recorded_ = recorded_ || recorded;
     win_ = t;
+    // behind the logits, ahead of whatever keep() runs again
+    if (every_output()) outputs(pos_, t, h);
 }
 
 // How a window of t tokens goes through the layers: in halves, or its tokens together.  Each way is timed a few
