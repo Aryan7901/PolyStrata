@@ -1,12 +1,17 @@
 // src/poly/cpu_experts.cpp - see the header.
 #include "cpu_experts.hpp"
 
+#include <chrono>
+#include <atomic>
+
 #include "ggml.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cpuid.h>
+#include <cstdlib>
 #include <immintrin.h>
 #include <mutex>
 #include <numeric>
@@ -16,9 +21,27 @@ namespace {
 
 // Rows of gate and up, and of down, a task.  With fewer tasks than several a thread, the last round left threads
 // idle at the end of every layer: 64 rows gave Tiel's 512-row experts 8 tasks each, and its down products 32 tasks.
-constexpr int kRowsPerTask = 32;
+constexpr int kRowsPerTask = 32;   // 16 and 24 were within noise of it for Inkling (2026-11-21)
 constexpr int kRowsPerDownTask = 16;
-constexpr int kSpinsBeforeSleep = 20000;   // about a millisecond of pause instructions
+constexpr int kSpinsBeforeSleep = 20000;   // STRATA_WORKER_IDLE=pause: the old count of pause instructions
+
+// An idle worker stays ready this long before it sleeps in posted_.wait().  A decode's calls come a few hundred
+// microseconds apart: with the old ~1 ms of pause instructions (less on Arrow Lake) the workers had gone to sleep
+// by the next one, and on an RTX 5060 laptop they started a one-expert call's first products ~46 us after it was
+// posted (a futex wake and a core coming out of a deep C-state), about 55 us of its 130.  STRATA_WORKER_SPIN_US
+// changes it.
+const int64_t kReadyUs = [] {
+    const char* s = std::getenv("STRATA_WORKER_SPIN_US");
+    return s ? std::atoll(s) : 4000;
+}();
+const int64_t kPauseUs = [] {
+    const char* s = std::getenv("STRATA_WORKER_PAUSE_US");
+    return s ? std::atoll(s) : 50;
+}();
+const bool kOldIdle = [] {
+    const char* s = std::getenv("STRATA_WORKER_IDLE");
+    return s && std::strcmp(s, "pause") == 0;
+}();
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
@@ -28,6 +51,30 @@ void init_once() {
 }
 
 thread_local bool in_task = false;   // this thread is running a task of a batch
+
+// Waiting for posted_ to move.  Where the CPU has WAITPKG, the worker arms a monitor on posted_'s cache line and
+// waits in C0.1 (umwait): it uses little power and wakes within a microsecond of run()'s write.  Elsewhere: pause.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+bool waitpkg_ok() {
+    static const bool ok = [] {
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        const char* s = std::getenv("STRATA_UMWAIT");
+        return !(s && std::atoi(s) == 0) && __get_cpuid_count(7, 0, &a, &b, &c, &d) && (c & (1u << 5));
+    }();
+    return ok;
+}
+__attribute__((target("waitpkg"))) void wait_line(const std::atomic<uint32_t>& posted, uint32_t seen) {
+    _umonitor((void*) &posted);
+    if (posted.load(std::memory_order_acquire) != seen) return;   // it moved before the monitor was armed
+    _umwait(1, __rdtsc() + 40000);   // C0.1, the quicker of the two to wake; the OS may end it sooner
+}
+void idle_wait(const std::atomic<uint32_t>& posted, uint32_t seen) {
+    if (waitpkg_ok()) wait_line(posted, seen);
+    else _mm_pause();
+}
+#else
+void idle_wait(const std::atomic<uint32_t>&, uint32_t) {}
+#endif
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 #define STRATA_NVFP4_VNNI 1
@@ -188,6 +235,7 @@ bool Workers::drain(Batch& b) {
 // their time slices, every batch.
 void Workers::loop() {
     int idle = 0;
+    std::chrono::steady_clock::time_point idle_since{};
     uint32_t seen = posted_.load() - 1;   // the count at which this worker last found nothing to do
     while (!quit_.load(std::memory_order_relaxed)) {
         const uint32_t now = posted_.load(std::memory_order_acquire);
@@ -206,9 +254,24 @@ void Workers::loop() {
             }
             seen = now;
         }
-        if (++idle < kSpinsBeforeSleep) {
-            _mm_pause();
-            continue;
+        if (kOldIdle) {
+            if (++idle < kSpinsBeforeSleep) {
+                _mm_pause();
+                continue;
+            }
+        } else {
+            const auto t = std::chrono::steady_clock::now();
+            if (idle++ == 0) idle_since = t;
+            // the first moments with pause: a call's next batch (its down products) comes within microseconds, and a
+            // worker woken from umwait came to it ~10 us late
+            if (t - idle_since < std::chrono::microseconds(kPauseUs)) {
+                _mm_pause();
+                continue;
+            }
+            if (t - idle_since < std::chrono::microseconds(kReadyUs)) {
+                idle_wait(posted_, seen);
+                continue;
+            }
         }
         // run() counts posted_ up before it reads sleepers_, and wait() returns at once when posted_ has moved
         sleepers_.fetch_add(1);
@@ -258,9 +321,32 @@ bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::str
     return true;
 }
 
+// INK_CPU_PROF=1: one-token calls' time by phase and by expert count, printed every 20000 calls (a diagnosis)
+namespace {
+struct Prof {
+    double calls[9] = {}, ph[9][5] = {};
+    int64_t all = 0;
+    // the gate|up phase of 1- and 2-expert calls: the GPU launches (meanwhile), the workers' start, the tail
+    double mw[3] = {}, start_avg[3] = {}, start_max[3] = {}, tail[3] = {}, busy_avg[3] = {};
+};
+constexpr int kMaxThreads = 64;
+std::atomic<int> next_widx{0};
+thread_local int widx = -1;
+using PClock = std::chrono::steady_clock;
+PClock::time_point t_first[kMaxThreads], t_last[kMaxThreads];
+bool t_used[kMaxThreads];
+double busy[kMaxThreads];
+Prof prof;
+const bool prof_on = std::getenv("INK_CPU_PROF") != nullptr;
+double us_between(PClock::time_point a, PClock::time_point b) { return std::chrono::duration<double, std::micro>(b - a).count(); }
+}  // namespace
+
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
                  int n_embd, int n_ff, const float* x, float limit, const Act& fn, float* out,
                  const std::function<void()>* meanwhile, const uint8_t* late, const std::function<void(int)>* wait) {
+    const bool timed = prof_on && rows == 1 && n <= 8 && !late;
+    PClock::time_point pt[5];
+    if (timed) pt[0] = PClock::now();
     init_once();
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* tu = traits(u_type);
@@ -324,14 +410,40 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     if (late)
         std::stable_partition(order.begin(), order.end(), [&](int u) { return !late[by[(size_t) run[(size_t) u]]]; });
 
+    if (timed) pt[1] = PClock::now();
     float* hp = h.data();
     const int* byp = by.data();
     const int* runp = run.data();
     const int* orderp = order.data();
     const int gu_tasks = (n_ff + kRowsPerTask - 1) / kRowsPerTask;
     const int first = meanwhile ? 1 : 0;   // task 0, so it is taken at once
+    const bool fine = timed && n <= 2;
+    double mw_us = 0;
+    if (fine) std::fill(t_used, t_used + kMaxThreads, false), std::fill(busy, busy + kMaxThreads, 0.0);
+    const PClock::time_point t_post = PClock::now();
     workers.run(first + n_run * gu_tasks, [&](int t) {
-        if (t < first) return (*meanwhile)();
+        struct Stamp {
+            bool on;
+            PClock::time_point a;
+            int w;
+            ~Stamp() {
+                if (!on) return;
+                const PClock::time_point b = PClock::now();
+                if (!t_used[w]) t_used[w] = true, t_first[w] = a;
+                t_last[w] = b;
+                busy[w] += us_between(a, b);
+            }
+        } st{fine, fine ? PClock::now() : PClock::time_point{}, 0};
+        if (fine) {
+            if (widx < 0) widx = next_widx.fetch_add(1) % kMaxThreads;
+            st.w = widx;
+        }
+        if (t < first) {
+            const PClock::time_point a = PClock::now();
+            (*meanwhile)();
+            if (fine) mw_us = us_between(a, PClock::now());
+            return;
+        }
         t -= first;
         const int u = orderp[t / gu_tasks], i0 = runp[u], i1 = runp[u + 1];
         if (late && late[byp[i0]]) (*wait)(byp[i0]);
@@ -373,6 +485,26 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             }
         }
     });
+    if (timed) pt[2] = PClock::now();
+    if (fine) {
+        std::vector<double> starts, ends, busys;
+        for (int w = 0; w < kMaxThreads; ++w)
+            if (t_used[w]) {
+                starts.push_back(us_between(t_post, t_first[w]));
+                ends.push_back(us_between(t_post, t_last[w]));
+                busys.push_back(busy[w]);
+            }
+        std::sort(starts.begin(), starts.end());
+        std::sort(ends.begin(), ends.end());
+        double sa = 0, ba = 0;
+        for (double v : starts) sa += v;
+        for (double v : busys) ba += v;
+        prof.mw[n] += mw_us;
+        prof.start_avg[n] += sa / starts.size();
+        prof.start_max[n] += starts.back();
+        prof.tail[n] += ends.back() - ends[ends.size() / 2];
+        prof.busy_avg[n] += ba / busys.size();
+    }
     uint8_t* hqp = hq.data();
     const auto hq_from = traits(td->vec_dot_type)->from_float;
     workers.run(n, [&](int j) { hq_from(hp + (size_t) j * n_ff, hqp + (size_t) j * h_bytes, n_ff); });
@@ -385,6 +517,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     const Ready* readyhp = ready_h.data();
 #endif
 
+    if (timed) pt[3] = PClock::now();
     const int d_tasks = (n_embd + kRowsPerDownTask - 1) / kRowsPerDownTask;
     workers.run(d_tasks, [&](int t) {
         static thread_local std::vector<float> one;   // an output value of every use
@@ -413,6 +546,24 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             }
         }
     });
+    if (timed) {
+        pt[4] = PClock::now();
+        prof.calls[n] += 1;
+        for (int i = 0; i < 4; ++i) prof.ph[n][i] += us_between(pt[i], pt[i + 1]);
+        if (++prof.all % 20000 == 0)
+            for (int k = 1; k <= 8; ++k)
+                if (prof.calls[k] > 0)
+                    std::fprintf(stderr, "INK_CPU_PROF %d experts: %6.0f calls, prep %5.1f  gate_up %6.1f  hq %5.1f  down %6.1f us\n",
+                                 k, prof.calls[k], prof.ph[k][0] / prof.calls[k], prof.ph[k][1] / prof.calls[k],
+                                 prof.ph[k][2] / prof.calls[k], prof.ph[k][3] / prof.calls[k]);
+        if (prof.all % 20000 == 0)
+            for (int k = 1; k <= 2; ++k)
+                if (prof.calls[k] > 0)
+                    std::fprintf(stderr, "INK_CPU_PROF %d experts gate_up: gpu launches %5.1f, threads start avg %5.1f max %5.1f, "
+                                 "tail (last - median end) %5.1f, busy avg %5.1f us\n", k,
+                                 prof.mw[k] / prof.calls[k], prof.start_avg[k] / prof.calls[k], prof.start_max[k] / prof.calls[k],
+                                 prof.tail[k] / prof.calls[k], prof.busy_avg[k] / prof.calls[k]);
+    }
 }
 
 }  // namespace strata::poly
