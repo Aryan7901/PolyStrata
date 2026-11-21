@@ -523,6 +523,22 @@ struct ClipJobs {
     ClipJob j[3];
 };
 
+// A warp's clip of one vector of dim values (clip3_kernel's job): v times its scale (null: none), scaled down to an L2
+// norm of at most limit, and where alpha > 0 times 1 + alpha * log(max(1, (p + 1) / floor)).  Its operations written
+// out as the compiler gave them, so that another kernel that clips gives the same values.
+__device__ __forceinline__ void clip_vec(float* v, const float* s, float limit, int dim, float alpha, float floor_,
+                                         int64_t p, int lane) {
+    float ss = 0.f;
+    for (int i = lane; i < dim; i += WARP) {
+        const float y = s ? __fmul_rn(v[i], s[i]) : v[i];
+        ss = __fmaf_rn(y, y, ss);
+    }
+    ss = warp_sum(ss);
+    float factor = fminf(fmaxf(limit / (sqrtf(ss) + 1e-6f), 0.f), 1.f);
+    if (alpha > 0.f) factor = __fmul_rn(factor, __fmaf_rn(alpha, logf(fmaxf((float) (p + 1) / floor_, 1.f)), 1.f));
+    for (int i = lane; i < dim; i += WARP) v[i] = __fmul_rn(s ? __fmul_rn(v[i], s[i]) : v[i], factor);
+}
+
 __global__ void clip3_kernel(ClipJobs jobs, int rows, float floor_, int64_t pos, const long long* at) {
     pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
     pdl_wait();
@@ -530,20 +546,8 @@ __global__ void clip3_kernel(ClipJobs jobs, int rows, float floor_, int64_t pos,
     const int head = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const int t = blockIdx.y;
     if (head >= J.heads || t >= rows) return;
-    float* v = J.x + (size_t) t * J.x_stride + (size_t) head * J.dim;
-    const float* s = J.scale ? J.scale + (size_t) head * J.dim : nullptr;
-    float ss = 0.f;
-    for (int i = lane; i < J.dim; i += WARP) {
-        const float y = s ? v[i] * s[i] : v[i];
-        ss += y * y;
-    }
-    ss = warp_sum(ss);
-    float factor = fminf(fmaxf(J.limit / (sqrtf(ss) + 1e-6f), 0.f), 1.f);
-    if (J.alpha > 0.f) {
-        const int64_t p = (at ? (int64_t) at[0] : pos) + t;
-        factor *= 1.f + J.alpha * logf(fmaxf((float) (p + 1) / floor_, 1.f));
-    }
-    for (int i = lane; i < J.dim; i += WARP) v[i] = (s ? v[i] * s[i] : v[i]) * factor;
+    clip_vec(J.x + (size_t) t * J.x_stride + (size_t) head * J.dim, J.scale ? J.scale + (size_t) head * J.dim : nullptr,
+             J.limit, J.dim, J.alpha, floor_, (at ? (int64_t) at[0] : pos) + t, lane);
 }
 
 // rms of two vectors a token (no weights) into the halves of a 2n row: the loop controller's input.  Up to four
@@ -602,13 +606,9 @@ __global__ void conv_kernel(const float* __restrict__ x, const float* __restrict
 // One token: its output and the state's advance in one thread a channel (no other thread reads the channel).  With
 // res, the output also goes into the residual stream there: added to it, or with push, in place of it, its value
 // before going to push (ink_conv's rows_kernel launches, the same values).
-__global__ void conv1_kernel(const float* x, float* state, const float* w,
-                             const float* dyn, int heads, float* out, int channels, int taps,
-                             float scale, float* snap, float* res, float* push) {
-    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
-    pdl_wait();
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= channels) return;
+// conv1_kernel's channel c: its output, and the state advanced (and its snapshot)
+__device__ __forceinline__ float conv1_channel(const float* x, float* state, const float* w, const float* dyn, int heads,
+                                               int channels, int taps, float scale, float* snap, int c) {
     const int keep = taps - 1;
     float* st = state + (size_t) c * keep;
     const float* wc = w + (size_t) c * taps;
@@ -622,7 +622,22 @@ __global__ void conv1_kernel(const float* x, float* state, const float* w,
         acc += d[0] * xt;
         for (int lag = 1; lag < taps; ++lag) acc += d[lag] * past[keep - lag];
     }
-    const float o = __fmul_rn(xt + acc, scale);   // rounded as stored: no fused add of the residual below
+    const float o = __fmul_rn(xt + acc, scale);   // rounded as stored: no fused add of a residual after it
+    for (int j = 0; j + 1 < keep; ++j) st[j] = past[j + 1];
+    st[keep - 1] = xt;
+    if (snap)
+        for (int j = 0; j < keep; ++j) snap[(size_t) c * keep + j] = st[j];
+    return o;
+}
+
+__global__ void conv1_kernel(const float* x, float* state, const float* w,
+                             const float* dyn, int heads, float* out, int channels, int taps,
+                             float scale, float* snap, float* res, float* push) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float o = conv1_channel(x, state, w, dyn, heads, channels, taps, scale, snap, c);
     out[c] = o;
     if (push) {
         push[c] = res[c];
@@ -630,10 +645,90 @@ __global__ void conv1_kernel(const float* x, float* state, const float* w,
     } else if (res) {
         res[c] = __fadd_rn(res[c], o);
     }
-    for (int j = 0; j + 1 < keep; ++j) st[j] = past[j + 1];
-    st[keep - 1] = xt;
-    if (snap)
-        for (int j = 0; j < keep; ++j) snap[(size_t) c * keep + j] = st[j];
+}
+
+// ---- one token's keys and values from their products to a Q8_0 cache (ink_kv_chain): a block a head of each side,
+// a thread a channel.  The short convolution (conv1_kernel's), then the keys' clip (clip3_kernel's: a warp's lanes
+// over the head, in its order, with no scale and no position factor) or the values' norm (head_norm_rope_kernel's
+// with no weights or rotation: the block's sum), then the store (store_q8_at_kernel's: a warp a 32-value block; the
+// block's largest magnitude is the same whatever the order).  Each the operations of the launch it stands for.
+struct KvChain {
+    InkKvSide k, v;
+};
+
+// Blocks past the keys' and values' (2 * heads): the queries' and the relative terms' clips (clip3_kernel's), a warp a
+// head, `per` blocks each.
+__global__ void __launch_bounds__(ATT_DIM)
+kv_chain_kernel(KvChain kc, int heads, int taps, float scale, float limit, float eps, int64_t pos, const long long* at,
+                int ring, InkClip cq, InkClip cr, int per, float floor_) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    if ((int) blockIdx.x >= 2 * heads) {
+        const int b = (int) blockIdx.x - 2 * heads;
+        const bool r = b >= per;
+        const int head = (r ? b - per : b) * (ATT_DIM / WARP) + (int) threadIdx.x / WARP;
+        const int dim = r ? cr.dim : cq.dim;
+        if (head >= (r ? cr.heads : cq.heads)) return;
+        const float* sc = r ? cr.scale : cq.scale;
+        clip_vec((r ? cr.x : cq.x) + (size_t) head * dim, sc ? sc + (size_t) head * dim : nullptr, r ? cr.limit : cq.limit,
+                 dim, r ? cr.alpha : cq.alpha, floor_, at ? (int64_t) at[0] : pos, (int) threadIdx.x % WARP);
+        return;
+    }
+    __shared__ float sh[ATT_DIM], part[ATT_DIM / WARP], fac;
+    const bool vs = (int) blockIdx.x >= heads;
+    const int channels = heads * ATT_DIM, c = (vs ? (int) blockIdx.x - heads : (int) blockIdx.x) * ATT_DIM + threadIdx.x;
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    InkKvSide S;   // the block's side, a field at a time (a reference into the parameters would copy them)
+    S.x = vs ? kc.v.x : kc.k.x;
+    S.state = vs ? kc.v.state : kc.k.state;
+    S.w = vs ? kc.v.w : kc.k.w;
+    S.dyn = vs ? kc.v.dyn : kc.k.dyn;
+    S.out = vs ? kc.v.out : kc.k.out;
+    S.fin = vs ? kc.v.fin : kc.k.fin;
+    S.codes = vs ? kc.v.codes : kc.k.codes;
+    S.scales = vs ? kc.v.scales : kc.k.scales;
+    S.snap = vs ? kc.v.snap : kc.k.snap;
+    const float o = conv1_channel(S.x, S.state, S.w, S.dyn, heads, channels, taps, scale, S.snap, c);
+    float y;
+    if (!vs) {   // the keys' clip: the head's L2 norm as clip3_kernel's warp sums it
+        sh[threadIdx.x] = o;
+        __syncthreads();
+        if (warp == 0) {
+            float ss = 0.f;
+            for (int i = lane; i < ATT_DIM; i += WARP) {
+                const float v = sh[i];
+                ss += v * v;
+            }
+            ss = warp_sum(ss);
+            if (lane == 0) fac = fminf(fmaxf(limit / (sqrtf(ss) + 1e-6f), 0.f), 1.f);
+        }
+        __syncthreads();
+        y = o * fac;
+    } else {     // the values' norm: head_norm_rope_kernel's block_sum of a value a thread
+        S.out[c] = o;
+        float ss = 0.0f;
+        ss += o * o;
+        ss = warp_sum(ss);
+        if (lane == 0) part[warp] = ss;
+        __syncthreads();
+        float sum = 0.0f;
+        for (int k = 0; k < ATT_DIM / WARP; ++k) sum += part[k];
+        // the division by a constant power of two is a product here, which must not fuse with the add of eps
+        y = o * (1.0f / sqrtf(__fadd_rn(__fdiv_rn(sum, (float) ATT_DIM), eps)));
+    }
+    S.fin[c] = y;
+    // the store: row (at ? at[0] : pos), modulo ring where ring > 0
+    const long long p = at ? *at : (long long) pos;
+    const long long row = ring > 0 ? p % ring : p;
+    float amax = fabsf(y);
+#pragma unroll
+    for (int o2 = WARP / 2; o2 > 0; o2 >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o2, WARP));
+    const float d = amax / 127.0f;
+    const float id = d > 0.f ? 1.0f / d : 0.0f;
+    if (lane == 0) S.scales[(size_t) row * (channels / 32) + c / 32] = __half_as_ushort(__float2half(d));
+    float q = rintf(y * id);
+    q = fminf(fmaxf(q, -127.0f), 127.0f);
+    S.codes[(size_t) row * channels + c] = (int8_t) q;
 }
 
 __global__ void conv_state_kernel(const float* __restrict__ x, float* __restrict__ state, int channels, int taps,
@@ -2008,6 +2103,17 @@ void ink_conv(const float* x, float* state, const float* w, const float* dyn, in
     if (!res) return;
     if (push) ink_rows(res, res_stride, push, res_stride, channels, rows, false, stream);
     ink_rows(out, channels, res, res_stride, channels, rows, !push, stream);
+}
+
+void ink_kv_chain(const InkKvSide& k, const InkKvSide& v, int kv_heads, int dim, int taps, float conv_scale,
+                  float k_limit, float v_eps, int64_t pos, const long long* at, int ring, const InkClip& q,
+                  const InkClip& rel, float floor_, void* stream) {
+    if (dim != ATT_DIM) throw std::invalid_argument("ink_kv_chain: heads of 128 values only");
+    if (taps < 2 || taps > 8) throw std::invalid_argument("ink_kv_chain: 2 to 8 taps");
+    const int per = grid(std::max(q.heads, rel.heads), ATT_DIM / WARP);
+    launch_pdl(kv_chain_kernel, dim3(2 * kv_heads + 2 * per), dim3(ATT_DIM), 0, cs(stream), KvChain{k, v}, kv_heads,
+               taps, conv_scale, k_limit, v_eps, pos, at, ring, q, rel, per, floor_);
+    ck("ink_kv_chain");
 }
 
 void ink_copies(const RowCopies& c, int count, int stride, int n, int rows, void* stream) {

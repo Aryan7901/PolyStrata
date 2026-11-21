@@ -539,7 +539,7 @@ void Inkling2::assign_scratch() {
     k_ = fbuf(n * kvw);
     vraw_ = fbuf(n * kvw);
     v_ = fbuf(n * kvw);
-    dyn_ = fbuf(n * (size_t) taps_ * n_kv_);
+    dyn_ = fbuf(2 * n * (size_t) taps_ * n_kv_);   // the keys' taps, then the values
     att_ = fbuf(n * hq);
     part_ = fbuf(ink_attend_floats(rows_, n_head_, opt_.max_context));
     tmp_ = fbuf(n * e);
@@ -727,32 +727,58 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         const float* kin = all ? q_ + (2 * hq + n_head_ * n_rel_) : kraw_;
         const float* vin = all ? kin + kvw : vraw_;
         const int kv_stride = all ? qgr : kvw;
+        const bool rows = rows_of_ != nullptr;   // step(): each row a sequence of its own, with its own state
+        // INK_KV_SIM=v4|v4r|k4v4r|k4r (a quality experiment, with --no-graphs): the rows a 4-bit cache would give
+        // back, unrotated or rotated as llama.cpp rotates them (V in blocks of 64, K by the head), into the Q8_0 store
+        static const std::string kv_sim = std::getenv("INK_KV_SIM") ? std::getenv("INK_KV_SIM") : "";
+        // a token's keys and values from their products into a Q8_0 cache in one launch (ink_kv_chain): their
+        // convolutions, the keys' clip, the values' norm and the stores
+        const bool chain = n == 1 && !rows && q8() && v4() == 0 && kv_sim.empty();
+        const float alpha = B.swa ? 0.f : log_alpha_;   // the queries' and relative terms' position factor
+        float* const dyn_v = dyn_ + (size_t) n * taps_ * n_kv_;   // the values' taps beside the keys'
         if (!all) lin(B.wk, xk, kraw_, n, xq8[1]);
         if (!B.swa) lin(B.kconv_proj, xk, dyn_, n);
-        const bool rows = rows_of_ != nullptr;   // step(): each row a sequence of its own, with its own state
-        if (rows) ink_conv_rows(kin, kv_stride, B.state, row_off_, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw,
-                                taps_, n, B.swa ? conv_s : conv_d, st_);
-        else ink_conv(kin, B.state, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw, taps_, n,
-                 B.swa ? conv_s : conv_d, st_, snap_bits_ ? snap_at_ + (B.state - state_) : nullptr, rec_n_, snap_bits_,
-                 kv_stride);
+        if (rows) {
+            ink_conv_rows(kin, kv_stride, B.state, row_off_, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw,
+                          taps_, n, B.swa ? conv_s : conv_d, st_);
+        } else if (!chain) {
+            ink_conv(kin, B.state, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw, taps_, n,
+                     B.swa ? conv_s : conv_d, st_, snap_bits_ ? snap_at_ + (B.state - state_) : nullptr, rec_n_,
+                     snap_bits_, kv_stride);
+        }
         if (!all) lin(B.wv, xv, vraw_, n, xq8[2]);
-        if (!B.swa) lin(B.vconv_proj, xv, dyn_, n);
-        if (rows) ink_conv_rows(vin, kv_stride, B.state + keep * kvw, row_off_, fp(B.v_conv), B.swa ? nullptr : dyn_,
-                                n_kv_, v_, kvw, taps_, n, B.swa ? conv_s : conv_d, st_);
-        else ink_conv(vin, B.state + keep * kvw, fp(B.v_conv), B.swa ? nullptr : dyn_, n_kv_, v_, kvw, taps_, n,
-                 B.swa ? conv_s : conv_d, st_, snap_bits_ ? snap_at_ + (B.state + keep * kvw - state_) : nullptr, rec_n_, snap_bits_,
-                 kv_stride);
-        // q, k and the relative terms clipped (q and r scaled by the position on the full runs), v normed
-        const float alpha = B.swa ? 0.f : log_alpha_;
-        if (rows)   // a row's position is its own: at_ holds one a row
+        if (!B.swa) lin(B.vconv_proj, xv, dyn_v, n);
+        if (chain) {
+            const float* kdyn = B.swa ? nullptr : dyn_;
+            const float* vdyn = B.swa ? nullptr : dyn_v;
+            float* ks = snap_bits_ & 1u ? snap_at_ + (B.state - state_) : nullptr;
+            float* vs = snap_bits_ & 1u ? snap_at_ + (B.state + keep * kvw - state_) : nullptr;
+            const InkKvSide ksd{kin, B.state, fp(B.k_conv), kdyn, k_, k_, B.k_codes, B.k_sc, ks};
+            const InkKvSide vsd{vin, B.state + keep * kvw, fp(B.v_conv), vdyn, v_, vraw_, B.v_codes, B.v_sc, vs};
+            const InkClip cq{q_, fp(B.q_clip), qk_clip_, alpha, dim_, n_head_};
+            const InkClip cr{rel, fp(B.rel_clip), rel_clip_, alpha, n_rel_, n_head_};
+            ink_kv_chain(ksd, vsd, n_kv_, dim_, taps_, B.swa ? conv_s : conv_d, qk_clip_, rms_eps_, pos_, at,
+                         B.swa ? ring_ : 0, cq, cr, log_floor_, st_);
+        } else if (rows) {
+            ink_conv_rows(vin, kv_stride, B.state + keep * kvw, row_off_, fp(B.v_conv), B.swa ? nullptr : dyn_v,
+                          n_kv_, v_, kvw, taps_, n, B.swa ? conv_s : conv_d, st_);
+        } else {
+            ink_conv(vin, B.state + keep * kvw, fp(B.v_conv), B.swa ? nullptr : dyn_v, n_kv_, v_, kvw, taps_, n,
+                     B.swa ? conv_s : conv_d, st_,
+                     snap_bits_ ? snap_at_ + (B.state + keep * kvw - state_) : nullptr, rec_n_, snap_bits_, kv_stride);
+        }
+        // q, k and the relative terms clipped (q and r scaled by the position on the full runs), v normed: the
+        // chain's are already
+        if (rows) {   // a row's position is its own: at_ holds one a row
             for (int i = 0; i < n; ++i)
                 ink_clip3(q_ + (size_t) i * qgr, qgr, fp(B.q_clip), qk_clip_, dim_, n_head_, alpha, k_ + (size_t) i * kvw,
                           kvw, nullptr, qk_clip_, dim_, n_kv_, 0.f, rel + (size_t) i * qgr, qgr, fp(B.rel_clip),
                           rel_clip_, n_rel_, n_head_, alpha, 1, log_floor_, rows_of_[i].pos, at_ + 2 * i, st_);
-        else
+        } else if (!chain) {
             ink_clip3(q_, qgr, fp(B.q_clip), qk_clip_, dim_, n_head_, alpha, k_, kvw, nullptr, qk_clip_, dim_, n_kv_, 0.f,
                       rel, qgr, fp(B.rel_clip), rel_clip_, n_rel_, n_head_, alpha, n, log_floor_, pos_, at, st_);
-        head_norm_rope(v_, dim_, nullptr, vraw_, dim_, n_kv_, 0, 1.f, pos_, n, rms_eps_, st_);
+        }
+        if (!chain) head_norm_rope(v_, dim_, nullptr, vraw_, dim_, n_kv_, 0, 1.f, pos_, n, rms_eps_, st_);
         const float* k = k_;
         const int ring = B.swa ? ring_ : 0;
         // INK_KV4_CHECK=1 (k8v4 or k4v4, with --no-graphs): the same attention over Q8_0 caches of the rows
@@ -798,12 +824,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                            sized, ks, vs, v4());
             }
         }
-        // INK_KV_SIM=v4|v4r|k4v4r|k4r (a quality experiment, with --no-graphs): the rows a 4-bit cache would give
-        // back, unrotated or rotated as llama.cpp rotates them (V in blocks of 64, K by the head), into the Q8_0 store
-        static const std::string kv_sim = std::getenv("INK_KV_SIM") ? std::getenv("INK_KV_SIM") : "";
         static float* sim_buf = nullptr;
         static size_t sim_n = 0;
-        for (int side = 0; side < 2 && q8() && !rows; ++side) {
+        for (int side = 0; side < 2 && q8() && !rows && !chain; ++side) {
             const float* x = side ? vraw_ : k;
             if (!kv_sim.empty() && !v4() && kv_sim.find(side ? "v4" : "k4") != std::string::npos) {
                 const size_t need = (size_t) n * kvw;

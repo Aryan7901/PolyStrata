@@ -481,6 +481,35 @@ void ink_conv(const float* x, float* state, const float* w, const float* dyn, in
               int taps, int rows, float scale, void* stream, float* snap = nullptr, size_t stride = 0,
               unsigned snaps = 0, int x_stride = 0,   ///< x_stride: floats from a token's x to the next (0: channels)
               float* res = nullptr, int res_stride = 0, float* push = nullptr);
+/// One side (keys or values) of ink_kv_chain(): ink_conv()'s x, state, w, dyn and out (out unused for the keys), what
+/// goes to the cache (fin: the keys clipped, the values normed), the Q8_0 cache's codes and scales (store_q8_at()'s
+/// layout), and the state's snapshot after the token (null: none).
+struct InkKvSide {
+    const float* x;
+    float* state;
+    const float* w;
+    const float* dyn;
+    float* out;
+    float* fin;
+    int8_t* codes;
+    uint16_t* scales;
+    float* snap;
+};
+/// One token's ink_clip() of `heads` vectors of dim values at x, in place (ink_kv_chain()'s queries and relative terms).
+struct InkClip {
+    float* x;
+    const float* scale;
+    float limit, alpha;
+    int dim, heads;
+};
+/// One token's keys and values from their products to a Q8_0 cache in one launch: what ink_conv() of each side (one
+/// row), ink_clip()'s of the keys (no scale, limit k_limit, no position factor), head_norm_rope() of the values (no
+/// weights, no rotation, v_eps) and store_q8_at() of both (row at[0], or pos without at; modulo ring where ring > 0)
+/// give, the same operations; and the clips of q and rel (heads 0: none) with position at[0] or pos and floor_, as
+/// ink_clip3() makes them.  kv_heads heads of dim (128) values a side.
+void ink_kv_chain(const InkKvSide& k, const InkKvSide& v, int kv_heads, int dim, int taps, float conv_scale,
+                  float k_limit, float v_eps, int64_t pos, const long long* at, int ring, const InkClip& q,
+                  const InkClip& rel, float floor_, void* stream);
 /// ink_conv for rows of different sequences, a token each: row t's state is at state + off[t] floats (off on the card).
 void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
                    int heads, float* out, int channels, int taps, int rows, float scale, void* stream);
