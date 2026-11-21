@@ -466,6 +466,9 @@ void ink_clip3(float* x0, int s0, const float* sc0, float lim0, int dim0, int he
                const long long* at, void* stream);
 /// out[t] = [rms(a[t]); rms(b[t])] (no weights), 2n values a token.
 void ink_rms2(const float* a, const float* b, float* out, int n, int rows, float eps, void* stream);
+/// Up to 4 ink_rms2()s in one launch: job j's (a[j], b[j]) into out + j * rows * 2n.
+void ink_rms2_jobs(const float* const* a, const float* const* b, int jobs, float* out, int n, int rows, float eps,
+                   void* stream);
 /// The causal short convolution of taps values (at most 8) a channel with its residual, for `rows` tokens of
 /// `channels` values: out = (x + sum_k w[k] x[t - taps + 1 + k] + dynamic) * scale, w as ggml's ssm_conv takes it
 /// (taps values a channel, the oldest first).  dyn, when not null: taps values a head (heads equal parts of the
@@ -514,6 +517,17 @@ void ink_hadamard(float* x, int stride, int n, int rows, int block, void* stream
 /// y = w x for 1 to 8 tokens of an F32 matrix (n_out rows of n_in, n_in a multiple of 4); false (nothing done) for
 /// other shapes.  For narrow matrices, where the general gemv gives too few blocks.
 bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream);
+/// Up to 4 ink_gemv_f32()s of one shape in one launch, job j's w[j] x[j] into y[j]: each the same sums as alone.
+bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out,
+                       int rows, void* stream);
+/// The loop's message controllers after their first product, up to 4 in one launch: job j's g and f = w[j] h[j] (w:
+/// 2n rows of n_in, gain then forget; h: n_in values a row), then out[j] = ink_gate()'s (1 - tanh(f)) * cur[j] +
+/// tanh(g) * msg[j] (n values a row; cur and msg rows cur_stride and msg_stride apart; out n apart; out may be cur).
+/// The products' sums are ink_gemv_f32()'s; false (nothing done) where its kernel for the shape is another (n_in of
+/// 512 or more) or for more than 8 rows.
+bool ink_gate_gemv(const float* const* w, const float* const* h, const float* const* cur, int cur_stride,
+                   const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
+                   void* stream);
 /// For each of `rows` rows of approximate logits (n of them, stride apart): the indices within `margin` of the row's
 /// largest into ids (cap a row; more are left out) and how many matched into count[row] (it may pass cap).
 /// scratch: ink_shortlist_floats(rows) floats.
@@ -523,6 +537,9 @@ void ink_shortlist(const float* approx, int n, int stride, float margin, int* id
 /// logits[row][ids[k]] = the Q8_0 matrix w's row ids[k] times h[row] (n_embd values), for k below count[row] and cap.
 void ink_rescore_q8(const void* w, const float* h, int n_embd, const int* ids, const int* count, int cap,
                     float* logits, int stride, int rows, void* stream);
+/// mul_sigmoid(acc, g, n, rows, g_stride, false) and native_quantize_q8_1() of acc into y_q8_1 in one launch, the same
+/// bytes in both.  n a multiple of 32.
+void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream);
 /// x[r][i] = -inf for i in [from, n) of `rows` rows of n values: a padded vocabulary's tail.
 void ink_fill_tail(float* x, int from, int n, int rows, void* stream);
 

@@ -2190,7 +2190,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                                     ${_strata_gpu_include_directories})
   target_link_libraries(poly_route_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # the fused residual sum, RMS norm and Q8_1 quantization against the three launches; needs a card, run by hand
-  add_executable(poly_norm_q8_test src/poly/norm_q8_test.cu src/poly/kernels.cu)
+  add_executable(poly_norm_q8_test src/poly/norm_q8_test.cu src/poly/kernels.cu src/poly/kernels_inkling.cu)
   target_include_directories(poly_norm_q8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                       ${_strata_gpu_include_directories})
   target_link_libraries(poly_norm_q8_test PRIVATE strata_kernels ${_strata_gpu_blas_target}

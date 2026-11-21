@@ -105,6 +105,8 @@ private:
     Dev msg_queries();
     /// The loop's message controller of module m on rows of x (n_embd a token, contiguous), in place.
     void control(Block& B, int m, float* x, const float* msg, int n);
+    /// The attention's three controllers (modules 0 to 2) together: out[j] from x[j] and msg[j].
+    void control3(Block& B, float* const* x, const float* const* msg, float* const* out, int n);
     void plan();
     /// The cache is codes and their scales (q8_0, k8v4, k4v4), not fp16 rows.
     bool q8() const { return opt_.kv_format == KvFmt::kQ8_0 || v4(); }

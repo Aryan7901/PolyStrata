@@ -526,8 +526,11 @@ void Inkling2::assign_scratch() {
     const size_t n = (size_t) rows_, e = (size_t) n_embd_, hq = (size_t) n_head_ * dim_, kvw = (size_t) n_kv_ * dim_;
     mix_ = fbuf(3 * n * e);
     msg_ = fbuf(4 * n * e);
-    ctl_ = fbuf(2 * n * e);
-    ctl_h_ = fbuf(n * (size_t) std::max(gate_rank_, 1));
+    // a controller's rows, or the three controllers' of a call of a few tokens (control3): no more scratch than one
+    // controller's of a prompt batch, which the expert cache would give up
+    const size_t ctl_rows = std::max(n, 3 * (size_t) std::min(rows_, kStageRows - 1));
+    ctl_ = fbuf(2 * ctl_rows * e);
+    ctl_h_ = fbuf(ctl_rows * (size_t) std::max(gate_rank_, 1));
     ctl_g_ = fbuf(2 * n * e);   // gain then forget, a token's 2 * n_embd together
     xin_ = fbuf(3 * n * e);
     q_ = fbuf(n * (2 * hq + (size_t) n_head_ * n_rel_ + 2 * kvw));   // a token's q, gate, rel (and k, v: wall)
@@ -548,7 +551,8 @@ void Inkling2::assign_scratch() {
         const char* hc = std::getenv("INK_HEAD_CHECK");
         if (hc && std::atoi(hc) == 1) head_exact_ = (float*) dmalloc(r * (size_t) n_vocab_ * sizeof(float), "head check");
     }
-    // the attention's three inputs in Q8_1, for a call of fewer than kStageRows tokens (layer_head)
+    // the attention's three inputs in Q8_1, then its gated output (fewer values a token than the three inputs), for a
+    // call of fewer than kStageRows tokens (layer_head)
     xq3_ = fbuf(3 * (size_t) std::min(rows_, kStageRows - 1) * kernels::native_q8_1_bytes(n_embd_) / sizeof(float));
     if (!row_off_) row_off_ = (long long*) dmalloc(8 * sizeof(long long), "the step's state offsets");
 }
@@ -558,8 +562,56 @@ void Inkling2::assign_scratch() {
 void Inkling2::control(Block& B, int m, float* x, const float* msg, int n) {
     ink_rms2(x, msg, ctl_, n_embd_, n, kMixEps, st_);
     lin_f32(B.loop_down[m], ctl_, ctl_h_, n);
-    lin_f32(B.loop_gf[m], ctl_h_, ctl_g_, n);
+    // G h, F h and the gate in one launch, where the product would be ink_gemv_f32's (lin_f32)
+    const Dev& gf = B.loop_gf[m];
+    const float* w = fp(gf);
+    const float* h = ctl_h_;
+    const float* cur = x;
+    if (gf.type == kTypeF32 && gf.scale == 1.0f && n < kStageRows &&
+        ink_gate_gemv(&w, &h, &cur, n_embd_, &msg, n_embd_, &x, 1, gf.n_in, n_embd_, n, st_))
+        return;
+    lin_f32(gf, ctl_h_, ctl_g_, n);
     ink_gate(x, n_embd_, msg, n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, x, n_embd_, n, st_);
+}
+
+// The attention's three controllers (q, k and v: modules 0 to 2), out[j] from x[j] and msg[j] as control() makes it
+// in place: each step of the three in one launch where the products are ink_gemv_f32's (a few tokens), the same sums.
+void Inkling2::control3(Block& B, float* const* x, const float* const* msg, float* const* out, int n) {
+    const size_t e = (size_t) n_embd_, rank = (size_t) std::max(gate_rank_, 1);
+    bool jobs = n < kStageRows;
+    for (int j = 0; j < 3; ++j)
+        for (const Dev* d : {&B.loop_down[j], &B.loop_gf[j]})
+            jobs = jobs && d->type == kTypeF32 && d->scale == 1.0f;
+    if (!jobs) {   // a prompt batch: control()'s launches each, into out[j]
+        for (int j = 0; j < 3; ++j) {
+            ink_rms2(x[j], msg[j], ctl_, n_embd_, n, kMixEps, st_);
+            lin_f32(B.loop_down[j], ctl_, ctl_h_, n);
+            lin_f32(B.loop_gf[j], ctl_h_, ctl_g_, n);
+            ink_gate(x[j], n_embd_, msg[j], n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, out[j], n_embd_, n, st_);
+        }
+        return;
+    }
+    const float* xs[3] = {x[0], x[1], x[2]};
+    const float* down[3];
+    const float* gf[3];
+    const float* c[3];
+    const float* hc[3];
+    float* h[3];
+    for (int j = 0; j < 3; ++j) {
+        down[j] = fp(B.loop_down[j]);
+        gf[j] = fp(B.loop_gf[j]);
+        c[j] = ctl_ + (size_t) j * n * 2 * e;
+        h[j] = ctl_h_ + (size_t) j * n * rank;
+        hc[j] = h[j];
+    }
+    ink_rms2_jobs(xs, msg, 3, ctl_, n_embd_, n, kMixEps, st_);
+    if (!ink_gemv_f32_jobs(down, c, h, 3, B.loop_down[0].n_in, B.loop_down[0].n_out, n, st_))
+        for (int j = 0; j < 3; ++j) lin_f32(B.loop_down[j], c[j], h[j], n);
+    if (ink_gate_gemv(gf, hc, xs, n_embd_, msg, n_embd_, out, 3, B.loop_gf[0].n_in, n_embd_, n, st_)) return;
+    for (int j = 0; j < 3; ++j) {
+        lin_f32(B.loop_gf[j], h[j], ctl_g_, n);
+        ink_gate(x[j], n_embd_, msg[j], n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, out[j], n_embd_, n, st_);
+    }
 }
 
 // A run from its input to its router's copy.  r_ holds a token's streams; slot 0 is the residual.
@@ -621,14 +673,12 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     if (B.attn_mix.n > 0) ink_mix(r_, rs, B.attn_mix, fp(B.attn_query), nq, mix_, plane, n_embd_, n, st_);
     else ink_rows(cur, rs, mix_, n_embd_, n_embd_, n, false, st_);
     for (int j = 0; j < 3; ++j) in[j] = mix_ + (size_t) (B.attn_mix.n > 0 && !B.swa ? j : 0) * plane;
-    if (msgs) {
-        if (B.swa || B.attn_mix.n == 0) {   // the messages differ by input: three of them
-            ink_rows(mix_, n_embd_, mix_ + plane, n_embd_, n_embd_, n, false, st_);
-            ink_rows(mix_, n_embd_, mix_ + 2 * plane, n_embd_, n_embd_, n, false, st_);
-            for (int j = 0; j < 3; ++j) in[j] = mix_ + (size_t) j * plane;
-        }
+    if (msgs) {   // the messages differ by input: three inputs, from the one mix of a window run, into xin_
         const float* m[3] = {msg_, msg_b, msg_b + plane};
-        for (int j = 0; j < 3; ++j) control(B, j, in[j], m[j], n);
+        float* out[3];
+        for (int j = 0; j < 3; ++j) out[j] = xin_ + (size_t) j * plane;
+        control3(B, in, m, out, n);
+        for (int j = 0; j < 3; ++j) in[j] = out[j];   // their norms below are in place
     }
     float* xq = xin_;
     float* xk = xin_ + plane;
@@ -801,8 +851,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                    1.f / std::sqrt((float) dim_), pos_, n, B.swa ? window_ : 0, ring, st_, at, room_rows,
                    q8() ? B.k_sc : nullptr, q8() ? B.v_sc : nullptr, v4());
         if (kv4_check) kv4_compare(B, il, n);
-        mul_sigmoid(att_, gate, hq, n, qgr, false, st_);
-        lin(B.wo, att_, tmp_, n);
+        if (n < kStageRows) {   // the gate, and the Q8_1 blocks of the product's input, in one launch
+            ink_mul_sigmoid_q8(att_, gate, hq, n, qgr, xq3_, st_);
+            lin(B.wo, att_, tmp_, n, xq3_);
+        } else {
+            mul_sigmoid(att_, gate, hq, n, qgr, false, st_);
+            lin(B.wo, att_, tmp_, n);
+        }
         // into the residual: the first run of a block keeps the stream as a block and starts again from the
         // attention's output, the others add it
         float* push = B.push >= 0 ? r_ + (size_t) B.push * n_embd_ : nullptr;

@@ -2,6 +2,7 @@
 // inkling2 graph (src/models/inkling2.cpp) and its relative positions (llama_kv_cache::set_input_relative_pos).
 // Where a kernel takes several tokens, blockIdx.y is the token unless it says otherwise.
 #include "strata/poly/kernels.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -249,6 +250,10 @@ mix_few_kernel(const float* __restrict__ r, int r_stride, InkStates s, const flo
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP, warps = blockDim.x / WARP;
     const int per = (n + MIX_CHUNKS - 1) / MIX_CHUNKS;
     const int j = warp % MIX_STATES;
+    int off_j = 0;   // s.off[j], selected: indexing the parameter would copy it to local memory
+#pragma unroll
+    for (int k = 0; k < MIX_STATES; ++k)
+        if (k == j) off_j = s.off[k];
     for (int c = warp / MIX_STATES; c < MIX_CHUNKS; c += warps / MIX_STATES) {
         float* pp = part[c];
         if (j >= s.n) {
@@ -256,7 +261,7 @@ mix_few_kernel(const float* __restrict__ r, int r_stride, InkStates s, const flo
             continue;
         }
         const int i0 = c * per;
-        mix_chunk<NQ>(row + s.off[j], query, n, i0, min(n, i0 + per), lane, pp, j);
+        mix_chunk<NQ>(row + off_j, query, n, i0, min(n, i0 + per), lane, pp, j);
     }
     __syncthreads();
     if (threadIdx.x < MIX_PART) {
@@ -270,14 +275,25 @@ mix_few_kernel(const float* __restrict__ r, int r_stride, InkStates s, const flo
     if (threadIdx.x < nq) {
         const int q = threadIdx.x;
         const float sc = rsqrtf((float) n);
+        // each operation rounded on its own, as in the loops over memory this was (no product fused into the
+        // subtraction of the max, nor the exponential's last product into the sum)
         float mx = -INFINITY, sc_j[MIX_STATES];
-        for (int k = 0; k < s.n; ++k) {
-            sc_j[k] = wsum[MIX_STATES + k * MIX_QUERIES + q] * inv[k] * sc;
-            mx = fmaxf(mx, sc_j[k]);
-        }
+#pragma unroll
+        for (int k = 0; k < MIX_STATES; ++k)
+            if (k < s.n) {
+                sc_j[k] = __fmul_rn(__fmul_rn(wsum[MIX_STATES + k * MIX_QUERIES + q], inv[k]), sc);
+                mx = fmaxf(mx, sc_j[k]);
+            }
         float sum = 0.f;
-        for (int k = 0; k < s.n; ++k) sum += sc_j[k] = expf(sc_j[k] - mx);
-        for (int k = 0; k < s.n; ++k) weight[q][k] = sc_j[k] / sum * inv[k];
+#pragma unroll
+        for (int k = 0; k < MIX_STATES; ++k)
+            if (k < s.n) {
+                sc_j[k] = expf(__fsub_rn(sc_j[k], mx));
+                sum = __fadd_rn(sum, sc_j[k]);
+            }
+#pragma unroll
+        for (int k = 0; k < MIX_STATES; ++k)
+            if (k < s.n) weight[q][k] = __fmul_rn(__fdiv_rn(sc_j[k], sum), inv[k]);
     }
     __syncthreads();
     float* o = out + (size_t) t * n;
@@ -296,13 +312,29 @@ mix_few_kernel(const float* __restrict__ r, int r_stride, InkStates s, const flo
 }
 
 // ---- F32 products of a few tokens with narrow matrices (the router, the loop's controllers): a block an output
-// when its row is long, a warp an output when it is short; the weights read once for all of the call's tokens.
+// when its row is long, a warp an output when it is short; the weights read once for all of the call's tokens.  Up
+// to four products of the same shape in one launch (blockIdx.y picks which), each its own matrix, input and output.
 constexpr int GEMV_ROWS = 8;
+constexpr int GEMV_JOBS = 4;
+
+struct GemvJobs {
+    const float* w[GEMV_JOBS];
+    const float* x[GEMV_JOBS];
+    float* y[GEMV_JOBS];
+};
+
+// a[j] of a kernel parameter's array: a select, where a[j] would copy the parameters to local memory to index them
+template <class T>
+__device__ __forceinline__ T pick(const T (&a)[GEMV_JOBS], int j) {
+    return j == 0 ? a[0] : j == 1 ? a[1] : j == 2 ? a[2] : a[3];
+}
 
 template <int R>
-__global__ void gemv_wide_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
-                                 int n_in, int n_out) {
+__global__ void gemv_wide_kernel(GemvJobs jobs, int n_in, int n_out) {
     __shared__ float red[R][8];
+    const float* __restrict__ w = pick(jobs.w, blockIdx.y);
+    const float* __restrict__ x = pick(jobs.x, blockIdx.y);
+    float* __restrict__ y = pick(jobs.y, blockIdx.y);
     const int o = blockIdx.x;
     const float* wr = w + (size_t) o * n_in;
     float acc[R];
@@ -330,13 +362,10 @@ __global__ void gemv_wide_kernel(const float* __restrict__ w, const float* __res
     }
 }
 
+// A warp's output o of R tokens: its lanes' products, then the warp's sum
 template <int R>
-__global__ void gemv_short_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
-                                  int n_in, int n_out) {
-    const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
-    if (o >= n_out) return;
-    const float* wr = w + (size_t) o * n_in;
-    float acc[R];
+__device__ __forceinline__ void gemv_short_row(const float* __restrict__ wr, const float* __restrict__ x, int n_in,
+                                               int lane, float* acc) {
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
     for (int i = lane; i < n_in; i += WARP) {
@@ -345,10 +374,27 @@ __global__ void gemv_short_kernel(const float* __restrict__ w, const float* __re
         for (int r = 0; r < R; ++r) acc[r] += wv * x[(size_t) r * n_in + i];
     }
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const float v = warp_sum(acc[r]);
-        if (lane == 0) y[(size_t) r * n_out + o] = v;
-    }
+    for (int r = 0; r < R; ++r) acc[r] = warp_sum(acc[r]);
+}
+
+template <int R>
+__global__ void gemv_short_kernel(GemvJobs jobs, int n_in, int n_out) {
+    const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    if (o >= n_out) return;
+    float acc[R];
+    const int j = blockIdx.y;
+    gemv_short_row<R>(pick(jobs.w, j) + (size_t) o * n_in, pick(jobs.x, j), n_in, lane, acc);
+    float* y = pick(jobs.y, j);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        if (lane == 0) y[(size_t) r * n_out + o] = acc[r];
+}
+
+// The loop controller's gate: out = (1 - tanh(f)) * cur + tanh(g) * msg, n values a row - with the one rounding of a
+// fused multiply-add the compiler gave the expression written out (gate_kernel's, before the gate had other callers:
+// left to the compiler, its contraction depends on the code around it)
+__device__ __forceinline__ float ctl_gate(float c, float m, float g, float f) {
+    return __fmaf_rn(1.f - tanhf(f), c, __fmul_rn(tanhf(g), m));
 }
 
 __global__ void gate_kernel(const float* __restrict__ cur, int cur_stride, const float* __restrict__ msg,
@@ -357,8 +403,72 @@ __global__ void gate_kernel(const float* __restrict__ cur, int cur_stride, const
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const size_t t = blockIdx.y;
-    const float c = cur[t * cur_stride + i], m = msg[t * msg_stride + i];
-    out[t * n + i] = (1.f - tanhf(f[t * gf_stride + i])) * c + tanhf(g[t * gf_stride + i]) * m;
+    out[t * n + i] = ctl_gate(cur[t * cur_stride + i], msg[t * msg_stride + i], g[t * gf_stride + i], f[t * gf_stride + i]);
+}
+
+// The controller's second product (its gain then its forget rows, 2n of them, of h) and its gate in one launch: a
+// warp takes an output o's gain and forget rows as gemv_short_kernel takes a row, and gates value o of each token.
+// Up to four controllers (blockIdx.y), each its own matrix, h, cur, msg and out.
+struct GateJobs {
+    const float* w[GEMV_JOBS];
+    const float* h[GEMV_JOBS];
+    const float* cur[GEMV_JOBS];
+    const float* msg[GEMV_JOBS];
+    float* out[GEMV_JOBS];
+};
+
+template <int R>
+__global__ void gate_gemv_kernel(GateJobs jobs, int n_in, int n, int cur_stride, int msg_stride) {
+    const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    if (o >= n) return;
+    const int j = blockIdx.y;
+    const float* w = pick(jobs.w, j);
+    const float* h = pick(jobs.h, j);
+    float g[R], f[R];
+    gemv_short_row<R>(w + (size_t) o * n_in, h, n_in, lane, g);
+    gemv_short_row<R>(w + (size_t) (n + o) * n_in, h, n_in, lane, f);
+    if (lane >= R) return;
+    const float* cur = pick(jobs.cur, j);
+    const float* msg = pick(jobs.msg, j);
+    float* out = pick(jobs.out, j);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        if (r == lane) out[(size_t) r * n + o] = ctl_gate(cur[(size_t) r * cur_stride + o], msg[(size_t) r * msg_stride + o], g[r], f[r]);
+}
+
+// ---- the attention's gated output in Q8_1 for its product: acc *= sigmoid(g) (poly's mul_sigmoid_kernel, the same
+// operations) and the products' Q8_1 blocks of it (native_quantize_q8_1_kernel's: a warp a 32-value block).  That
+// kernel is built with --use_fast_math: its divisions are div.approx(.ftz), which __fdividef is here (no denormal
+// takes part in a finite block's scale or code).
+struct Q81 {
+    __half2 ds;
+    int8_t qs[32];
+};
+
+__device__ __forceinline__ void store_q8_1(float xi, Q81* __restrict__ y, size_t i) {
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o, WARP));
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, WARP);
+    const float d = kernels::q8_1_finite(__fdividef(amax, 127.0f));
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float r = roundf(__fdividef(xi, d));
+        q = (int8_t) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
+    }
+    y[i / 32].qs[i % 32] = q;
+    if (i % 32 == 0) y[i / 32].ds = kernels::q8_1_ds(d, sum);
+}
+
+__global__ void mul_sigmoid_q8_kernel(float* __restrict__ acc, const float* __restrict__ g, int n, int g_stride,
+                                      Q81* __restrict__ yq) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;   // n is a multiple of 32: whole warps return
+    const size_t at = (size_t) blockIdx.y * n + i;
+    const float v = acc[at] * (1.0f / (1.0f + expf(-g[(size_t) blockIdx.y * g_stride + i])));
+    acc[at] = v;
+    store_q8_1(v, yq, at);
 }
 
 // ---- the queries', keys' and relative terms' clip, a warp a head
@@ -417,11 +527,17 @@ __global__ void clip3_kernel(ClipJobs jobs, int rows, float floor_, int64_t pos,
     for (int i = lane; i < J.dim; i += WARP) v[i] = (s ? v[i] * s[i] : v[i]) * factor;
 }
 
-// rms of two vectors a token (no weights) into the halves of a 2n row: the loop controller's input
-__global__ void rms2_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, int n,
-                            float eps) {
+// rms of two vectors a token (no weights) into the halves of a 2n row: the loop controller's input.  Up to four
+// controllers' (blockIdx.z), each its own a and b; controller j's rows from out + j * rows * 2n.
+struct Rms2Jobs {
+    const float* a[GEMV_JOBS];
+    const float* b[GEMV_JOBS];
+};
+
+__global__ void rms2_kernel(Rms2Jobs jobs, float* __restrict__ out_, int n, float eps) {
     __shared__ float red[2][8];
-    const float* src = blockIdx.y ? b : a;
+    const float* src = blockIdx.y ? pick(jobs.b, blockIdx.z) : pick(jobs.a, blockIdx.z);
+    float* __restrict__ out = out_ + (size_t) blockIdx.z * gridDim.x * 2 * n;
     const float* x = src + (size_t) blockIdx.x * n;
     float ss = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
@@ -1818,8 +1934,16 @@ void ink_clip3(float* x0, int s0, const float* sc0, float lim0, int dim0, int he
 }
 
 void ink_rms2(const float* a, const float* b, float* out, int n, int rows, float eps, void* stream) {
+    ink_rms2_jobs(&a, &b, 1, out, n, rows, eps, stream);
+}
+
+void ink_rms2_jobs(const float* const* a, const float* const* b, int jobs, float* out, int n, int rows, float eps,
+                   void* stream) {
     if (rows <= 0) return;
-    rms2_kernel<<<dim3(rows, 2), 256, 0, cs(stream)>>>(a, b, out, n, eps);
+    if (jobs < 1 || jobs > GEMV_JOBS) throw std::invalid_argument("ink_rms2_jobs: 1 to 4 controllers");
+    Rms2Jobs J{};
+    for (int j = 0; j < jobs; ++j) J.a[j] = a[j], J.b[j] = b[j];
+    rms2_kernel<<<dim3(rows, 2, jobs), 256, 0, cs(stream)>>>(J, out, n, eps);
 }
 
 void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
@@ -2102,26 +2226,63 @@ void ink_hadamard(float* x, int stride, int n, int rows, int block, void* stream
     ck("ink_hadamard");
 }
 
-bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream) {
-    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0) return false;
-    const cudaStream_t st = cs(stream);
-    const auto go = [&](auto rr) {
-        constexpr int R = decltype(rr)::value;
-        if (n_in >= 512) gemv_wide_kernel<R><<<n_out, 256, 0, st>>>(w, x, y, n_in, n_out);
-        else gemv_short_kernel<R><<<grid(n_out, 8), 8 * WARP, 0, st>>>(w, x, y, n_in, n_out);
-    };
+namespace {
+// f(std::integral_constant<int, rows>) for 1 to 8 rows
+template <class F>
+void by_rows(int rows, F&& f) {
     switch (rows) {
-    case 1: go(std::integral_constant<int, 1>{}); break;
-    case 2: go(std::integral_constant<int, 2>{}); break;
-    case 3: go(std::integral_constant<int, 3>{}); break;
-    case 4: go(std::integral_constant<int, 4>{}); break;
-    case 5: go(std::integral_constant<int, 5>{}); break;
-    case 6: go(std::integral_constant<int, 6>{}); break;
-    case 7: go(std::integral_constant<int, 7>{}); break;
-    default: go(std::integral_constant<int, 8>{}); break;
+    case 1: f(std::integral_constant<int, 1>{}); break;
+    case 2: f(std::integral_constant<int, 2>{}); break;
+    case 3: f(std::integral_constant<int, 3>{}); break;
+    case 4: f(std::integral_constant<int, 4>{}); break;
+    case 5: f(std::integral_constant<int, 5>{}); break;
+    case 6: f(std::integral_constant<int, 6>{}); break;
+    case 7: f(std::integral_constant<int, 7>{}); break;
+    default: f(std::integral_constant<int, 8>{}); break;
     }
+}
+}  // namespace
+
+bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream) {
+    return ink_gemv_f32_jobs(&w, &x, &y, 1, n_in, n_out, rows, stream);
+}
+
+bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out,
+                       int rows, void* stream) {
+    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || jobs < 1 || jobs > GEMV_JOBS) return false;
+    GemvJobs J{};
+    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.x[j] = x[j], J.y[j] = y[j];
+    const cudaStream_t st = cs(stream);
+    by_rows(rows, [&](auto rr) {
+        constexpr int R = decltype(rr)::value;
+        if (n_in >= 512) gemv_wide_kernel<R><<<dim3(n_out, jobs), 256, 0, st>>>(J, n_in, n_out);
+        else gemv_short_kernel<R><<<dim3(grid(n_out, 8), jobs), 8 * WARP, 0, st>>>(J, n_in, n_out);
+    });
     ck("ink_gemv_f32");
     return true;
+}
+
+bool ink_gate_gemv(const float* const* w, const float* const* h, const float* const* cur, int cur_stride,
+                   const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
+                   void* stream) {
+    // gemv_short_kernel's shape only: below it, the product is gemv_wide_kernel's and the sums are others
+    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || n_in >= 512 || jobs < 1 || jobs > GEMV_JOBS) return false;
+    GateJobs J{};
+    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.h[j] = h[j], J.cur[j] = cur[j], J.msg[j] = msg[j], J.out[j] = out[j];
+    const cudaStream_t st = cs(stream);
+    by_rows(rows, [&](auto rr) {
+        constexpr int R = decltype(rr)::value;
+        gate_gemv_kernel<R><<<dim3(grid(n, 8), jobs), 8 * WARP, 0, st>>>(J, n_in, n, cur_stride, msg_stride);
+    });
+    ck("ink_gate_gemv");
+    return true;
+}
+
+void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream) {
+    if (rows <= 0) return;
+    if (n % 32 != 0) throw std::invalid_argument("ink_mul_sigmoid_q8: n must be a multiple of 32");
+    mul_sigmoid_q8_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(acc, g, n, g_stride, (Q81*) y_q8_1);
+    ck("ink_mul_sigmoid_q8");
 }
 
 void ink_rows(const float* src, int src_stride, float* dst, int dst_stride, int n, int rows, bool add, void* stream) {
