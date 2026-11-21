@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include <sys/mman.h>
@@ -698,8 +699,24 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                            sized, ks, vs);
             }
         }
+        // INK_KV_SIM=v4|v4r|k4v4r|k4r (a quality experiment, with --no-graphs): the rows a 4-bit cache would give
+        // back, unrotated or rotated as llama.cpp rotates them (V in blocks of 64, K by the head), into the Q8_0 store
+        static const std::string kv_sim = std::getenv("INK_KV_SIM") ? std::getenv("INK_KV_SIM") : "";
+        static float* sim_buf = nullptr;
+        static size_t sim_n = 0;
         for (int side = 0; side < 2 && q8() && !rows; ++side) {
             const float* x = side ? vraw_ : k;
+            if (!kv_sim.empty() && kv_sim.find(side ? "v4" : "k4") != std::string::npos) {
+                const size_t need = (size_t) n * kvw;
+                if (need > sim_n) {
+                    if (sim_buf) cudaFree(sim_buf);
+                    ck(cudaMalloc(&sim_buf, need * sizeof(float)), "INK_KV_SIM");
+                    sim_n = need;
+                }
+                const bool rot = kv_sim.back() == 'r';
+                ink_kv_sim(x, sim_buf, n, kvw, rot ? (side ? 64 : dim_) : 32, rot ? 1 : 0, st_);
+                x = sim_buf;
+            }
             int8_t* codes = side ? B.v_codes : B.k_codes;
             uint16_t* sc = side ? B.v_sc : B.k_sc;
             if (at) {
@@ -838,6 +855,26 @@ void Inkling2::finish_logits(float* logits, int rows) {
 
 // What ggml's MoE graph does for this model: sigmoid gates, the n_used largest of gate + bias, and weights from
 // the bare gates, made to sum to one and scaled.
+// INK_PREDICT_LOG: run il's choice for x from its file layer's router in the mapped file (F32), as route() picks
+int Inkling2::predict_route(int il, const float* x, int* ranked, int n) const {
+    if (il < 0 || il >= (int) blocks_.size()) return 0;
+    const Block& B = blocks_[(size_t) il];
+    const TensorInfo* t = gg_->find(blk(B.file, "ffn_gate_inp.weight"));
+    if (!t || t->type != kTypeF32 || B.probs_b.size() != (size_t) n_expert_) return 0;
+    const float* W = (const float*) home(*t).data(*t);   // n_expert rows of n_embd
+    std::vector<std::pair<float, int>> pick((size_t) n_expert_);
+    for (int e = 0; e < n_expert_; ++e) {
+        const float* row = W + (size_t) e * n_embd_;
+        float s = 0.f;
+        for (int i = 0; i < n_embd_; ++i) s += row[i] * x[i];
+        pick[(size_t) e] = {1.f / (1.f + std::exp(-s)) + B.probs_b[(size_t) e], e};
+    }
+    n = std::min(n, n_expert_);
+    std::partial_sort(pick.begin(), pick.begin() + n, pick.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (int k = 0; k < n; ++k) ranked[k] = pick[(size_t) k].second;
+    return n;
+}
+
 void Inkling2::route(int il, const float* logits, int32_t, int* ids, float* w, float* probs) const {
     const std::vector<float>& bias = blocks_[(size_t) il].probs_b;
     float* pick = probs + n_expert_;

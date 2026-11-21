@@ -4218,6 +4218,47 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
 #endif
         };
 
+        // INK_PREDICT_LOG=1 (a measurement, --window 1): how many of this run's CPU experts the previous run foresaw
+        // with the next router on its own MoE input (top 8/12/16), and how many uncached experts that foresight names
+        {
+            static const bool pred_on = std::getenv("INK_PREDICT_LOG") != nullptr;
+            static int pred_for = -1;
+            static int pred[16];
+            static int pred_n = 0;
+            static double cpu_n = 0, hit[3] = {}, need[3] = {}, runs = 0, calls = 0, self_n = 0, self_hit = 0;
+            if (pred_on && n == 1) {
+                int self[8];   // the check: this run's own router on its input names its CPU experts
+                if (predict_route(il, h_x_ + (size_t) at * e_row, self, 8) == 8)
+                    for (int i = 0; i < n_host; ++i) {
+                        self_n += 1;
+                        for (int k = 0; k < 8; ++k) self_hit += self[k] == host_e[i];
+                    }
+                if (pred_for == il && pred_n == 16) {
+                    const Layer& X = layers_[(size_t) ex(il)];
+                    const int tops[3] = {8, 12, 16};
+                    for (int j = 0; j < 3; ++j) {
+                        for (int k = 0; k < tops[j]; ++k) need[j] += X.slot[(size_t) pred[k]] ? 0 : 1;
+                        for (int i = 0; i < n_host; ++i)
+                            for (int k = 0; k < tops[j]; ++k) hit[j] += pred[k] == host_e[i];
+                    }
+                    cpu_n += n_host;
+                    runs += 1;
+                }
+                pred_for = -1;
+                if (il + 1 < hi_) {
+                    pred_n = predict_route(il + 1, h_x_ + (size_t) at * e_row, pred, 16);
+                    pred_for = il + 1;
+                }
+                if (++calls == 30000) {
+                    std::fprintf(stderr, "INK_PREDICT self-check %.1f%%; %.0f runs, %.2f CPU experts a run; foreseen: top8 %.1f%% "
+                                 "(%.2f to copy a run), top12 %.1f%% (%.2f), top16 %.1f%% (%.2f)\n", 100 * self_hit / std::max(self_n, 1.0),
+                                 runs, cpu_n / runs,
+                                 100 * hit[0] / cpu_n, need[0] / runs, 100 * hit[1] / cpu_n, need[1] / runs,
+                                 100 * hit[2] / cpu_n, need[2] / runs);
+                    calls = 0;
+                }
+            }
+        }
         // The next layer's router wait is what makes h_cpu_ free to write again.
         float* cpu = h_cpu_ + (size_t) at * e_row;
         if (n_host == 0) {

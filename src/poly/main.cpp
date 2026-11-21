@@ -1619,7 +1619,18 @@ int main(int argc, char** argv) {
         else if (a == "--min-p") s.min_p = std::strtof(val(), nullptr);
         else if (a == "--seed") s.seed = std::strtoull(val(), nullptr, 10);
         else if (a == "--tokens" || a == "--eos-ids" || a == "--follow") {
-            if (!parse_ids(val(), a == "--tokens" ? ids : a == "--eos-ids" ? eos : follow)) {
+            std::string v = val();
+            // @FILE: the ids from a file - a long prompt's list passes Linux's 128 KiB limit on one argument
+            if (a == "--tokens" && !v.empty() && v[0] == '@') {
+                std::ifstream f(v.substr(1));
+                if (!f) {
+                    std::fprintf(stderr, "strata-poly: cannot read %s\n", v.c_str() + 1);
+                    return 2;
+                }
+                v.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                while (!v.empty() && (v.back() == '\n' || v.back() == '\r' || v.back() == ' ')) v.pop_back();
+            }
+            if (!parse_ids(v.c_str(), a == "--tokens" ? ids : a == "--eos-ids" ? eos : follow)) {
                 std::fprintf(stderr, "strata-poly: %s takes token ids separated by commas\n", a.c_str());
                 return 2;
             }

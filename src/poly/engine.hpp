@@ -456,6 +456,9 @@ protected:
     /// for, or -1 where it has none (a picture's row, the draft block).  tmp: 2 * n_expert_ floats of scratch.  A
     /// prompt batch's tokens are routed by several threads at once: it changes nothing of the engine's.
     virtual void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const = 0;
+    /// INK_PREDICT_LOG (a measurement): the experts run il would pick for the MoE input x, best first, up to n of
+    /// them, scored from the host's copy of its router; 0 when the architecture cannot.
+    virtual int predict_route(int il, const float* x, int* ranked, int n) const { (void) il, (void) x, (void) ranked, (void) n; return 0; }
     /// A prompt batch's routing on the card: n tokens' experts and weights from their scores in rl_, n_used_ a token
     /// into ids and w (on the card), what route() gives them up to the last bits of a weight.  False: the host routes.
     virtual bool route_card(int il, int n, int32_t* ids, float* w) {

@@ -127,6 +127,8 @@ void store_int8_at(const float* x, int8_t* code, uint16_t* delta, int n_kv, int 
 /// Stores the tokens' rows as ggml Q8_0 (one fp16 scale a 32-value block of int8 codes) from row `pos`.
 /// codes: n int8 a row; scales: n/32 fp16 a row.  n must be a multiple of 32 (QK8_0).
 void store_q8(const float* x, int8_t* codes, uint16_t* scales, int n, int64_t pos, int rows, void* stream);
+/// INK_KV_SIM: rows of a cache as a rotated (block > 32: Walsh-Hadamard in blocks of `block`) Q4_0 cache gives them back.
+void ink_kv_sim(const float* x, float* y, int rows, int kvw, int block, int rot, void* stream);
 /// The same from the row the card holds at `at` when the launch runs; with `ring`, a row is its number % ring.
 void store_q8_at(const float* x, int8_t* codes, uint16_t* scales, int n, const long long* at, int rows, int ring,
                  void* stream);

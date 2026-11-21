@@ -8,6 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -598,6 +602,11 @@ attend_kernel(const float* __restrict__ q, int q_stride, const uint16_t* __restr
 // G query heads; the block joins its warps and leaves the split's partial sums as attend_kernel does.
 constexpr int DEC_WARPS = 4;
 constexpr int DEC_SPLIT = 128;
+// decode_long_kernel's blocks in all, a SM (INK_ATT_BLOCKS changes it): enough for the card to hide the reads' latency
+const int kDecLongBlocksPerSm = [] {
+    const char* e = std::getenv("INK_ATT_BLOCKS");
+    return e && std::atoi(e) > 0 ? std::atoi(e) : 8;
+}();
 
 // Groups of 8 lanes a position: a lane 16 values of the head, so a score is 3 shuffles, not 5 a head.  The
 // bias of each of the block's positions (minus the sink) is worked out once into shared memory first.
@@ -705,6 +714,222 @@ decode_kernel(const float* __restrict__ q, int q_stride, const void* __restrict_
             pp[ATT_DIM + 1] = sum;
         }
     }
+}
+
+// A cache row's 16 values, as read (prefetched a position ahead in decode_long_kernel), then as floats
+template <bool Q8>
+struct Raw16 {
+    uint4 a, b;
+    float d;
+};
+template <bool Q8>
+__device__ __forceinline__ void fetch16(const void* cache, const uint16_t* sc, size_t at, Raw16<Q8>& r) {
+    if (Q8) {
+        r.a = *(const uint4*) ((const int8_t*) cache + at);
+        r.d = __half2float(*(const __half*) (sc + at / 32));
+    } else {
+        const uint4* p = (const uint4*) ((const uint16_t*) cache + at);
+        r.a = p[0];
+        r.b = p[1];
+    }
+}
+template <bool Q8>
+__device__ __forceinline__ void unpack16(const Raw16<Q8>& r, float* f) {
+    if (Q8) {
+        const int8_t* b = (const int8_t*) &r.a;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) f[j] = (float) b[j] * r.d;
+    } else {
+        const __half2* h0 = (const __half2*) &r.a;
+        const __half2* h1 = (const __half2*) &r.b;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 a = __half22float2(h0[j]), c = __half22float2(h1[j]);
+            f[2 * j] = a.x;
+            f[2 * j + 1] = a.y;
+            f[8 + 2 * j] = c.x;
+            f[8 + 2 * j + 1] = c.y;
+        }
+    }
+}
+
+// decode_kernel for a long span (a full-attention layer deep into a conversation): a block takes split_len
+// positions, not DEC_SPLIT, so the card holds a few blocks a SM for the whole span instead of one per 128 positions
+// (at 100K positions those spent more on their setup, their joining and combine_kernel's partial sums than on reading
+// the cache).  A position's keys and values are read together, and the next ones a group takes are fetched while it
+// scores these.  The bias is worked out only for the positions within `extent` of the token (at most DEC_NEAR);
+// the others have none - as in decode_kernel, where it is 0 for them - and only the sink is taken off.
+constexpr int DEC_NEAR = 1024;
+template <int G, bool Q8>
+__global__ void __launch_bounds__(DEC_WARPS * WARP)
+decode_long_kernel(const float* __restrict__ q, int q_stride, const void* __restrict__ kcache,
+                   const void* __restrict__ vcache, const uint16_t* __restrict__ ksc, const uint16_t* __restrict__ vsc,
+                   const float* __restrict__ rel, int rel_stride, const float* __restrict__ table, int n_rel,
+                   int extent, const float* __restrict__ sink, float* __restrict__ part, int heads, int kv_heads,
+                   float scale, int64_t pos, int rows, int window, int ring, const long long* at, int split_len) {
+    constexpr int GROUPS = DEC_WARPS * 4;
+    // the bias of the near positions while the block reads; afterwards the groups' sums (the bias is spent by then)
+    __shared__ union {
+        float bias[G][DEC_NEAR];
+        float gacc[GROUPS][G][ATT_DIM];
+    } sm;
+    __shared__ float gm[GROUPS][G], gl[GROUPS][G];
+    const int kvh = blockIdx.x, t = blockIdx.y, split = blockIdx.z;
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP, grp = warp * 4 + lane / 8, sub = lane % 8;
+    const int64_t p = (at ? (int64_t) at[0] : pos) + t;
+    const int64_t lo = window > 0 ? max((int64_t) 0, p - window + 1) : 0;
+    const int64_t s0 = lo + (int64_t) split * split_len, s1 = min(p + 1, s0 + split_len);
+    const int64_t near0 = max(s0, p - extent + 1);   // the first position with a bias term
+    const int n_near = (int) max((int64_t) 0, s1 - near0);
+    const size_t kv_row = (size_t) kv_heads * ATT_DIM;
+    for (int i = threadIdx.x; i < G * n_near; i += blockDim.x) {
+        const int g = i / n_near, k = i % n_near, h = kvh * G + g;
+        const int64_t dist = p - (near0 + k);
+        const float* tb = table + (size_t) dist * n_rel;
+        const float* rv = rel + (size_t) t * rel_stride + (size_t) h * n_rel;
+        float b = 0.f;
+        for (int r = 0; r < n_rel; ++r) b += rv[r] * tb[r];
+        sm.bias[g][k] = b;
+    }
+    float qv[G][16], acc[G][16], m[G], l[G], sk[G];
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const float* qh = q + (size_t) t * q_stride + (size_t) (kvh * G + g) * ATT_DIM + sub * 16;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            qv[g][j] = qh[j] * scale;
+            acc[g][j] = 0.f;
+        }
+        m[g] = -INFINITY;
+        l[g] = 0.f;
+        sk[g] = sink[(size_t) t * heads + kvh * G + g];
+    }
+    __syncthreads();
+    const int n_keys = (int) max((int64_t) 0, s1 - s0);
+    const auto row_of = [&](int k) {
+        const int64_t kp = s0 + k;
+        return (size_t) (ring > 0 ? kp % ring : kp) * kv_row + (size_t) kvh * ATT_DIM + sub * 16;
+    };
+    Raw16<Q8> kr, vr, kn, vn;
+    int base = warp * 4;
+    if (base < n_keys) {
+        const int k = base + lane / 8;
+        const size_t row = row_of(k < n_keys ? k : 0);
+        fetch16<Q8>(kcache, ksc, row, kr);
+        fetch16<Q8>(vcache, vsc, row, vr);
+    }
+    // the warp goes round together (its shuffles take every lane); a group past the split's end weighs nothing
+    for (; base < n_keys; base += GROUPS) {
+        const int k = base + lane / 8;
+        const bool live = k < n_keys;
+        if (base + GROUPS < n_keys) {   // the group's next position, read while this one is scored
+            const int kk = k + GROUPS;
+            const size_t row = row_of(kk < n_keys ? kk : 0);
+            fetch16<Q8>(kcache, ksc, row, kn);
+            fetch16<Q8>(vcache, vsc, row, vn);
+        }
+        float kf[16];
+        unpack16<Q8>(kr, kf);
+        const int64_t kp = s0 + (live ? k : 0);
+        const int ni = (int) (kp - near0);
+        float sc[G];
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float d = 0.f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) d += qv[g][j] * kf[j];
+            d += __shfl_xor_sync(0xffffffffu, d, 1);
+            d += __shfl_xor_sync(0xffffffffu, d, 2);
+            d += __shfl_xor_sync(0xffffffffu, d, 4);
+            const float b = kp >= near0 ? sm.bias[g][ni] : 0.f;
+            sc[g] = live ? d + (b - sk[g]) : -INFINITY;
+        }
+        float vf[16];
+        unpack16<Q8>(vr, vf);
+#pragma unroll
+        for (int g = 0; g < G; ++g) {
+            if (!live) continue;
+            const float mn = fmaxf(m[g], sc[g]);
+            const float c = __expf(m[g] - mn), e = __expf(sc[g] - mn);
+            l[g] = l[g] * c + e;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) acc[g][j] = acc[g][j] * c + e * vf[j];
+            m[g] = mn;
+        }
+        kr = kn;
+        vr = vn;
+    }
+    __syncthreads();   // the bias is read no more: its room takes the groups' sums
+#pragma unroll
+    for (int g = 0; g < G; ++g) {
+        if (sub == 0) {
+            gm[grp][g] = m[g];
+            gl[grp][g] = l[g];
+        }
+#pragma unroll
+        for (int j = 0; j < 16; ++j) sm.gacc[grp][g][sub * 16 + j] = acc[g][j];
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < G * ATT_DIM; i += blockDim.x) {
+        const int g = i / ATT_DIM, d = i % ATT_DIM;
+        float mx = -INFINITY;
+        for (int w = 0; w < GROUPS; ++w) mx = fmaxf(mx, gm[w][g]);
+        float v = 0.f, sum = 0.f;
+        if (mx != -INFINITY)
+            for (int w = 0; w < GROUPS; ++w) {
+                if (gm[w][g] == -INFINITY) continue;
+                const float c = __expf(gm[w][g] - mx);
+                v += c * sm.gacc[w][g][d];
+                sum += c * gl[w][g];
+            }
+        float* pp = part + (((size_t) split * rows + t) * heads + kvh * G + g) * ATT_PART;
+        pp[d] = v;
+        if (d == 0) {
+            pp[ATT_DIM] = mx;
+            pp[ATT_DIM + 1] = sum;
+        }
+    }
+}
+
+// INK_KV_SIM (a quality experiment): a cache row as a 4-bit cache would give it back - rotated in blocks of B
+// values by the orthonormal Walsh-Hadamard matrix (llama.cpp's KV rotation: 64 for V, the head for K), rounded to
+// ggml's Q4_0 (32 a block, scale max/-8 kept as a half), rotated back - written to y for the Q8_0 store to take.
+template <int B>
+__global__ void kv_sim_kernel(const float* __restrict__ x, float* __restrict__ y, int kvw, int rot) {
+    __shared__ float s[B];
+    __shared__ float d32[B / 32];
+    const int r = blockIdx.x, c0 = blockIdx.y * B, i = threadIdx.x;
+    s[i] = x[(size_t) r * kvw + c0 + i];
+    const auto fwht = [&] {
+        for (int h = 1; h < B; h <<= 1) {
+            __syncthreads();
+            const float a = s[i], b = s[i ^ h];
+            __syncthreads();
+            s[i] = (i & h) ? b - a : a + b;
+        }
+        __syncthreads();
+        s[i] *= rsqrtf((float) B);
+        __syncthreads();
+    };
+    __syncthreads();
+    if (rot) fwht();
+    if (i % 32 == 0) {
+        float amax = 0.f, mx = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            const float v = s[i + j];
+            if (fabsf(v) > amax) amax = fabsf(v), mx = v;
+        }
+        d32[i / 32] = mx / -8.f;
+    }
+    __syncthreads();
+    const float d = d32[i / 32], id = d != 0.f ? 1.f / d : 0.f;
+    const int q = min(15, (int) (s[i] * id + 8.5f));
+    const float v = (float) (q - 8) * __half2float(__float2half_rn(d));
+    __syncthreads();
+    s[i] = v;
+    __syncthreads();
+    if (rot) fwht();
+    y[(size_t) r * kvw + c0 + i] = s[i];
 }
 
 // ---- a prompt batch's attention on the tensor cores (mma.sync m16n8k16, fp16 in, fp32 sums): a block 32 tokens
@@ -1136,10 +1361,40 @@ void ink_attend(const float* q, int q_stride, const void* kcache, const void* vc
     const int split_len = (int) (grid(grid(span, splits), ATT_KEYS) * ATT_KEYS);   // whole tiles, every position
     const cudaStream_t st = cs(stream);
     if (rows <= ATT_FEW) {   // a block a token and split of positions, a warp a position
-        const int dsplits = std::max(1, grid(span, DEC_SPLIT));
+        int dsplits = std::max(1, grid(span, DEC_SPLIT));
+        // A long span (INK_ATT_LONG=0: never): a few blocks a SM in all, each over many positions (decode_long_kernel)
+        static const int sms = [] {
+            int dev = 0, n = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev);
+            return std::max(n, 1);
+        }();
+        static const bool long_ok = [] {
+            const char* e = std::getenv("INK_ATT_LONG");
+            return !(e && std::atoi(e) == 0);
+        }();
+        const int most = std::max(1, kDecLongBlocksPerSm * sms / (kv_heads * rows));
+        const bool longer = long_ok && extent <= DEC_NEAR && dsplits > most;
+        int split_len = DEC_SPLIT;
+        if (longer) {
+            dsplits = most;
+            split_len = (int) (grid(grid(span, dsplits), 16) * 16);
+            dsplits = std::max(1, grid(span, split_len));
+        }
         const dim3 gd(kv_heads, rows, dsplits);
         const auto dec = [&](auto gq) {
             constexpr int G = decltype(gq)::value;
+            if (longer) {
+                if (q8)
+                    decode_long_kernel<G, true><<<gd, DEC_WARPS * WARP, 0, st>>>(q, q_stride, kcache, vcache, kscales,
+                        vscales, rel, rel_stride, table, n_rel, extent, sink, part, heads, kv_heads, scale, pos, rows,
+                        window, ring, at, split_len);
+                else
+                    decode_long_kernel<G, false><<<gd, DEC_WARPS * WARP, 0, st>>>(q, q_stride, kcache, vcache, nullptr,
+                        nullptr, rel, rel_stride, table, n_rel, extent, sink, part, heads, kv_heads, scale, pos, rows,
+                        window, ring, at, split_len);
+                return;
+            }
             if (q8)
                 decode_kernel<G, true><<<gd, DEC_WARPS * WARP, 0, st>>>(q, q_stride, kcache, vcache, kscales, vscales,
                     rel, rel_stride, table, n_rel, extent, sink, part, heads, kv_heads, scale, pos, rows, window, ring, at);
@@ -1157,6 +1412,52 @@ void ink_attend(const float* q, int q_stride, const void* kcache, const void* vc
         ck("ink_attend decode");
         combine_kernel<<<dim3(heads, rows), ATT_DIM, 0, st>>>(part, out, heads, rows, dsplits);
         ck("ink_attend combine");
+        // INK_ATT_CHECK=1 (with --no-graphs): the long kernel's output against decode_kernel's, on the same inputs
+        static const bool check = std::getenv("INK_ATT_CHECK") != nullptr;
+        if (check && longer) {
+            static float *cpart = nullptr, *cout = nullptr;
+            static size_t cpart_n = 0;
+            static int checked = 0;
+            const int osplits = std::max(1, grid(span, DEC_SPLIT));
+            const size_t need = (size_t) osplits * rows * heads * ATT_PART;
+            if (need > cpart_n) {
+                if (cpart) cudaFree(cpart);
+                cudaMalloc(&cpart, need * sizeof(float));
+                cpart_n = need;
+            }
+            if (!cout) cudaMalloc(&cout, (size_t) ATT_FEW * 64 * ATT_DIM * sizeof(float));
+            const dim3 go(kv_heads, rows, osplits);
+            const auto old_dec = [&](auto gq) {
+                constexpr int G = decltype(gq)::value;
+                if (q8)
+                    decode_kernel<G, true><<<go, DEC_WARPS * WARP, 0, st>>>(q, q_stride, kcache, vcache, kscales, vscales,
+                        rel, rel_stride, table, n_rel, extent, sink, cpart, heads, kv_heads, scale, pos, rows, window, ring, at);
+                else
+                    decode_kernel<G, false><<<go, DEC_WARPS * WARP, 0, st>>>(q, q_stride, kcache, vcache, nullptr, nullptr,
+                        rel, rel_stride, table, n_rel, extent, sink, cpart, heads, kv_heads, scale, pos, rows, window, ring, at);
+            };
+            if (g == 1) old_dec(std::integral_constant<int, 1>{});
+            else if (g == 2) old_dec(std::integral_constant<int, 2>{});
+            else if (g == 3) old_dec(std::integral_constant<int, 3>{});
+            else old_dec(std::integral_constant<int, 4>{});
+            combine_kernel<<<dim3(heads, rows), ATT_DIM, 0, st>>>(cpart, cout, heads, rows, osplits);
+            const size_t n = (size_t) heads * rows * ATT_DIM;
+            std::vector<float> a(n), b(n);
+            cudaMemcpyAsync(a.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(b.data(), cout, n * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaStreamSynchronize(st);
+            double d2 = 0, r2 = 0, mx = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const double d = (double) a[i] - b[i];
+                d2 += d * d;
+                r2 += (double) b[i] * b[i];
+                mx = std::max(mx, std::fabs(d));
+            }
+            if (checked++ % 50 == 0 || std::sqrt(d2 / std::max(r2, 1e-30)) > 1e-4)
+                std::fprintf(stderr, "INK_ATT_CHECK pos %lld span %lld: long %d splits of %d vs %d of %d: rel err %.3g, max %.3g\n",
+                             (long long) pos, (long long) span, dsplits, split_len, osplits, DEC_SPLIT,
+                             std::sqrt(d2 / std::max(r2, 1e-30)), mx);
+        }
         return;
     }
     if (!at) {   // a prompt batch on the tensor cores
@@ -1256,6 +1557,17 @@ void ink_rescore_q8(const void* w, const float* h, int n_embd, const int* ids, c
 void ink_fill_tail(float* x, int from, int n, int rows, void* stream) {
     if (rows <= 0 || from >= n) return;
     fill_tail_kernel<<<dim3(grid(n - from, 256), rows), 256, 0, cs(stream)>>>(x, from, n);
+}
+
+void ink_kv_sim(const float* x, float* y, int rows, int kvw, int block, int rot, void* stream) {
+    if (rows <= 0) return;
+    if (kvw % block != 0) throw std::invalid_argument("ink_kv_sim: the row is not whole blocks");
+    const dim3 g(rows, kvw / block);
+    if (block == 32) kv_sim_kernel<32><<<g, 32, 0, cs(stream)>>>(x, y, kvw, rot);
+    else if (block == 64) kv_sim_kernel<64><<<g, 64, 0, cs(stream)>>>(x, y, kvw, rot);
+    else if (block == 128) kv_sim_kernel<128><<<g, 128, 0, cs(stream)>>>(x, y, kvw, rot);
+    else throw std::invalid_argument("ink_kv_sim: blocks of 32, 64 or 128");
+    ck("ink_kv_sim");
 }
 
 }  // namespace strata::poly

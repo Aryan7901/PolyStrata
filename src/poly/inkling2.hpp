@@ -49,6 +49,7 @@ protected:
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
+    int predict_route(int il, const float* x, int* ranked, int n) const override;
     bool route_card(int il, int n, int32_t* ids, float* w) override;
     void moe_shared(const Layer& L, int il, int n) override;
     void router_scores(const Layer& L, int n) override;
