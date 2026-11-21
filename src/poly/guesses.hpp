@@ -19,6 +19,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace strata::poly {
 
@@ -40,6 +41,11 @@ struct Gate {
 
     bool ask() {
         ++rounds;
+        // Asking every round measured faster with the fast attention kernel (INK_ATT_DSPARK): +3.1% at 100K, +1.5-1.8%
+        // at 6K, -1.2% on a lookup-heavy rewrite, flat on an agentic transcript (400 tokens, same text, 2 runs each).
+        // The adaptive gate below under-asks at long context.  STRATA_DRAFT_GATE=1 restores it.
+        static const bool adaptive = [] { const char* v = std::getenv("STRATA_DRAFT_GATE"); return v && std::atoi(v) == 1; }();
+        if (!adaptive) return true;
         if (seen[1] < 16) return true;
         if (seen[0] < 4) return false;
         const double with = tokens[1] * ms[0], without = tokens[0] * ms[1];   // the two rates, over one divisor
