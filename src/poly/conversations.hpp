@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <new>
@@ -60,6 +61,20 @@ public:
             if (r > at || (r == at && i == cur_)) best = i, at = r, same = c;
         }
         ++clock_;
+        if (std::getenv("STRATA_RESUME_DEBUG")) {   // where a prompt leaves the current conversation, and why
+            const auto& s = slots_[cur_].seq;
+            const int64_t c = common(s, ids);
+            if (c < (int64_t) s.size() && c < n) {
+                std::fprintf(stderr, "strata-poly: resume: prompt %lld leaves the conversation (%lld tokens) at %lld; at:",
+                             (long long) n, (long long) s.size(), (long long) c);
+                for (int64_t k = std::max<int64_t>(0, c - 4); k < std::min<int64_t>(c + 8, (int64_t) s.size()); ++k)
+                    std::fprintf(stderr, " %d", s[(size_t) k]);
+                std::fprintf(stderr, " | prompt:");
+                for (int64_t k = std::max<int64_t>(0, c - 4); k < std::min<int64_t>(c + 8, n); ++k)
+                    std::fprintf(stderr, " %d", ids[(size_t) k]);
+                std::fprintf(stderr, " | resumes at %lld\n", (long long) at);
+            }
+        }
         // The pinned conversation (pin()) gets the prompt further than any kept one: the engine takes a copy of it.
         if (const int64_t far = marked(pinned_, common(pinned_.seq, ids), n); far > at) return from_pinned(far);
         if (at == 0) {

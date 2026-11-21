@@ -16,6 +16,7 @@ emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
 from __future__ import annotations
 
 import bisect
+import collections
 import json
 import pathlib
 import sys
@@ -551,6 +552,9 @@ class PromptEncoder:
         self.entries: list[tuple[str, tuple, list[int], list[int], list[int]]] = []
         self.lock = threading.Lock()
         self.last_reused = 0                            # characters taken from an earlier prompt (for tests)
+        # The model's own ids for stretches of its replies that encode() splits differently (remember()), by text
+        self.generated: "collections.OrderedDict[str, list[int]]" = collections.OrderedDict()
+        self.generated_max = 2048
 
     def encode(self, text: str, plain=(), store: bool = True) -> list[int]:
         plain = tuple(sorted(plain))
@@ -575,6 +579,8 @@ class PromptEncoder:
             ends = src[3][:cut_k + 1] + [c + m[0] for m in marks]
             counts = src[4][:cut_k + 1] + [n + m[1] for m in marks]
             self.last_reused = c
+        if self.generated:
+            ids, counts = self._own(text, ids, ends, counts, cut_k if src is not None else -1)
         if not store:
             return ids
         # every rendered prompt starts with the template's header, so sharing a special boundary does not make two
@@ -583,6 +589,67 @@ class PromptEncoder:
         with self.lock:
             self.entries = [(text, plain, ids, ends, counts)] + [e for e in self.entries if e is not old][:self.keep - 1]
         return list(ids)
+
+    def remember(self, ids: list[int]) -> int:
+        """A reply the model wrote, as its ids.  The next prompt carries that reply as text, and encoding the text
+        again need not give the model's ids: the model may write a piece in a split the tokenizer never makes
+        (" ---" + "--" where encode() gives " ----" + "-").  The engine holds the model's ids, so such a prompt
+        leaves the engine's conversation inside the reply and is read again from its last checkpoint, often the
+        whole reply or more.  Each stretch between two special tokens that encode() would split otherwise is kept
+        here by its text; a later prompt with the same stretch between special tokens takes the model's ids for it
+        (_own()).  The text is the same either way.  Returns the stretches kept."""
+        specials = set(self.tok.special_tokens.values())
+        stretches, cur = [], []
+        for t in ids:
+            if t in specials:
+                if cur:
+                    stretches.append(cur)
+                cur = []
+            else:
+                cur.append(t)
+        if cur:
+            stretches.append(cur)
+        kept = 0
+        for s in stretches:
+            if len(s) < 2:
+                continue
+            try:
+                text = b"".join(self.tok.token_bytes(i) for i in s).decode("utf-8")
+            except (UnicodeDecodeError, IndexError, KeyError):
+                continue                                # cut inside a character: no stretch of text matches it
+            if self.tok.encode(text) == s:
+                continue
+            with self.lock:
+                self.generated[text] = list(s)
+                self.generated.move_to_end(text)
+                while len(self.generated) > self.generated_max:
+                    self.generated.popitem(last=False)
+            kept += 1
+        return kept
+
+    def _own(self, text, ids, ends, counts, first):
+        """ids with the stretches after mark `first` (-1: all) that remember() knows taken as the model wrote them,
+        and the marks' id counts to match.  A stretch runs from the end of one special-token match to the start of
+        the next (or the text's end); a special-token match is one id."""
+        gen = self.generated
+        out = list(ids[:counts[first]]) if first >= 0 else []
+        new_counts = list(counts[:first + 1]) if first >= 0 else []
+        a = ends[first] if first >= 0 else 0
+        ia = counts[first] if first >= 0 else 0
+        n = len(ends)
+        for j in range(first + 1, n + 1):
+            if j < n:
+                sid = ids[counts[j] - 1]
+                b, ib = ends[j] - len(self.tok.token_bytes(sid).decode("utf-8")), counts[j] - 1
+            else:
+                b, ib = len(text), len(ids)
+            mine = gen.get(text[a:b]) if b > a else None
+            out.extend(mine if mine is not None else ids[ia:ib])
+            if j < n:
+                out.append(sid)
+                new_counts.append(len(out))
+                a, ia = ends[j], counts[j]
+        return out, new_counts
 
     def forget(self, ids: list[int]) -> None:
         """The prompt with these ids was refused: it is not kept."""

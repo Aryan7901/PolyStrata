@@ -5369,6 +5369,12 @@ class Service:
                                       "strata-<model>.json for every request) leaves room to answer", flush=True)
                             if os.environ.get("STRATA_DEBUG") and raw_ids:
                                 print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                            # the reply's own ids, for the next prompt that carries it (PromptEncoder.remember)
+                            if self.prompts is not None and raw_ids and hasattr(self.prompts, "remember"):
+                                try:
+                                    self.prompts.remember(raw_ids)
+                                except Exception as e:          # a cache, never a reason to fail a request
+                                    print(f"[strata] the reply's ids were not kept: {e}", flush=True)
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
