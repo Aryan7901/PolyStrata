@@ -1,6 +1,7 @@
 // src/poly/norm_q8_test.cu - kernels::native_add_rms_norm_q8_1() against the launches it stands for: axpy(),
-// rms_norm() and native_quantize_q8_1(), with and without the sum.  The residual, the normed rows and the Q8_1
-// blocks must be the same bytes.
+// rms_norm() and native_quantize_q8_1(), with and without the sum; and native_rms_norm_q8_1_planes() against a
+// rms_norm() and native_quantize_q8_1() a plane.  The residual, the normed rows and the Q8_1 blocks must be the same
+// bytes.
 //
 // usage: poly_norm_q8_test   (exit 0: every byte the same)
 #include "strata/kernels/native_mmvq.hpp"
@@ -59,6 +60,40 @@ int check(int n, int rows, bool with_add, float spread, std::mt19937& rng) {
     return ok ? 0 : 1;
 }
 
+// planes groups of rows, each from its own input (two of them may be one) with its own weights
+int check_planes(int n, int rows, int planes, bool shared_input, std::mt19937& rng) {
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> x((size_t) 3 * n * rows), w((size_t) 3 * n);
+    for (float& v : x) v = nd(rng);
+    for (float& v : w) v = 1.f + 0.1f * nd(rng);
+    const size_t plane = (size_t) n * rows, qp = kernels::native_q8_1_bytes(n) * rows;
+    float *dx = upload(x), *dw = upload(w), *y1 = nullptr, *y2 = nullptr;
+    void *q1 = nullptr, *q2 = nullptr;
+    cudaMalloc(&y1, 3 * plane * sizeof(float)), cudaMalloc(&y2, 3 * plane * sizeof(float));
+    cudaMalloc(&q1, 3 * qp), cudaMalloc(&q2, 3 * qp);
+    cudaStream_t s;
+    cudaStreamCreate(&s);
+    const float eps = 1e-6f;
+    const float* xs[3];
+    const float* ws[3];
+    for (int g = 0; g < planes; ++g) {
+        xs[g] = dx + (shared_input ? 0 : g) * plane;
+        ws[g] = dw + (size_t) g * n;
+        poly::rms_norm(xs[g], ws[g], y1 + g * plane, n, rows, eps, s);
+        kernels::native_quantize_q8_1(y1 + g * plane, (char*) q1 + g * qp, n * rows, 1, s);
+    }
+    kernels::native_rms_norm_q8_1_planes(xs, ws, planes, y2, q2, n, rows, eps, poly::sum_threads(n), s);
+    cudaStreamSynchronize(s);
+    const size_t fb = planes * plane * sizeof(float);
+    const bool same_y = bytes(y1, fb) == bytes(y2, fb), same_q = bytes(q1, planes * qp) == bytes(q2, planes * qp);
+    cudaFree(dx), cudaFree(dw), cudaFree(y1), cudaFree(y2), cudaFree(q1), cudaFree(q2);
+    cudaStreamDestroy(s);
+    const bool ok = same_y && same_q;
+    std::printf("%s n %5d rows %4d planes %d%s: normed %s, q8_1 %s\n", ok ? "ok  " : "FAIL", n, rows, planes,
+                shared_input ? " (one input)" : "", same_y ? "same" : "DIFF", same_q ? "same" : "DIFF");
+    return ok ? 0 : 1;
+}
+
 }  // namespace
 
 int main() {
@@ -69,6 +104,10 @@ int main() {
             for (bool add : {false, true}) bad += check(n, rows, add, 1.f, rng);
     bad += check(2048, 1024, true, 1.f, rng);   // a prompt batch
     bad += check(2048, 8, true, 300.f, rng);    // large activations
+    for (int n : {2304, 4096})
+        for (int rows : {1, 2, 7})
+            for (int planes : {1, 3}) bad += check_planes(n, rows, planes, false, rng);
+    bad += check_planes(2304, 1, 3, true, rng);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess) {
         std::printf("CUDA: %s\n", cudaGetErrorString(e));
         return 1;

@@ -548,6 +548,8 @@ void Inkling2::assign_scratch() {
         const char* hc = std::getenv("INK_HEAD_CHECK");
         if (hc && std::atoi(hc) == 1) head_exact_ = (float*) dmalloc(r * (size_t) n_vocab_ * sizeof(float), "head check");
     }
+    // the attention's three inputs in Q8_1, for a call of fewer than kStageRows tokens (layer_head)
+    xq3_ = fbuf(3 * (size_t) std::min(rows_, kStageRows - 1) * kernels::native_q8_1_bytes(n_embd_) / sizeof(float));
     if (!row_off_) row_off_ = (long long*) dmalloc(8 * sizeof(long long), "the step's state offsets");
 }
 
@@ -619,16 +621,21 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     float* xq = xin_;
     float* xk = xin_ + plane;
     float* xv = xin_ + 2 * plane;
-    if (B.swa && !msgs) {
-        rms_norm(in[0], fp(L.attn_norm), xq, n_embd_, n, rms_eps_, st_);
-        xk = xv = xq;
-    } else if (B.swa) {
-        for (int j = 0; j < 3; ++j) rms_norm(in[j], fp(L.attn_norm), xin_ + (size_t) j * plane, n_embd_, n, rms_eps_, st_);
+    // the inputs' norms (a window run's one input, or q, k and v) in one launch, which for a few tokens also
+    // quantizes them for the products: the bytes lin() would make of them
+    const bool one = B.swa && !msgs;
+    const int planes = one ? 1 : 3;
+    const float* nw[3];
+    for (int j = 0; j < 3; ++j) nw[j] = fp(B.swa ? L.attn_norm : j == 0 ? B.q_norm : j == 1 ? B.k_norm : B.v_norm);
+    const void* xq8[3] = {nullptr, nullptr, nullptr};
+    if (n < kStageRows) {
+        kernels::native_rms_norm_q8_1_planes(in, nw, planes, xin_, xq3_, n_embd_, n, rms_eps_, sum_threads(n_embd_), st_);
+        const size_t qp = (size_t) n * kernels::native_q8_1_bytes(n_embd_);
+        for (int j = 0; j < 3; ++j) xq8[j] = (const uint8_t*) xq3_ + (size_t) (one ? 0 : j) * qp;
     } else {
-        rms_norm(in[0], fp(B.q_norm), xq, n_embd_, n, rms_eps_, st_);
-        rms_norm(in[1], fp(B.k_norm), xk, n_embd_, n, rms_eps_, st_);
-        rms_norm(in[2], fp(B.v_norm), xv, n_embd_, n, rms_eps_, st_);
+        for (int j = 0; j < planes; ++j) rms_norm(in[j], nw[j], xin_ + (size_t) j * plane, n_embd_, n, rms_eps_, st_);
     }
+    if (one) xk = xv = xq;
     dbg("attn_in", il, xq, n_embd_);
 
     // self-attention
@@ -643,14 +650,14 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         float* gate = q_ + hq;
         float* rel = q_ + 2 * hq;
         if (all) {
-            lin(B.wall, xq, q_, n);
+            lin(B.wall, xq, q_, n, xq8[0]);
         } else if (B.wqgr.n_out > 0) {
-            lin(B.wqgr, xq, q_, n);
+            lin(B.wqgr, xq, q_, n, xq8[0]);
         } else {
             const Dev* part[3] = {&B.wq, &B.wgate, &B.wrel};
             const int at_col[3] = {0, hq, 2 * hq};
             for (int j = 0; j < 3; ++j) {   // att_ is free until the attention writes it
-                lin(*part[j], xq, att_, n);
+                lin(*part[j], xq, att_, n, xq8[0]);
                 ink_rows(att_, part[j]->n_out, q_ + at_col[j], qgr, part[j]->n_out, n, false, st_);
             }
         }
@@ -658,7 +665,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         const float* kin = all ? q_ + (2 * hq + n_head_ * n_rel_) : kraw_;
         const float* vin = all ? kin + kvw : vraw_;
         const int kv_stride = all ? qgr : kvw;
-        if (!all) lin(B.wk, xk, kraw_, n);
+        if (!all) lin(B.wk, xk, kraw_, n, xq8[1]);
         if (!B.swa) lin(B.kconv_proj, xk, dyn_, n);
         const bool rows = rows_of_ != nullptr;   // step(): each row a sequence of its own, with its own state
         if (rows) ink_conv_rows(kin, kv_stride, B.state, row_off_, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw,
@@ -666,7 +673,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         else ink_conv(kin, B.state, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw, taps_, n,
                  B.swa ? conv_s : conv_d, st_, snap_bits_ ? snap_at_ + (B.state - state_) : nullptr, rec_n_, snap_bits_,
                  kv_stride);
-        if (!all) lin(B.wv, xv, vraw_, n);
+        if (!all) lin(B.wv, xv, vraw_, n, xq8[2]);
         if (!B.swa) lin(B.vconv_proj, xv, dyn_, n);
         if (rows) ink_conv_rows(vin, kv_stride, B.state + keep * kvw, row_off_, fp(B.v_conv), B.swa ? nullptr : dyn_,
                                 n_kv_, v_, kvw, taps_, n, B.swa ? conv_s : conv_d, st_);
@@ -800,8 +807,8 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // the experts' input
     ink_mix(r_, rs, B.ffn_mix, fp(B.ffn_query), 1, mix_, plane, n_embd_, n, st_);
     if (msgs) control(B, 3, mix_, msg_ + plane, n);
-    rms_norm(mix_, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
-    kernels::native_quantize_q8_1(xn_, xq_, n * n_embd_, 1, st_);
+    kernels::native_add_rms_norm_q8_1(mix_, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                      sum_threads(n_embd_), st_);
     dbg("ffn_in", il, xn_, n_embd_);
     Layer& X = layers_[(size_t) ex(il)];   // the experts' layer: this one, or the loop's first run of it
     if (!batched(X, n)) moe_router(X, n);

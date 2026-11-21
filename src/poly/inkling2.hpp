@@ -164,6 +164,7 @@ private:
           *ctl_g_ = nullptr, *ctl_f_ = nullptr, *xin_ = nullptr, *q_ = nullptr, *gate_ = nullptr, *rel_ = nullptr,
           *sink_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *vraw_ = nullptr, *v_ = nullptr, *dyn_ = nullptr,
           *att_ = nullptr, *part_ = nullptr, *tmp_ = nullptr;
+    float* xq3_ = nullptr;           ///< the attention's inputs in Q8_1 (layer_head)
     long long* row_off_ = nullptr;   ///< step(): each row's sequence's state, in floats from the bound one's
 };
 

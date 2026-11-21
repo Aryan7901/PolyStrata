@@ -199,18 +199,33 @@ __global__ void native_swiglu_quantize_q8_1_kernel(const float* __restrict__ gat
     if (i % Q8K == 0) y[i / Q8K].ds = q8_1_ds(d, sum);
 }
 
+// native_rms_norm_q8_1_planes: up to three groups ("planes") of `rows` rows, each from its own input with its own
+// weights, in one launch; the outputs take the planes' rows one after the other.
+struct NormPlanes {
+    const float* x[3];
+    const float* w[3];
+    int rows;
+};
+
 // native_add_rms_norm_q8_1: a block a row.  The sum of squares, the scale and the product are poly's rms_norm_kernel
 // with its block size (SUM threads of the block) and its IEEE operations written out (this file is built with
 // --use_fast_math).  Then every thread of the block takes values, a warp 32 of one Q8_1 block, and quantizes them as
-// native_quantize_q8_1_kernel does: more threads than the sum's make the row's quantization fewer steps.
-template<int SUM>
+// native_quantize_q8_1_kernel does: more threads than the sum's make the row's quantization fewer steps.  PLANES: the
+// block's input row and weights are its plane's (planes), and there is no sum.
+template<int SUM, bool PLANES = false>
 __launch_bounds__(1024, 1)
 __global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const float* __restrict__ add,
-                                                const float* __restrict__ w, float* __restrict__ y,
-                                                Q81Block* __restrict__ yq, int n, float eps) {
+                                                const float* __restrict__ w_, float* __restrict__ y,
+                                                Q81Block* __restrict__ yq, int n, float eps, NormPlanes planes = {}) {
     __shared__ float part[SUM / WARP];
     float* xr = x + std::size_t(blockIdx.x) * n;
-    const float* ar = add ? add + std::size_t(blockIdx.x) * n : nullptr;
+    const float* w = w_;
+    if constexpr (PLANES) {
+        const int g = int(blockIdx.x) / planes.rows;
+        xr = const_cast<float*>(planes.x[g]) + std::size_t(int(blockIdx.x) - g * planes.rows) * n;
+        w = planes.w[g];
+    }
+    const float* ar = !PLANES && add ? add + std::size_t(blockIdx.x) * n : nullptr;
     float* yr = y + std::size_t(blockIdx.x) * n;
     Q81Block* qr = yq + std::size_t(blockIdx.x) * (n / Q8K);
     if (threadIdx.x < SUM) {
@@ -2701,6 +2716,36 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     case 512: native_add_rms_norm_q8_1_kernel<512><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     case 1024: native_add_rms_norm_q8_1_kernel<1024><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
     default: throw std::invalid_argument("native_add_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
+    }
+    launch_check();
+}
+
+void native_rms_norm_q8_1_planes(const float* const* x, const float* const* w, int planes, float* y, void* y_q8_1,
+                                 int n, int rows, float eps, int threads, void* stream) {
+    validate_shape(n, 1);
+    validate_pointer(y);
+    validate_pointer(y_q8_1);
+    validate_stream(stream);
+    if (planes < 1 || planes > 3) throw std::invalid_argument("native_rms_norm_q8_1_planes: 1 to 3 planes");
+    if (rows < 1) return;
+    NormPlanes p{};
+    p.rows = rows;
+    for (int g = 0; g < planes; ++g) {
+        validate_pointer(x[g]);
+        validate_pointer(w[g]);
+        p.x[g] = x[g];
+        p.w[g] = w[g];
+    }
+    const auto s = static_cast<cudaStream_t>(stream);
+    auto* q = static_cast<Q81Block*>(y_q8_1);
+    const int block = std::max(threads, std::min(1024, n));
+    const int blocks = planes * rows;
+    switch (threads) {
+    case 128: native_add_rms_norm_q8_1_kernel<128, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    case 256: native_add_rms_norm_q8_1_kernel<256, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    case 512: native_add_rms_norm_q8_1_kernel<512, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    case 1024: native_add_rms_norm_q8_1_kernel<1024, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    default: throw std::invalid_argument("native_rms_norm_q8_1_planes: 128, 256, 512 or 1024 threads");
     }
     launch_check();
 }
