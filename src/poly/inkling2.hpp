@@ -102,6 +102,7 @@ private:
     /// Matrices of one input stacked as one (their rows one after the other), uploaded as they are: one product
     /// for all of them.  The same type each, n_in values a row.
     Dev fused(int il, std::initializer_list<const char*> names, int64_t n_in);
+    Dev msg_queries();
     /// The loop's message controller of module m on rows of x (n_embd a token, contiguous), in place.
     void control(Block& B, int m, float* x, const float* msg, int n);
     void plan();
@@ -144,7 +145,7 @@ private:
     int bank_last_ = -1, prelude_ = -1; ///< the slot of the stream at the end of the pass before; of the loop's start
     InkStates bank_states_{};           ///< what the messages read
     InkStates out_mix_{};               ///< the output's attention over the depth
-    Dev tok_norm_, out_query_, loop_query_, loop_kv_query_, ones_;
+    Dev tok_norm_, out_query_, msg_query_, ones_;
     // the output's shortlist (INK_HEAD=0 turns it off): a Q4_0 copy of the output matrix scores every token, and the
     // tokens within kHeadMargin of the best are scored again from the Q8_0 matrix
     Dev out_q4_;
@@ -159,10 +160,10 @@ private:
     void head_check(const float* got, const float* h, int rows);
 
     // device scratch, rows_ tokens
-    float *mix_ = nullptr, *msg_a_ = nullptr, *msg_b_ = nullptr, *ctl_ = nullptr, *ctl_h_ = nullptr,
+    float *mix_ = nullptr, *msg_ = nullptr, *ctl_ = nullptr, *ctl_h_ = nullptr,
           *ctl_g_ = nullptr, *ctl_f_ = nullptr, *xin_ = nullptr, *q_ = nullptr, *gate_ = nullptr, *rel_ = nullptr,
           *sink_ = nullptr, *kraw_ = nullptr, *k_ = nullptr, *vraw_ = nullptr, *v_ = nullptr, *dyn_ = nullptr,
-          *att_ = nullptr, *part_ = nullptr, *tmp_ = nullptr, *mixp_ = nullptr;
+          *att_ = nullptr, *part_ = nullptr, *tmp_ = nullptr;
     long long* row_off_ = nullptr;   ///< step(): each row's sequence's state, in floats from the bound one's
 };
 

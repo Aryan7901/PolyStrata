@@ -191,47 +191,77 @@ __global__ void mix_kernel(const float* __restrict__ r, int r_stride, InkStates 
     }
 }
 
-// The same for a few tokens, spread over MIX_CHUNKS blocks a token: each block sums its part of the vectors into
-// `part` (MIX_PART floats a block); mix_out_kernel adds the parts, takes the softmax and writes its part.
+// The same for a few tokens, in one launch of MIX_CHUNKS blocks a token: each block works out the whole sums - every
+// state's sum of squares and products with the queries, as MIX_CHUNKS partial sums of n / MIX_CHUNKS values each, a
+// warp a (state, chunk), added in the chunks' order - then the softmax, and writes its chunk of the outputs.  The
+// partial sums are the ones a block a chunk would make (it was two launches, those blocks' sums through scratch into a
+// second kernel), so the result does not depend on the threads a block has.  A lane's values of a chunk are read
+// before they are summed, in its order: a loop that waited for each read took most of the time.
 constexpr int MIX_CHUNKS = 8;
 constexpr int MIX_PART = MIX_STATES * (1 + MIX_QUERIES);
+constexpr int MIX_FEW_THREADS = 1024;   // 32 warps: a state's 8 chunks over 4 of them, two each
+constexpr int MIX_LANE = 9;             // a lane's values of a chunk read ahead (n up to 2304; past it, a loop)
 
-__global__ void mix_part_kernel(const float* __restrict__ r, int r_stride, InkStates s, const float* __restrict__ query,
-                                int nq, float* __restrict__ part, int n) {
-    const float* row = r + (size_t) blockIdx.y * r_stride;
-    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
-    const int per = (n + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = min(n, i0 + per);
-    float* pp = part + ((size_t) blockIdx.y * gridDim.x + blockIdx.x) * MIX_PART;
-    if (warp >= s.n) {
-        if (warp < MIX_STATES && lane < 1 + MIX_QUERIES) pp[lane == 0 ? warp : MIX_STATES + warp * MIX_QUERIES + lane - 1] = 0.f;
-        return;
-    }
-    const float* x = row + s.off[warp];
+template <int NQ>
+__device__ __forceinline__ void mix_chunk(const float* __restrict__ x, const float* __restrict__ query, int n,
+                                          int i0, int i1, int lane, float* pp, int j) {
     float ss = 0.f, d[MIX_QUERIES] = {0.f, 0.f, 0.f, 0.f};
-    for (int i = i0 + lane; i < i1; i += WARP) {
-        const float v = x[i];
-        ss += v * v;
+    float v[MIX_LANE], qv[NQ][MIX_LANE];
 #pragma unroll
-        for (int q = 0; q < MIX_QUERIES; ++q)
-            if (q < nq) d[q] += v * query[(size_t) q * n + i];
+    for (int k = 0; k < MIX_LANE; ++k) {
+        const int i = i0 + lane + k * WARP;
+        v[k] = i < i1 ? x[i] : 0.f;
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) qv[q][k] = i < i1 ? query[(size_t) q * n + i] : 0.f;
+    }
+#pragma unroll
+    for (int k = 0; k < MIX_LANE; ++k) {
+        if (i0 + lane + k * WARP >= i1) break;
+        ss += v[k] * v[k];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) d[q] += v[k] * qv[q][k];
+    }
+    for (int i = i0 + lane + MIX_LANE * WARP; i < i1; i += WARP) {
+        const float vi = x[i];
+        ss += vi * vi;
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) d[q] += vi * query[(size_t) q * n + i];
     }
     ss = warp_sum(ss);
 #pragma unroll
     for (int q = 0; q < MIX_QUERIES; ++q) d[q] = warp_sum(d[q]);
     if (lane == 0) {
-        pp[warp] = ss;
+        pp[j] = ss;
 #pragma unroll
-        for (int q = 0; q < MIX_QUERIES; ++q) pp[MIX_STATES + warp * MIX_QUERIES + q] = q < nq ? d[q] : 0.f;
+        for (int q = 0; q < MIX_QUERIES; ++q) pp[MIX_STATES + j * MIX_QUERIES + q] = q < NQ ? d[q] : 0.f;
     }
 }
 
-__global__ void mix_out_kernel(const float* __restrict__ r, int r_stride, InkStates s, int nq,
-                               const float* __restrict__ part, float* __restrict__ out, size_t q_stride, int n) {
+template <int NQ>
+__global__ void __launch_bounds__(MIX_FEW_THREADS)
+mix_few_kernel(const float* __restrict__ r, int r_stride, InkStates s, const float* __restrict__ query,
+               float* __restrict__ out, size_t q_stride, int n) {
+    constexpr int nq = NQ;
+    __shared__ float part[MIX_CHUNKS][MIX_PART];
     __shared__ float wsum[MIX_PART], inv[MIX_STATES], weight[MIX_QUERIES][MIX_STATES];
     const int t = blockIdx.y;
+    const float* row = r + (size_t) t * r_stride;
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP, warps = blockDim.x / WARP;
+    const int per = (n + MIX_CHUNKS - 1) / MIX_CHUNKS;
+    const int j = warp % MIX_STATES;
+    for (int c = warp / MIX_STATES; c < MIX_CHUNKS; c += warps / MIX_STATES) {
+        float* pp = part[c];
+        if (j >= s.n) {
+            if (lane < 1 + MIX_QUERIES) pp[lane == 0 ? j : MIX_STATES + j * MIX_QUERIES + lane - 1] = 0.f;
+            continue;
+        }
+        const int i0 = c * per;
+        mix_chunk<NQ>(row + s.off[j], query, n, i0, min(n, i0 + per), lane, pp, j);
+    }
+    __syncthreads();
     if (threadIdx.x < MIX_PART) {
         float v = 0.f;
-        for (int c = 0; c < (int) gridDim.x; ++c) v += part[((size_t) t * gridDim.x + c) * MIX_PART + threadIdx.x];
+        for (int c = 0; c < MIX_CHUNKS; ++c) v += part[c][threadIdx.x];
         wsum[threadIdx.x] = v;
     }
     __syncthreads();
@@ -241,26 +271,25 @@ __global__ void mix_out_kernel(const float* __restrict__ r, int r_stride, InkSta
         const int q = threadIdx.x;
         const float sc = rsqrtf((float) n);
         float mx = -INFINITY, sc_j[MIX_STATES];
-        for (int j = 0; j < s.n; ++j) {
-            sc_j[j] = wsum[MIX_STATES + j * MIX_QUERIES + q] * inv[j] * sc;
-            mx = fmaxf(mx, sc_j[j]);
+        for (int k = 0; k < s.n; ++k) {
+            sc_j[k] = wsum[MIX_STATES + k * MIX_QUERIES + q] * inv[k] * sc;
+            mx = fmaxf(mx, sc_j[k]);
         }
         float sum = 0.f;
-        for (int j = 0; j < s.n; ++j) sum += sc_j[j] = expf(sc_j[j] - mx);
-        for (int j = 0; j < s.n; ++j) weight[q][j] = sc_j[j] / sum * inv[j];
+        for (int k = 0; k < s.n; ++k) sum += sc_j[k] = expf(sc_j[k] - mx);
+        for (int k = 0; k < s.n; ++k) weight[q][k] = sc_j[k] / sum * inv[k];
     }
     __syncthreads();
-    const float* row = r + (size_t) t * r_stride;
     float* o = out + (size_t) t * n;
-    const int per = (n + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = min(n, i0 + per);
+    const int i0 = blockIdx.x * per, i1 = min(n, i0 + per);
     for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
         float x[MIX_STATES];
 #pragma unroll
-        for (int j = 0; j < MIX_STATES; ++j) x[j] = j < s.n ? row[s.off[j] + i] : 0.f;
+        for (int k = 0; k < MIX_STATES; ++k) x[k] = k < s.n ? row[s.off[k] + i] : 0.f;
         for (int q = 0; q < nq; ++q) {
             float v = 0.f;
 #pragma unroll
-            for (int j = 0; j < MIX_STATES; ++j) v += j < s.n ? weight[q][j] * x[j] : 0.f;
+            for (int k = 0; k < MIX_STATES; ++k) v += k < s.n ? weight[q][k] * x[k] : 0.f;
             o[(size_t) q * q_stride + i] = v;
         }
     }
@@ -1720,17 +1749,23 @@ int attend_splits(int rows, int kv_heads, int64_t span) {
 
 }  // namespace
 
-size_t ink_mix_floats(int rows) { return (size_t) std::min(rows, MIX_FEW) * MIX_CHUNKS * MIX_PART; }
-
 void ink_mix(const float* r, int r_stride, const InkStates& s, const float* query, int nq, float* out,
-             size_t q_stride, int n_embd, int rows, void* stream, float* scratch) {
+             size_t q_stride, int n_embd, int rows, void* stream) {
     if (rows <= 0) return;
     if (s.n < 1 || s.n > MIX_STATES || nq < 1 || nq > MIX_QUERIES)
         throw std::invalid_argument("ink_mix: 1 to 8 states and 1 to 4 queries");
-    if (scratch && rows <= MIX_FEW) {   // a few tokens: MIX_CHUNKS blocks each
+    if (rows <= MIX_FEW) {   // a few tokens: MIX_CHUNKS blocks each
         const dim3 g(MIX_CHUNKS, rows);
-        mix_part_kernel<<<g, MIX_THREADS, 0, cs(stream)>>>(r, r_stride, s, query, nq, scratch, n_embd);
-        mix_out_kernel<<<g, MIX_THREADS, 0, cs(stream)>>>(r, r_stride, s, nq, scratch, out, q_stride, n_embd);
+        const auto few = [&](auto k) {
+            mix_few_kernel<decltype(k)::value><<<g, MIX_FEW_THREADS, 0, cs(stream)>>>(r, r_stride, s, query, out,
+                                                                                    q_stride, n_embd);
+        };
+        switch (nq) {
+        case 1: few(std::integral_constant<int, 1>{}); break;
+        case 2: few(std::integral_constant<int, 2>{}); break;
+        case 3: few(std::integral_constant<int, 3>{}); break;
+        default: few(std::integral_constant<int, 4>{}); break;
+        }
         ck("ink_mix");
         return;
     }

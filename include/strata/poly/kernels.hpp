@@ -437,11 +437,9 @@ struct InkStates {
 /// Attention over the depth for `rows` tokens, each a row of r_stride floats in r: the states (n_embd values each,
 /// at s.off) RMS-normed without weights (eps 1e-6), weighed for each of nq queries (query: nq vectors of n_embd)
 /// by the softmax of their products over the root of n_embd, and summed.  Query q's sum of token t goes to
-/// out + q * q_stride + t * n_embd.  nq is at most 4.
-/// scratch: ink_mix_floats(rows) floats, which a call of a few tokens spreads its sums over (null: a block a token).
-size_t ink_mix_floats(int rows);
+/// out + q * q_stride + t * n_embd.  nq is at most 4.  A query's sums are the same whatever nq is.
 void ink_mix(const float* r, int r_stride, const InkStates& s, const float* query, int nq, float* out,
-             size_t q_stride, int n_embd, int rows, void* stream, float* scratch = nullptr);
+             size_t q_stride, int n_embd, int rows, void* stream);
 /// dst[t] = src[t] (or dst[t] += src[t] with `add`) for `rows` vectors of n values, src_stride and dst_stride
 /// floats from one token's to the next's.
 void ink_rows(const float* src, int src_stride, float* dst, int dst_stride, int n, int rows, bool add, void* stream);

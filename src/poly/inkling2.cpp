@@ -77,6 +77,35 @@ Dev Inkling2::fused(int il, std::initializer_list<const char*> names, int64_t n_
     return d;
 }
 
+// The loop's message queries (loop_res_query, loop_kv_res_query: two rows a run of the core each) as one table, a
+// later pass's four rows together - (q, experts) then (k, v) - so that one mix of the bank takes all four.
+Dev Inkling2::msg_queries() {
+    const TensorInfo* tq = gg_->find("loop_res_query.weight");
+    const TensorInfo* tkv = gg_->find("loop_kv_res_query.weight");
+    const int64_t rows = 2 * (core_end_ - core_start_);
+    for (const TensorInfo* t : {tq, tkv})
+        if (!t || t->type != kTypeF32 || (int64_t) t->shape[0] != n_embd_ || (int64_t) (t->elements() / n_embd_) != rows)
+            throw std::runtime_error("unsupported model: loop_res_query / loop_kv_res_query are not F32 [n_embd, " +
+                                     std::to_string(rows) + "]");
+    const size_t row = (size_t) n_embd_ * sizeof(float), bytes = 2 * (size_t) rows * row;
+    const Dev d{dense_ ? dense_ + dense_at_ : nullptr, kTypeF32, n_embd_, (int) (2 * rows)};
+    dense_at_ += pad(bytes) + kTail;
+    if (!dense_) return d;
+    if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for the loop's message queries");
+    const uint8_t* q = (const uint8_t*) home(*tq).data(*tq);
+    const uint8_t* kv = (const uint8_t*) home(*tkv).data(*tkv);
+    uploaded_.emplace_back(q, home(*tq).payload(*tq));
+    uploaded_.emplace_back(kv, home(*tkv).payload(*tkv));
+    std::vector<uint8_t> h(bytes);
+    for (int64_t p = 0; p < rows; p += 2) {
+        uint8_t* dst = h.data() + (size_t) (2 * p) * row;
+        std::memcpy(dst, q + (size_t) p * row, 2 * row);
+        std::memcpy(dst + 2 * row, kv + (size_t) p * row, 2 * row);
+    }
+    h2d(d.p, h.data(), bytes);
+    return d;
+}
+
 Inkling2::~Inkling2() {
     if (head_host_) cudaFreeHost(head_host_);
     if (igpu_) set_igpu(nullptr);
@@ -300,12 +329,7 @@ void Inkling2::load_layer(int il) {
         }
         tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", n_embd_, 1, kF32);
         out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", n_embd_, 1, kF32);
-        if (passes_ > 1) {
-            const int rows = 2 * (core_end_ - core_start_);
-            loop_query_ = upload(gg_->find("loop_res_query.weight"), "loop_res_query.weight", n_embd_, rows, kF32);
-            loop_kv_query_ =
-                upload(gg_->find("loop_kv_res_query.weight"), "loop_kv_res_query.weight", n_embd_, rows, kF32);
-        }
+        if (passes_ > 1) msg_query_ = msg_queries();
     }
     if (B.twin) {
         // a later pass of the loop: its first run's weights, and its own caches, state and plan
@@ -501,8 +525,7 @@ void Inkling2::alloc_caches() {
 void Inkling2::assign_scratch() {
     const size_t n = (size_t) rows_, e = (size_t) n_embd_, hq = (size_t) n_head_ * dim_, kvw = (size_t) n_kv_ * dim_;
     mix_ = fbuf(3 * n * e);
-    msg_a_ = fbuf(2 * n * e);
-    msg_b_ = fbuf(2 * n * e);
+    msg_ = fbuf(4 * n * e);
     ctl_ = fbuf(2 * n * e);
     ctl_h_ = fbuf(n * (size_t) std::max(gate_rank_, 1));
     ctl_g_ = fbuf(2 * n * e);   // gain then forget, a token's 2 * n_embd together
@@ -525,7 +548,6 @@ void Inkling2::assign_scratch() {
         const char* hc = std::getenv("INK_HEAD_CHECK");
         if (hc && std::atoi(hc) == 1) head_exact_ = (float*) dmalloc(r * (size_t) n_vocab_ * sizeof(float), "head check");
     }
-    mixp_ = fbuf(ink_mix_floats(rows_));
     if (!row_off_) row_off_ = (long long*) dmalloc(8 * sizeof(long long), "the step's state offsets");
 }
 
@@ -576,16 +598,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         ink_rows(r_ + (size_t) prelude_ * n_embd_, rs, cur, rs, n_embd_, n, false, st_);
     }
     const bool msgs = B.pass > 0;
-    if (msgs) {   // the messages: (q, experts) and (k, v)
-        ink_mix(r_, rs, bank_states_, fp(loop_query_) + (size_t) B.msg_row * n_embd_, 2, msg_a_, plane, n_embd_, n,
-                st_, mixp_);
-        ink_mix(r_, rs, bank_states_, fp(loop_kv_query_) + (size_t) B.msg_row * n_embd_, 2, msg_b_, plane, n_embd_,
-                n, st_, mixp_);
-    }
+    // the messages, four planes of msg_: (q, experts), then (k, v) - one mix of the bank with four queries
+    float* const msg_b = msg_ + 2 * plane;
+    if (msgs) ink_mix(r_, rs, bank_states_, fp(msg_query_) + (size_t) 2 * B.msg_row * n_embd_, 4, msg_, plane, n_embd_, n, st_);
     // the attention's inputs: a window run reads one mix of the depth, a full run one each for q, k and v
     float* in[3];
     const int nq = B.swa ? 1 : 3;
-    if (B.attn_mix.n > 0) ink_mix(r_, rs, B.attn_mix, fp(B.attn_query), nq, mix_, plane, n_embd_, n, st_, mixp_);
+    if (B.attn_mix.n > 0) ink_mix(r_, rs, B.attn_mix, fp(B.attn_query), nq, mix_, plane, n_embd_, n, st_);
     else ink_rows(cur, rs, mix_, n_embd_, n_embd_, n, false, st_);
     for (int j = 0; j < 3; ++j) in[j] = mix_ + (size_t) (B.attn_mix.n > 0 && !B.swa ? j : 0) * plane;
     if (msgs) {
@@ -594,7 +613,7 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             ink_rows(mix_, n_embd_, mix_ + 2 * plane, n_embd_, n_embd_, n, false, st_);
             for (int j = 0; j < 3; ++j) in[j] = mix_ + (size_t) j * plane;
         }
-        const float* m[3] = {msg_a_, msg_b_, msg_b_ + plane};
+        const float* m[3] = {msg_, msg_b, msg_b + plane};
         for (int j = 0; j < 3; ++j) control(B, j, in[j], m[j], n);
     }
     float* xq = xin_;
@@ -779,8 +798,8 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         ink_rows(ao_, n_embd_, cur, rs, n_embd_, n, true, st_);
     }
     // the experts' input
-    ink_mix(r_, rs, B.ffn_mix, fp(B.ffn_query), 1, mix_, plane, n_embd_, n, st_, mixp_);
-    if (msgs) control(B, 3, mix_, msg_a_ + plane, n);
+    ink_mix(r_, rs, B.ffn_mix, fp(B.ffn_query), 1, mix_, plane, n_embd_, n, st_);
+    if (msgs) control(B, 3, mix_, msg_ + plane, n);
     rms_norm(mix_, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
     kernels::native_quantize_q8_1(xn_, xq_, n * n_embd_, 1, st_);
     dbg("ffn_in", il, xn_, n_embd_);
@@ -891,7 +910,7 @@ void Inkling2::layer_tail(Layer&, int il, int n) {
 void Inkling2::output_rows(int first, int rows, float* h) {
     const int rs = n_streams_ * n_embd_;
     ink_mix(r_ + (size_t) first * rs, rs, out_mix_, fp(out_query_), 1, tmp_, (size_t) rows * n_embd_, n_embd_, rows,
-            st_, mixp_);
+            st_);
     rms_norm(tmp_, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
 }
 
