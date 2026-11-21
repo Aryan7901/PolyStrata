@@ -525,8 +525,8 @@ void ink_set_offsets(long long* dst, const long long* v, int n, void* stream);
 /// rel: n_rel (at most 16) a head a token; table: extent rows of n_rel.  out: heads * dim a token.  part: scratch of
 /// ink_attend_floats().  With `at`, the launch is sized for positions below room.
 size_t ink_attend_floats(int rows, int heads, int max_ctx);
-/// Number of zero-initialized counters to reserve for INK_ATT_NEW=1 on this device.
-size_t ink_attend_counters(int rows, int kv_heads);
+/// Number of zero-initialized counters to reserve for INK_ATT_NEW=1 (and INK_ATT_DSPARK=1 with DSpark).
+size_t ink_attend_counters(int rows, int kv_heads, bool token_splits = false);
 /// With kscales and vscales (Q8_0: an fp16 scale every 32 values), kcache and vcache are int8 codes (store_q8).
 /// v4 = 1: vcache is ink_store_q4's (values rotated in blocks of 64), and each head's output is rotated back before it
 /// is written; v4 = 2: kcache too (keys rotated by the head), and q must come rotated the same way (ink_hadamard).

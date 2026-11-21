@@ -19,6 +19,7 @@
 #include <cmath>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::poly {
 namespace {
@@ -2022,14 +2023,32 @@ __device__ __forceinline__ float unq16(const Row16<F>& r, float* f, uint32_t mag
     }
 }
 
-template <int G, int KF, int VF>
+// The launch uses its bucket's upper bound; DSpark chooses the actual split count from each token's span.
+struct Dec2Splits {
+    int fixed, min_pos, max_waves;
+    int slots;
+
+    __host__ __device__ int count(int64_t span, int units, int limit) const {
+        if (fixed > 0) return fixed < limit ? fixed : limit;
+        const int64_t fit = span * units / ((int64_t) slots * min_pos);
+        const int64_t waves = fit < 1 ? 1 : fit > max_waves ? max_waves : fit;
+        const int64_t splits = waves * slots / units;
+        return splits < 1 ? 1 : splits > limit ? limit : (int) splits;
+    }
+};
+
+constexpr int kDec2PartSlots = 2048;
+constexpr int kDec2MaxSplits = 512;   // shared memory for the final reduction
+constexpr int kDec2TokenSplits = kDec2PartSlots / ATT_FEW;
+
+template <int G, int KF, int VF, bool TokenSplits>
 __global__ void __launch_bounds__(DEC_WARPS * WARP)
 decode2_kernel(const float* __restrict__ q, int q_stride, const void* __restrict__ kcache,
                const void* __restrict__ vcache, const uint16_t* __restrict__ ksc, const uint16_t* __restrict__ vsc,
                const float* __restrict__ rel, int rel_stride, const float* __restrict__ table, int n_rel,
                int extent, const float* __restrict__ sink, float* __restrict__ part, float* __restrict__ out,
                int heads, int kv_heads, float scale, int64_t pos, int rows, int window, int ring,
-               const long long* at, unsigned int* counters) {
+               const long long* at, unsigned int* counters, Dec2Splits policy) {
     constexpr int GROUPS = DEC_WARPS * 4, NT = DEC_WARPS * WARP;
     // as many stages as fit beside the bias in ~31 KB (3 blocks a SM have ~100 KB), DEC2_STAGES at the most; fp16
     // (twice the bytes a value: 2 stages would fit) reads ahead into registers, which measured faster for it
@@ -2047,12 +2066,20 @@ decode2_kernel(const float* __restrict__ q, int q_stride, const void* __restrict
     } sm;
     __shared__ float gm[GROUPS][G], gl[GROUPS][G], relb[G][ATT_REL], rot[ATT_DIM];
     __shared__ bool last;
-    const int kvh = blockIdx.x, t = blockIdx.y, nsplit = gridDim.z, split = nsplit - 1 - (int) blockIdx.z;
+    const int kvh = blockIdx.x, t = blockIdx.y;
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP, grp = warp * 4 + lane / 8, sub = lane % 8;
     const int64_t p = (at ? (int64_t) at[0] : pos) + t;
     const int64_t lo = window > 0 ? max((int64_t) 0, p - window + 1) : 0;
     const int n_all = (int) (p + 1 - lo);
+    int nsplit = gridDim.z;
+    if constexpr (TokenSplits) nsplit = policy.count(n_all, kv_heads, kDec2TokenSplits);
     const int split_len = ((n_all + nsplit - 1) / nsplit + 15) / 16 * 16;   // whole chunks of 16 positions
+    if constexpr (TokenSplits) {
+        // Surplus blocks, including splits beyond the last key, never touch the row's counter.
+        nsplit = (n_all + split_len - 1) / split_len;
+        if ((int) blockIdx.z >= nsplit) return;
+    }
+    const int split = nsplit - 1 - (int) blockIdx.z;
     const int64_t s0 = min(p + 1, lo + (int64_t) split * split_len), s1 = min(p + 1, s0 + split_len);
     const int64_t near0 = max(s0, p - extent + 1);   // the first position with a bias term
     const int n_near = (int) (s1 - near0), n_keys = (int) (s1 - s0);
@@ -2495,17 +2522,15 @@ int attend_splits(int rows, int kv_heads, int64_t span) {
 #if !defined(__HIPCC__) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
 // decode2_kernel's splits a (token, key head) for a span of `span` positions at the most: whole waves of the card's
 // `slots` (its blocks at once), as many as give each block 512 positions or more, up to 2 - so that no wave runs part
-// empty (the splits share the positions out evenly whatever the launch was sized for).  INK_ATT_SPLITS=N sets N; INK_ATT_MINPOS and INK_ATT_WAVES the two limits (measurements).
-int dec2_splits(int64_t span, int units, int slots) {
+// empty. INK_ATT_SPLITS=N sets N; INK_ATT_MINPOS and INK_ATT_WAVES set the two limits.
+Dec2Splits dec2_split_policy(int slots) {
     static const auto env = [](const char* n, int d) {
         const char* e = std::getenv(n);
         return e && std::atoi(e) > 0 ? std::atoi(e) : d;
     };
     static const int fixed = env("INK_ATT_SPLITS", 0), min_pos = env("INK_ATT_MINPOS", 512),
                      most_waves = env("INK_ATT_WAVES", 2);
-    if (fixed > 0) return fixed;
-    const int64_t waves = std::clamp<int64_t>(span * units / ((int64_t) slots * min_pos), 1, most_waves);
-    return (int) std::max<int64_t>(1, waves * slots / units);
+    return {fixed, min_pos, most_waves, slots};
 }
 
 // INK_ATT_CHECK: the worst relative error (L2, of a call's output) seen, by kind of call, printed at exit
@@ -2647,10 +2672,11 @@ size_t ink_attend_floats(int rows, int heads, int max_ctx) {
     return std::max(few, many) * (size_t) heads * ATT_PART;
 }
 
-size_t ink_attend_counters(int rows, int kv_heads) {
+size_t ink_attend_counters(int rows, int kv_heads, bool token_splits) {
 #if !defined(__HIPCC__)
     const char* flag = std::getenv("INK_ATT_NEW");
-    if (flag && std::atoi(flag) != 0) {
+    const char* dspark = token_splits ? std::getenv("INK_ATT_DSPARK") : nullptr;
+    if (flag && std::atoi(flag) != 0 && (!token_splits || (dspark && std::atoi(dspark) == 1))) {
         int device = 0, major = 0;
         if (cudaGetDevice(&device) == cudaSuccess &&
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) == cudaSuccess && major >= 8)
@@ -2728,17 +2754,25 @@ void ink_attend(const float* q, int q_stride, const void* kcache, const void* vc
             int n2 = 1;
             by_g_kv([&](auto gq, auto kf, auto vf) {
                 constexpr int G = decltype(gq)::value, KF = decltype(kf)::value, VF = decltype(vf)::value;
-                static const int slots = [] {   // the card's blocks at once (the stages need the shared memory)
-                    cudaFuncSetAttribute(decode2_kernel<G, KF, VF>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                         cudaSharedmemCarveoutMaxShared);
-                    int n = 0;
-                    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, decode2_kernel<G, KF, VF>, DEC_WARPS * WARP, 0);
-                    return std::max(n, 1) * sms;
-                }();
-                n2 = std::min({dec2_splits(span, kv_heads * rows, slots), 2048 / rows, 512});   // part's room, the sums' smem
-                decode2_kernel<G, KF, VF><<<dim3(kv_heads, rows, n2), DEC_WARPS * WARP, 0, st>>>(q, q_stride, kcache,
-                    vcache, kscales, vscales, rel, rel_stride, table, n_rel, extent, sink, part, out, heads, kv_heads,
-                    scale, pos, rows, window, ring, at, counters);
+                const auto launch = [&](auto stable) {
+                    constexpr bool TokenSplits = decltype(stable)::value;
+                    static const Dec2Splits policy = [] {   // the card's blocks at once
+                        cudaFuncSetAttribute(decode2_kernel<G, KF, VF, TokenSplits>,
+                                             cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                        int n = 0;
+                        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, decode2_kernel<G, KF, VF, TokenSplits>,
+                                                                     DEC_WARPS * WARP, 0);
+                        return dec2_split_policy(std::max(n, 1) * sms);
+                    }();
+                    const int units = TokenSplits ? kv_heads : kv_heads * rows;
+                    const int limit = TokenSplits ? kDec2TokenSplits : std::min(kDec2PartSlots / rows, kDec2MaxSplits);
+                    n2 = policy.count(span, units, limit);
+                    decode2_kernel<G, KF, VF, TokenSplits><<<dim3(kv_heads, rows, n2), DEC_WARPS * WARP, 0, st>>>(
+                        q, q_stride, kcache, vcache, kscales, vscales, rel, rel_stride, table, n_rel, extent, sink,
+                        part, out, heads, kv_heads, scale, pos, rows, window, ring, at, counters, policy);
+                };
+                if (token_splits) launch(std::true_type{});
+                else launch(std::false_type{});
             });
             ck("ink_attend decode2");
             // INK_ATT_CHECK=1 (with --no-graphs): against decode_kernel and combine_kernel on the same inputs

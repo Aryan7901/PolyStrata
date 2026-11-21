@@ -557,8 +557,7 @@ void Inkling2::assign_scratch() {
     dyn_ = fbuf(2 * n * (size_t) taps_ * n_kv_);   // the keys' taps, then the values
     att_ = fbuf(n * hq);
     part_ = fbuf(ink_attend_floats(rows_, n_head_, opt_.max_context));
-    // DSpark verifies drafts with the legacy attention split and reduction order.
-    if (const size_t counters = ds_.on ? 0 : ink_attend_counters(rows_, n_kv_)) {
+    if (const size_t counters = ink_attend_counters(rows_, n_kv_, ds_.on)) {
         attn_counters_ = (unsigned int*) fbuf(counters);
         if (attn_counters_)
             ck(cudaMemsetAsync(attn_counters_, 0, counters * sizeof(*attn_counters_), cs(st_)),
@@ -987,7 +986,7 @@ void Inkling2::kv4_shadow(const Block& B, int il, int n, const float* k, const f
         ink_attend(q_, qgr, v4() == 2 ? sh.kc : B.k_codes, sh.vc, rel, qgr, fp(B.rel_table), n_rel_,
                    B.swa ? window_ : extent_, sink_, shadow_out_ + (size_t) j * rows_ * hq, part_, dim_, n_head_, n_kv_,
                    1.f / std::sqrt((float) dim_), pos_, n, B.swa ? window_ : 0, ring, st_, nullptr, 0,
-                   v4() == 2 ? sh.ks : B.k_sc, sh.vs, 0, attn_counters_);
+                   v4() == 2 ? sh.ks : B.k_sc, sh.vs, 0, attn_counters_, ds_.on);
     }
 }
 
