@@ -573,7 +573,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         for (int i = 0; i < n; ++i) off[i] = (long long) (seq_state(rows_of_[i].seq, state_) - state_);
         ink_set_offsets(row_off_, off, n, st_);
     }
-    if (il == 0) {   // the token's embedding, normed; a picture's rows go in as the encoder made them (llama.cpp
+    if (il == 0 && n == 1 && (images_.empty() || rows_of_ || !image_at(pos_))) {   // a token: normed where it is
+        rms_norm(cur, fp(tok_norm_), cur, n_embd_, 1, rms_eps_, st_);
+    } else if (il == 0) {   // the token's embedding, normed; a picture's rows go in as the encoder made them (llama.cpp
                      // norms only tokens).  Row t is at pos_ + t here: a batch with a picture's rows is not replayed
                      // from a recording, and step()'s rows (rows_of_) are tokens an answer writes
         ink_rows(cur, rs, tmp_, n_embd_, n_embd_, n, false, st_);
@@ -594,10 +596,20 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         }
     }
     if (B.restart) {   // a later pass: the pass before's blocks to the bank, and the stream from the loop's start
-        for (const auto& [from, to] : bank_)
-            ink_rows(r_ + (size_t) from * n_embd_, rs, r_ + (size_t) to * n_embd_, rs, n_embd_, n, false, st_);
-        ink_rows(cur, rs, r_ + (size_t) bank_last_ * n_embd_, rs, n_embd_, n, false, st_);
-        ink_rows(r_ + (size_t) prelude_ * n_embd_, rs, cur, rs, n_embd_, n, false, st_);
+        RowCopies c{};
+        int k = 0;
+        const auto copy = [&](int from, int to) {
+            if (k == 8) {
+                ink_copies(c, k, rs, n_embd_, n, st_);
+                k = 0;
+            }
+            c.src[k] = r_ + (size_t) from * n_embd_;
+            c.dst[k++] = r_ + (size_t) to * n_embd_;
+        };
+        for (const auto& [from, to] : bank_) copy(from, to);
+        copy(cur_, bank_last_);
+        copy(prelude_, cur_);
+        ink_copies(c, k, rs, n_embd_, n, st_);
     }
     const bool msgs = B.pass > 0;
     // the messages, four planes of msg_: (q, experts), then (k, v) - one mix of the bank with four queries
@@ -791,19 +803,22 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         if (kv4_check) kv4_compare(B, il, n);
         mul_sigmoid(att_, gate, hq, n, qgr, false, st_);
         lin(B.wo, att_, tmp_, n);
-        if (rows) ink_conv_rows(tmp_, n_embd_, B.state + 2 * keep * kvw, row_off_, fp(B.attn_conv), nullptr, 1, ao_, n_embd_,
-                                taps_, n, conv_s, st_);
-        else ink_conv(tmp_, B.state + 2 * keep * kvw, fp(B.attn_conv), nullptr, 1, ao_, n_embd_, taps_, n, conv_s, st_, snap_bits_ ? snap_at_ + (B.state + 2 * keep * kvw - state_) : nullptr, rec_n_, snap_bits_);
+        // into the residual: the first run of a block keeps the stream as a block and starts again from the
+        // attention's output, the others add it
+        float* push = B.push >= 0 ? r_ + (size_t) B.push * n_embd_ : nullptr;
+        if (rows) {
+            ink_conv_rows(tmp_, n_embd_, B.state + 2 * keep * kvw, row_off_, fp(B.attn_conv), nullptr, 1, ao_, n_embd_,
+                          taps_, n, conv_s, st_);
+            if (push) ink_rows(cur, rs, push, rs, n_embd_, n, false, st_);
+            ink_rows(ao_, n_embd_, cur, rs, n_embd_, n, !push, st_);
+        } else {
+            ink_conv(tmp_, B.state + 2 * keep * kvw, fp(B.attn_conv), nullptr, 1, ao_, n_embd_, taps_, n, conv_s, st_,
+                     snap_bits_ ? snap_at_ + (B.state + 2 * keep * kvw - state_) : nullptr, rec_n_, snap_bits_, 0, cur,
+                     rs, push);
+        }
     }
     dbg("attn", il, ao_, n_embd_);
 
-    // the residual: the first run of a block keeps the stream as a block and starts again from the attention
-    if (B.push >= 0) {
-        ink_rows(cur, rs, r_ + (size_t) B.push * n_embd_, rs, n_embd_, n, false, st_);
-        ink_rows(ao_, n_embd_, cur, rs, n_embd_, n, false, st_);
-    } else {
-        ink_rows(ao_, n_embd_, cur, rs, n_embd_, n, true, st_);
-    }
     // the experts' input
     ink_mix(r_, rs, B.ffn_mix, fp(B.ffn_query), 1, mix_, plane, n_embd_, n, st_);
     if (msgs) control(B, 3, mix_, msg_ + plane, n);
@@ -904,13 +919,19 @@ void Inkling2::kv4_compare(const Block& B, int il, int n) {
 void Inkling2::layer_tail(Layer&, int il, int n) {
     Block& B = blocks_[(size_t) il];
     const size_t keep = (size_t) (taps_ - 1), kvw = (size_t) n_kv_ * dim_;
-    if (stepping_ > 0)   // step(): each row its sequence's state, from the offsets its head left (row_off_)
+    float* cur = r_ + (size_t) cur_ * n_embd_;
+    const int rs = n_streams_ * n_embd_;
+    if (stepping_ > 0) {   // step(): each row its sequence's state, from the offsets its head left (row_off_)
         ink_conv_rows(fo_, n_embd_, B.state + keep * (2 * kvw + n_embd_), row_off_, fp(B.ffn_conv), nullptr, 1, tmp_,
                       n_embd_, taps_, n, 1.f / std::sqrt((float) (taps_ + 1)), st_);
-    else ink_conv(fo_, B.state + keep * (2 * kvw + n_embd_), fp(B.ffn_conv), nullptr, 1, tmp_, n_embd_, taps_, n,
-             1.f / std::sqrt((float) (taps_ + 1)), st_, snap_bits_ ? snap_at_ + (B.state + keep * (2 * kvw + n_embd_) - state_) : nullptr, rec_n_, snap_bits_);
+        ink_rows(tmp_, n_embd_, cur, rs, n_embd_, n, true, st_);
+    } else {   // its output added to the residual as it is written
+        ink_conv(fo_, B.state + keep * (2 * kvw + n_embd_), fp(B.ffn_conv), nullptr, 1, tmp_, n_embd_, taps_, n,
+                 1.f / std::sqrt((float) (taps_ + 1)), st_,
+                 snap_bits_ ? snap_at_ + (B.state + keep * (2 * kvw + n_embd_) - state_) : nullptr, rec_n_, snap_bits_,
+                 0, cur, rs);
+    }
     dbg("ffn", il, tmp_, n_embd_);
-    ink_rows(tmp_, n_embd_, r_ + (size_t) cur_ * n_embd_, n_streams_ * n_embd_, n_embd_, n, true, st_);
 }
 
 // The output reads the blocks and the stream through its own query over the depth, then its norm.

@@ -462,10 +462,12 @@ __global__ void conv_kernel(const float* __restrict__ x, const float* __restrict
     out[(size_t) t * channels + c] = (xt + acc) * scale;
 }
 
-// One token: its output and the state's advance in one thread a channel (no other thread reads the channel).
+// One token: its output and the state's advance in one thread a channel (no other thread reads the channel).  With
+// res, the output also goes into the residual stream there: added to it, or with push, in place of it, its value
+// before going to push (ink_conv's rows_kernel launches, the same values).
 __global__ void conv1_kernel(const float* __restrict__ x, float* __restrict__ state, const float* __restrict__ w,
                              const float* __restrict__ dyn, int heads, float* __restrict__ out, int channels, int taps,
-                             float scale, float* __restrict__ snap) {
+                             float scale, float* __restrict__ snap, float* __restrict__ res, float* __restrict__ push) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const int keep = taps - 1;
@@ -481,7 +483,14 @@ __global__ void conv1_kernel(const float* __restrict__ x, float* __restrict__ st
         acc += d[0] * xt;
         for (int lag = 1; lag < taps; ++lag) acc += d[lag] * past[keep - lag];
     }
-    out[c] = (xt + acc) * scale;
+    const float o = __fmul_rn(xt + acc, scale);   // rounded as stored: no fused add of the residual below
+    out[c] = o;
+    if (push) {
+        push[c] = res[c];
+        res[c] = o;
+    } else if (res) {
+        res[c] = __fadd_rn(res[c], o);
+    }
     for (int j = 0; j + 1 < keep; ++j) st[j] = past[j + 1];
     st[keep - 1] = xt;
     if (snap)
@@ -1631,6 +1640,14 @@ __global__ void store_q4_kernel(const float* __restrict__ x, uint8_t* __restrict
     if (i % 32 == 0) scales[v0 / 32] = __half_as_ushort(__float2half_rn(d));
 }
 
+// ink_copies(): each element through the copies in their order (a later one may read what an earlier one wrote)
+__global__ void copies_kernel(RowCopies c, int count, int stride, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t at = (size_t) blockIdx.y * stride + i;
+    for (int k = 0; k < count; ++k) c.dst[k][at] = c.src[k][at];
+}
+
 __global__ void rows_kernel(const float* __restrict__ src, int src_stride, float* __restrict__ dst, int dst_stride,
                             int n, bool add) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1821,20 +1838,31 @@ void ink_set_offsets(long long* dst, const long long* v, int n, void* stream) {
 }
 
 void ink_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* out, int channels,
-              int taps, int rows, float scale, void* stream, float* snap, size_t stride, unsigned snaps, int x_stride) {
+              int taps, int rows, float scale, void* stream, float* snap, size_t stride, unsigned snaps, int x_stride,
+              float* res, int res_stride, float* push) {
     const int xs = x_stride > 0 ? x_stride : channels;
     if (rows <= 0) return;
     if (taps < 2 || taps > 8) throw std::invalid_argument("ink_conv: 2 to 8 taps");
     if (dyn && (heads < 1 || channels % heads != 0)) throw std::invalid_argument("ink_conv: heads do not divide the channels");
     if (out == x) throw std::invalid_argument("ink_conv: out must not be x");
+    if (push && !res) throw std::invalid_argument("ink_conv: push without res");
     if (rows == 1) {
         conv1_kernel<<<grid(channels, 128), 128, 0, cs(stream)>>>(x, state, w, dyn, heads, out, channels, taps, scale,
-                                                                  snap && (snaps & 1u) ? snap : nullptr);
+                                                                  snap && (snaps & 1u) ? snap : nullptr, res, push);
         return;
     }
     conv_kernel<<<dim3(grid(channels, 128), rows), 128, 0, cs(stream)>>>(x, state, w, dyn, heads, out, channels, taps,
                                                                          rows, scale, xs);
     conv_state_kernel<<<grid(channels, 128), 128, 0, cs(stream)>>>(x, state, channels, taps, rows, snap, stride, snaps, xs);
+    if (!res) return;
+    if (push) ink_rows(res, res_stride, push, res_stride, channels, rows, false, stream);
+    ink_rows(out, channels, res, res_stride, channels, rows, !push, stream);
+}
+
+void ink_copies(const RowCopies& c, int count, int stride, int n, int rows, void* stream) {
+    if (rows <= 0 || count <= 0) return;
+    if (count > 8) throw std::invalid_argument("ink_copies: at most 8 copies");
+    copies_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(c, count, stride, n);
 }
 
 size_t ink_attend_floats(int rows, int heads, int max_ctx) {

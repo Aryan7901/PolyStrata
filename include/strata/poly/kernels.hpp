@@ -443,6 +443,13 @@ void ink_mix(const float* r, int r_stride, const InkStates& s, const float* quer
 /// dst[t] = src[t] (or dst[t] += src[t] with `add`) for `rows` vectors of n values, src_stride and dst_stride
 /// floats from one token's to the next's.
 void ink_rows(const float* src, int src_stride, float* dst, int dst_stride, int n, int rows, bool add, void* stream);
+/// Up to 8 copies of `rows` rows of n values in one launch, dst[k][t] = src[k][t] for each k in order (a copy may read
+/// what one before it wrote), every row `stride` floats from the one before.
+struct RowCopies {
+    const float* src[8];
+    float* dst[8];
+};
+void ink_copies(const RowCopies& c, int count, int stride, int n, int rows, void* stream);
 /// The loop's message controller after its products: out = (1 - tanh(f)) * cur + tanh(g) * msg, n values a row;
 /// cur, msg and g / f start their rows cur_stride, msg_stride and gf_stride floats apart.
 void ink_gate(const float* cur, int cur_stride, const float* msg, int msg_stride, const float* g, const float* f,
@@ -465,9 +472,12 @@ void ink_rms2(const float* a, const float* b, float* out, int n, int rows, float
 /// channels) a token, dyn[lag] times the input lag tokens back.  state: taps - 1 past inputs a channel, the oldest
 /// first, advanced by the rows.  out must not be x.
 /// snap, stride, snaps: as conv4_silu's - the state after each token whose bit is set, in order, stride floats apart.
+/// res (null: none): the output also goes into the residual stream's rows there (res_stride floats apart): added to
+/// them, or with push, in place of them, their values before going to push (the same stride).
 void ink_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* out, int channels,
               int taps, int rows, float scale, void* stream, float* snap = nullptr, size_t stride = 0,
-              unsigned snaps = 0, int x_stride = 0);   ///< x_stride: floats from a token's x to the next (0: channels)
+              unsigned snaps = 0, int x_stride = 0,   ///< x_stride: floats from a token's x to the next (0: channels)
+              float* res = nullptr, int res_stride = 0, float* push = nullptr);
 /// ink_conv for rows of different sequences, a token each: row t's state is at state + off[t] floats (off on the card).
 void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
                    int heads, float* out, int channels, int taps, int rows, float scale, void* stream);
