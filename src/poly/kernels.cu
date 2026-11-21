@@ -1,6 +1,7 @@
 // src/poly/kernels.cu - see the header.  The reference for every formula is llama.cpp's graph of the model and the
 // ggml ops it builds.  Where a kernel takes several tokens, blockIdx.y is the token unless it says otherwise.
 #include "strata/poly/kernels.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/kernels/dp4a.hpp"
 #ifdef STRATA_POLY_GDN_MMA
 #include "gdn_mma.hpp"
@@ -83,8 +84,10 @@ __device__ __forceinline__ float ldw(const float* w, size_t i) { return w[i]; }
 __device__ __forceinline__ float ldw(const uint16_t* w, size_t i) { return __uint_as_float(uint32_t(w[i]) << 16); }
 
 template<typename W>
-__global__ void gemv_kernel(const W* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int n_in,
+__global__ void gemv_kernel(const W* __restrict__ w, const float* x, float* y, int n_in,
                             int n_out, int rows_per_x) {
+    strata::kernels::pdl_trigger();   // PDL (pdl.hpp): nothing is read or written before the wait
+    strata::kernels::pdl_wait();
     __shared__ float part[32];
     const int o = blockIdx.x;
     const size_t tok = blockIdx.y;
@@ -113,7 +116,7 @@ namespace {
 template<typename W>
 void gemv(const W* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows, void* stream) {
     const int threads = n_in >= 128 ? sum_threads(n_in) : 32;
-    gemv_kernel<W><<<dim3(n_out, rows), threads, 0, (cudaStream_t) stream>>>(w, x, y, n_in, n_out, rows_per_x);
+    strata::kernels::launch_pdl(gemv_kernel<W>, dim3(dim3(n_out, rows)), dim3(threads), 0, (cudaStream_t) stream, w, x, y, n_in, n_out, rows_per_x);
 }
 
 // A prompt batch's product with a matrix of few rows (a gate a head, the indexer's weights).  cuBLAS cuts such a
@@ -252,8 +255,10 @@ __global__ void bf16_to_f32_kernel(const uint16_t* __restrict__ w, float* __rest
     if (i < n) out[i] = ldw(w, i);
 }
 
-__global__ void rms_norm_kernel(const float* __restrict__ x, const float* __restrict__ w, float* y, int n,
+__global__ void rms_norm_kernel(const float* x, const float* w, float* y, int n,
                                 float eps, int y_stride) {
+    strata::kernels::pdl_trigger();   // PDL (pdl.hpp): nothing is read or written before the wait
+    strata::kernels::pdl_wait();
     __shared__ float part[32];
     const float* xr = x + size_t(blockIdx.x) * n;
     float* yr = y + size_t(blockIdx.x) * y_stride;
@@ -647,9 +652,11 @@ __global__ void store_q8_kernel(const float* __restrict__ x, int8_t* __restrict_
 }
 
 // Rows from the position the card holds when the launch runs.
-__global__ void store_q8_at_kernel(const float* __restrict__ x, int8_t* __restrict__ codes,
-                                   half* __restrict__ scales, int n, int rows, int nb,
-                                   const long long* __restrict__ at, int ring) {
+__global__ void store_q8_at_kernel(const float* x, int8_t* codes,
+                                   half* scales, int n, int rows, int nb,
+                                   const long long* at, int ring) {
+    strata::kernels::pdl_trigger();   // PDL (pdl.hpp): nothing is read or written before the wait
+    strata::kernels::pdl_wait();
     const int gb = blockIdx.x * blockDim.x + threadIdx.x;
     if (gb >= nb * rows) return;
     const int trow = gb / nb, blk = gb % nb;
@@ -953,8 +960,10 @@ __global__ void axpy_kernel(const float* __restrict__ x, float a, float* __restr
     acc[i] = add ? acc[i] + x[i] * a : x[i] * a;
 }
 
-__global__ void copy2_kernel(const uint32_t* __restrict__ x0, uint32_t* __restrict__ y0, int n0,
-                             const uint32_t* __restrict__ x1, uint32_t* __restrict__ y1, int n1) {
+__global__ void copy2_kernel(const uint32_t* x0, uint32_t* y0, int n0,
+                             const uint32_t* x1, uint32_t* y1, int n1) {
+    strata::kernels::pdl_trigger();   // PDL (pdl.hpp): nothing is read or written before the wait
+    strata::kernels::pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n0) y0[i] = x0[i];
     else if (i < n0 + n1) y1[i - n0] = x1[i - n0];
@@ -1126,11 +1135,13 @@ __global__ void add_bias_kernel(const float* __restrict__ b, float* __restrict__
 // One block per head and token.  The pairs of the rotation are i and i + n_rot / 2 for i below n_rot / 2.  With
 // axes, a token has a position on each of three axes, and pair j turns by the one on axis (j % sections) % 3.
 // With `at`, the first token's position is what the card holds there when the launch runs.
-__global__ void head_norm_rope_kernel(const float* __restrict__ x, int x_stride, const float* __restrict__ w,
-                                      float* __restrict__ y, int dim, int heads, int n_rot, float theta_scale,
-                                      const float* __restrict__ freq, long long pos, float eps,
-                                      const int* __restrict__ axes, int sections,
-                                      const long long* __restrict__ at) {
+__global__ void head_norm_rope_kernel(const float* x, int x_stride, const float* w,
+                                      float* y, int dim, int heads, int n_rot, float theta_scale,
+                                      const float* freq, long long pos, float eps,
+                                      const int* axes, int sections,
+                                      const long long* at) {
+    strata::kernels::pdl_trigger();   // PDL (pdl.hpp): nothing is read or written before the wait
+    strata::kernels::pdl_wait();
     __shared__ float part[8];
     const float* xr = x + size_t(blockIdx.x) * x_stride;
     float* yr = y + size_t(blockIdx.x) * dim;
@@ -2744,7 +2755,7 @@ void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream) {
 }
 
 void rms_norm(const float* x, const float* w, float* y, int n, int rows, float eps, void* stream, int y_stride) {
-    rms_norm_kernel<<<rows, sum_threads(n), 0, cs(stream)>>>(x, w, y, n, eps, y_stride ? y_stride : n);
+    strata::kernels::launch_pdl(rms_norm_kernel, dim3(rows), dim3(sum_threads(n)), 0, cs(stream), x, w, y, n, eps, y_stride ? y_stride : n);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("rms_norm: ") + cudaGetErrorString(e));
 }
@@ -2913,7 +2924,7 @@ void store_q8_at(const float* x, int8_t* codes, uint16_t* scales, int n, const l
     const int nb = n >> 5;
     const size_t all = (size_t) nb * rows;
     if (!all) return;
-    store_q8_at_kernel<<<grid(all, 256), 256, 0, cs(stream)>>>(x, codes, (half*) scales, n, rows, nb, at, ring);
+    strata::kernels::launch_pdl(store_q8_at_kernel, dim3(grid(all, 256)), dim3(256), 0, cs(stream), x, codes, (half*) scales, n, rows, nb, at, ring);
 }
 
 void dsa_attend(void* blas, const float* q, const uint16_t* cache, const int32_t* sel, int sel_stride, int top_rows,
@@ -3002,7 +3013,7 @@ void axpy(const float* x, float a, float* acc, int n, bool add, void* stream) {
 }
 
 void copy2(const void* x0, void* y0, int n0, const void* x1, void* y1, int n1, void* stream) {
-    copy2_kernel<<<grid(n0 + n1, 256), 256, 0, cs(stream)>>>((const uint32_t*) x0, (uint32_t*) y0, n0,
+    strata::kernels::launch_pdl(copy2_kernel, dim3(grid(n0 + n1, 256)), dim3(256), 0, cs(stream), (const uint32_t*) x0, (uint32_t*) y0, n0,
                                                              (const uint32_t*) x1, (uint32_t*) y1, n1);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("copy2: ") + cudaGetErrorString(e));
@@ -3064,7 +3075,7 @@ void add_bias(const float* b, float* acc, int n, int rows, void* stream) {
 void head_norm_rope(const float* x, int x_stride, const float* w, float* y, int dim, int heads, int n_rot,
                     float theta_scale, int64_t pos, int rows, float eps, void* stream, const float* freq,
                     const int32_t* axes, int sections, const long long* at) {
-    head_norm_rope_kernel<<<rows * heads, dim >= 256 ? 256 : 128, 0, cs(stream)>>>(
+    strata::kernels::launch_pdl(head_norm_rope_kernel, dim3(rows * heads), dim3(dim >= 256 ? 256 : 128), 0, cs(stream), 
         x, x_stride, w, y, dim, heads, n_rot, theta_scale, freq, (long long) pos, eps, axes, sections, at);
 }
 

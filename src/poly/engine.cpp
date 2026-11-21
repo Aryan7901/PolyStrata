@@ -20,6 +20,7 @@
 #include "strata/gpu/metal.hpp"
 #endif
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/platform/memory.hpp"
 
 #include "ggml.h"
@@ -4942,14 +4943,19 @@ void* Engine::record(F&& work) {
     cudaGraph_t g = nullptr;
     ck(cudaStreamBeginCapture(cs(st_), cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
     recording_ = recorded_ = true;
+    bool& pdl = kernels::pdl_scope();
+    const bool pdl_was = pdl;
+    pdl = pdl_graphs();
     try {
         work();
     } catch (...) {
+        pdl = pdl_was;
         recording_ = false;
         if (cudaStreamEndCapture(cs(st_), &g) == cudaSuccess && g) cudaGraphDestroy(g);
         cudaGetLastError();   // a capture the failure broke does not end cleanly: the work's exception says why
         throw;
     }
+    pdl = pdl_was;
     recording_ = false;
     ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
     cudaGraphExec_t exec = nullptr;

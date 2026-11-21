@@ -214,9 +214,10 @@ struct NormPlanes {
 // block's input row and weights are its plane's (planes), and there is no sum.
 template<int SUM, bool PLANES = false>
 __launch_bounds__(1024, 1)
-__global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const float* __restrict__ add,
-                                                const float* __restrict__ w_, float* __restrict__ y,
-                                                Q81Block* __restrict__ yq, int n, float eps, NormPlanes planes = {}) {
+__global__ void native_add_rms_norm_q8_1_kernel(float* x, const float* add, const float* w_, float* y, Q81Block* yq,
+                                                int n, float eps, NormPlanes planes) {
+    pdl_trigger();   // PDL (pdl.hpp): launched with it where the caller allows (launch_pdl), otherwise a no-op
+    pdl_wait();
     __shared__ float part[SUM / WARP];
     float* xr = x + std::size_t(blockIdx.x) * n;
     const float* w = w_;
@@ -948,8 +949,12 @@ __device__ __forceinline__ float small_q8_dot(const MXFP4Block* __restrict__ w,
 template<typename Weight, int Qi, bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
-                                         const Q81Block* __restrict__ x,
-                                         float* __restrict__ y, int n_in, int n_out) {
+                                         const Q81Block* x_,
+                                         float* y_, int n_in, int n_out) {
+    const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
+    float* STRATA_PDL_RESTRICT y = y_;
+    pdl_trigger();   // PDL (pdl.hpp): launched with it where the caller allows (launch_pdl), otherwise a no-op
+    pdl_wait();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
@@ -2213,9 +2218,9 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     const dim3 threads(WARP, WARPS);
     if (n_in / 32 < 2 * WARPS * WARP / Qi) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
-        native_small_mmvq_kernel<Weight, Qi, true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+        launch_pdl(native_small_mmvq_kernel<Weight, Qi, true>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
     } else {
-        native_small_mmvq_kernel<Weight, Qi, false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
+        launch_pdl(native_small_mmvq_kernel<Weight, Qi, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out);
     }
     launch_check();
 }
@@ -2711,10 +2716,10 @@ void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float*
     auto* q = static_cast<Q81Block*>(y_q8_1);
     const int block = std::max(threads, std::min(1024, n));   // n is a multiple of 32, and so is this
     switch (threads) {
-    case 128: native_add_rms_norm_q8_1_kernel<128><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
-    case 256: native_add_rms_norm_q8_1_kernel<256><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
-    case 512: native_add_rms_norm_q8_1_kernel<512><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
-    case 1024: native_add_rms_norm_q8_1_kernel<1024><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
+    case 128: launch_pdl(native_add_rms_norm_q8_1_kernel<128>, dim3(rows), dim3(block), 0, s, x, add, w, y, q, n, eps, NormPlanes{}); break;
+    case 256: launch_pdl(native_add_rms_norm_q8_1_kernel<256>, dim3(rows), dim3(block), 0, s, x, add, w, y, q, n, eps, NormPlanes{}); break;
+    case 512: launch_pdl(native_add_rms_norm_q8_1_kernel<512>, dim3(rows), dim3(block), 0, s, x, add, w, y, q, n, eps, NormPlanes{}); break;
+    case 1024: launch_pdl(native_add_rms_norm_q8_1_kernel<1024>, dim3(rows), dim3(block), 0, s, x, add, w, y, q, n, eps, NormPlanes{}); break;
     default: throw std::invalid_argument("native_add_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
     }
     launch_check();
@@ -2741,10 +2746,10 @@ void native_rms_norm_q8_1_planes(const float* const* x, const float* const* w, i
     const int block = std::max(threads, std::min(1024, n));
     const int blocks = planes * rows;
     switch (threads) {
-    case 128: native_add_rms_norm_q8_1_kernel<128, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
-    case 256: native_add_rms_norm_q8_1_kernel<256, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
-    case 512: native_add_rms_norm_q8_1_kernel<512, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
-    case 1024: native_add_rms_norm_q8_1_kernel<1024, true><<<blocks, block, 0, s>>>(nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    case 128: launch_pdl(native_add_rms_norm_q8_1_kernel<128, true>, dim3(blocks), dim3(block), 0, s, nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    case 256: launch_pdl(native_add_rms_norm_q8_1_kernel<256, true>, dim3(blocks), dim3(block), 0, s, nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    case 512: launch_pdl(native_add_rms_norm_q8_1_kernel<512, true>, dim3(blocks), dim3(block), 0, s, nullptr, nullptr, nullptr, y, q, n, eps, p); break;
+    case 1024: launch_pdl(native_add_rms_norm_q8_1_kernel<1024, true>, dim3(blocks), dim3(block), 0, s, nullptr, nullptr, nullptr, y, q, n, eps, p); break;
     default: throw std::invalid_argument("native_rms_norm_q8_1_planes: 128, 256, 512 or 1024 threads");
     }
     launch_check();

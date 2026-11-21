@@ -63,6 +63,7 @@ protected:
     int head_key(int il, int n) const override;
     int file_layer(int il) const override;
     bool batch_heads() const override { return true; }
+    bool pdl_graphs() const override;
     bool sees() const override { return true; }   // pictures: rows of Inkling's vision encoder (strata-vision)
     void after_load() override;
 

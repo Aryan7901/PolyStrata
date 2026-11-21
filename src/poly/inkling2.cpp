@@ -1137,6 +1137,24 @@ void Inkling2::moe_shared(const Layer&, int, int n) {
     ck(cudaMemsetAsync(fo_, 0, (size_t) n * n_embd_ * sizeof(float), cs(st_)), "experts");
 }
 
+// The recorded layers' launches with programmatic dependent launch (pdl.hpp) on sm_90+: every kernel of Inkling's
+// that is launched with launch_pdl waits (pdl_wait) before it reads or writes anything; the attention's kernels are
+// launched as before.  INK_PDL=0 turns it off.
+bool Inkling2::pdl_graphs() const {
+    static const bool on = [] {
+        const char* e = std::getenv("INK_PDL");
+        if (e && std::atoi(e) == 0) return false;
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return major >= 9;
+    }();
+    return on;
+}
+
 int Inkling2::head_key(int il, int n) const { return blocks_[(size_t) il].swa ? 0 : room_key(n); }
 
 // ---- a sequence's state: the convolutions' past inputs (state_), the window runs' rings (extra), the full runs'

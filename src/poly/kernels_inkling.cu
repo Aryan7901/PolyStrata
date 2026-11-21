@@ -2,6 +2,7 @@
 // inkling2 graph (src/models/inkling2.cpp) and its relative positions (llama_kv_cache::set_input_relative_pos).
 // Where a kernel takes several tokens, blockIdx.y is the token unless it says otherwise.
 #include "strata/poly/kernels.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 
 #include <cuda_fp16.h>
@@ -18,6 +19,10 @@
 
 namespace strata::poly {
 namespace {
+
+using kernels::launch_pdl;
+using kernels::pdl_trigger;
+using kernels::pdl_wait;
 
 constexpr int WARP = 32;
 constexpr int MIX_THREADS = 256;   // a warp a state: MIX_STATES warps
@@ -204,7 +209,7 @@ constexpr int MIX_FEW_THREADS = 1024;   // 32 warps: a state's 8 chunks over 4 o
 constexpr int MIX_LANE = 9;             // a lane's values of a chunk read ahead (n up to 2304; past it, a loop)
 
 template <int NQ>
-__device__ __forceinline__ void mix_chunk(const float* __restrict__ x, const float* __restrict__ query, int n,
+__device__ __forceinline__ void mix_chunk(const float* x, const float* query, int n,
                                           int i0, int i1, int lane, float* pp, int j) {
     float ss = 0.f, d[MIX_QUERIES] = {0.f, 0.f, 0.f, 0.f};
     float v[MIX_LANE], qv[NQ][MIX_LANE];
@@ -240,8 +245,10 @@ __device__ __forceinline__ void mix_chunk(const float* __restrict__ x, const flo
 
 template <int NQ>
 __global__ void __launch_bounds__(MIX_FEW_THREADS)
-mix_few_kernel(const float* __restrict__ r, int r_stride, InkStates s, const float* __restrict__ query,
-               float* __restrict__ out, size_t q_stride, int n) {
+mix_few_kernel(const float* r, int r_stride, InkStates s, const float* query,
+               float* out, size_t q_stride, int n) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     constexpr int nq = NQ;
     __shared__ float part[MIX_CHUNKS][MIX_PART];
     __shared__ float wsum[MIX_PART], inv[MIX_STATES], weight[MIX_QUERIES][MIX_STATES];
@@ -331,10 +338,12 @@ __device__ __forceinline__ T pick(const T (&a)[GEMV_JOBS], int j) {
 
 template <int R>
 __global__ void gemv_wide_kernel(GemvJobs jobs, int n_in, int n_out) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     __shared__ float red[R][8];
-    const float* __restrict__ w = pick(jobs.w, blockIdx.y);
-    const float* __restrict__ x = pick(jobs.x, blockIdx.y);
-    float* __restrict__ y = pick(jobs.y, blockIdx.y);
+    const float* w = pick(jobs.w, blockIdx.y);
+    const float* x = pick(jobs.x, blockIdx.y);
+    float* y = pick(jobs.y, blockIdx.y);
     const int o = blockIdx.x;
     const float* wr = w + (size_t) o * n_in;
     float acc[R];
@@ -364,7 +373,7 @@ __global__ void gemv_wide_kernel(GemvJobs jobs, int n_in, int n_out) {
 
 // A warp's output o of R tokens: its lanes' products, then the warp's sum
 template <int R>
-__device__ __forceinline__ void gemv_short_row(const float* __restrict__ wr, const float* __restrict__ x, int n_in,
+__device__ __forceinline__ void gemv_short_row(const float* wr, const float* x, int n_in,
                                                int lane, float* acc) {
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
@@ -379,6 +388,8 @@ __device__ __forceinline__ void gemv_short_row(const float* __restrict__ wr, con
 
 template <int R>
 __global__ void gemv_short_kernel(GemvJobs jobs, int n_in, int n_out) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
     if (o >= n_out) return;
     float acc[R];
@@ -397,9 +408,11 @@ __device__ __forceinline__ float ctl_gate(float c, float m, float g, float f) {
     return __fmaf_rn(1.f - tanhf(f), c, __fmul_rn(tanhf(g), m));
 }
 
-__global__ void gate_kernel(const float* __restrict__ cur, int cur_stride, const float* __restrict__ msg,
-                            int msg_stride, const float* __restrict__ g, const float* __restrict__ f, int gf_stride,
-                            float* __restrict__ out, int n) {
+__global__ void gate_kernel(const float* cur, int cur_stride, const float* msg,
+                            int msg_stride, const float* g, const float* f, int gf_stride,
+                            float* out, int n) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const size_t t = blockIdx.y;
@@ -419,6 +432,8 @@ struct GateJobs {
 
 template <int R>
 __global__ void gate_gemv_kernel(GateJobs jobs, int n_in, int n, int cur_stride, int msg_stride) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
     if (o >= n) return;
     const int j = blockIdx.y;
@@ -445,7 +460,7 @@ struct Q81 {
     int8_t qs[32];
 };
 
-__device__ __forceinline__ void store_q8_1(float xi, Q81* __restrict__ y, size_t i) {
+__device__ __forceinline__ void store_q8_1(float xi, Q81* y, size_t i) {
     float amax = fabsf(xi), sum = xi;
 #pragma unroll
     for (int o = WARP / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o, WARP));
@@ -461,8 +476,10 @@ __device__ __forceinline__ void store_q8_1(float xi, Q81* __restrict__ y, size_t
     if (i % 32 == 0) y[i / 32].ds = kernels::q8_1_ds(d, sum);
 }
 
-__global__ void mul_sigmoid_q8_kernel(float* __restrict__ acc, const float* __restrict__ g, int n, int g_stride,
-                                      Q81* __restrict__ yq) {
+__global__ void mul_sigmoid_q8_kernel(float* acc, const float* g, int n, int g_stride,
+                                      Q81* yq) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n is a multiple of 32: whole warps return
     const size_t at = (size_t) blockIdx.y * n + i;
@@ -507,6 +524,8 @@ struct ClipJobs {
 };
 
 __global__ void clip3_kernel(ClipJobs jobs, int rows, float floor_, int64_t pos, const long long* at) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const ClipJob& J = jobs.j[blockIdx.z];
     const int head = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const int t = blockIdx.y;
@@ -534,10 +553,12 @@ struct Rms2Jobs {
     const float* b[GEMV_JOBS];
 };
 
-__global__ void rms2_kernel(Rms2Jobs jobs, float* __restrict__ out_, int n, float eps) {
+__global__ void rms2_kernel(Rms2Jobs jobs, float* out_, int n, float eps) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     __shared__ float red[2][8];
     const float* src = blockIdx.y ? pick(jobs.b, blockIdx.z) : pick(jobs.a, blockIdx.z);
-    float* __restrict__ out = out_ + (size_t) blockIdx.z * gridDim.x * 2 * n;
+    float* out = out_ + (size_t) blockIdx.z * gridDim.x * 2 * n;
     const float* x = src + (size_t) blockIdx.x * n;
     float ss = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
@@ -581,9 +602,11 @@ __global__ void conv_kernel(const float* __restrict__ x, const float* __restrict
 // One token: its output and the state's advance in one thread a channel (no other thread reads the channel).  With
 // res, the output also goes into the residual stream there: added to it, or with push, in place of it, its value
 // before going to push (ink_conv's rows_kernel launches, the same values).
-__global__ void conv1_kernel(const float* __restrict__ x, float* __restrict__ state, const float* __restrict__ w,
-                             const float* __restrict__ dyn, int heads, float* __restrict__ out, int channels, int taps,
-                             float scale, float* __restrict__ snap, float* __restrict__ res, float* __restrict__ push) {
+__global__ void conv1_kernel(const float* x, float* state, const float* w,
+                             const float* dyn, int heads, float* out, int channels, int taps,
+                             float scale, float* snap, float* res, float* push) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= channels) return;
     const int keep = taps - 1;
@@ -1758,14 +1781,18 @@ __global__ void store_q4_kernel(const float* __restrict__ x, uint8_t* __restrict
 
 // ink_copies(): each element through the copies in their order (a later one may read what an earlier one wrote)
 __global__ void copies_kernel(RowCopies c, int count, int stride, int n) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const size_t at = (size_t) blockIdx.y * stride + i;
     for (int k = 0; k < count; ++k) c.dst[k][at] = c.src[k][at];
 }
 
-__global__ void rows_kernel(const float* __restrict__ src, int src_stride, float* __restrict__ dst, int dst_stride,
+__global__ void rows_kernel(const float* src, int src_stride, float* dst, int dst_stride,
                             int n, bool add) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float v = src[(size_t) blockIdx.y * src_stride + i];
@@ -1890,7 +1917,7 @@ void ink_mix(const float* r, int r_stride, const InkStates& s, const float* quer
     if (rows <= MIX_FEW) {   // a few tokens: MIX_CHUNKS blocks each
         const dim3 g(MIX_CHUNKS, rows);
         const auto few = [&](auto k) {
-            mix_few_kernel<decltype(k)::value><<<g, MIX_FEW_THREADS, 0, cs(stream)>>>(r, r_stride, s, query, out,
+            launch_pdl(mix_few_kernel<decltype(k)::value>, dim3(g), dim3(MIX_FEW_THREADS), 0, cs(stream), r, r_stride, s, query, out,
                                                                                     q_stride, n_embd);
         };
         switch (nq) {
@@ -1909,7 +1936,7 @@ void ink_mix(const float* r, int r_stride, const InkStates& s, const float* quer
 void ink_gate(const float* cur, int cur_stride, const float* msg, int msg_stride, const float* g, const float* f,
               int gf_stride, float* out, int n, int rows, void* stream) {
     if (rows <= 0) return;
-    gate_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(cur, cur_stride, msg, msg_stride, g, f, gf_stride,
+    launch_pdl(gate_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), cur, cur_stride, msg, msg_stride, g, f, gf_stride,
                                                                   out, n);
 }
 
@@ -1930,7 +1957,7 @@ void ink_clip3(float* x0, int s0, const float* sc0, float lim0, int dim0, int he
                    {x2, sc2, lim2, alpha2, s2, dim2, heads2}}};
     const int heads = std::max({heads0, heads1, heads2});
     constexpr int per = 4;
-    clip3_kernel<<<dim3(grid(heads, per), rows, 3), per * WARP, 0, cs(stream)>>>(jobs, rows, floor_, pos, at);
+    launch_pdl(clip3_kernel, dim3(dim3(grid(heads, per), rows, 3)), dim3(per * WARP), 0, cs(stream), jobs, rows, floor_, pos, at);
 }
 
 void ink_rms2(const float* a, const float* b, float* out, int n, int rows, float eps, void* stream) {
@@ -1943,7 +1970,7 @@ void ink_rms2_jobs(const float* const* a, const float* const* b, int jobs, float
     if (jobs < 1 || jobs > GEMV_JOBS) throw std::invalid_argument("ink_rms2_jobs: 1 to 4 controllers");
     Rms2Jobs J{};
     for (int j = 0; j < jobs; ++j) J.a[j] = a[j], J.b[j] = b[j];
-    rms2_kernel<<<dim3(rows, 2, jobs), 256, 0, cs(stream)>>>(J, out, n, eps);
+    launch_pdl(rms2_kernel, dim3(dim3(rows, 2, jobs)), dim3(256), 0, cs(stream), J, out, n, eps);
 }
 
 void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
@@ -1971,7 +1998,7 @@ void ink_conv(const float* x, float* state, const float* w, const float* dyn, in
     if (out == x) throw std::invalid_argument("ink_conv: out must not be x");
     if (push && !res) throw std::invalid_argument("ink_conv: push without res");
     if (rows == 1) {
-        conv1_kernel<<<grid(channels, 128), 128, 0, cs(stream)>>>(x, state, w, dyn, heads, out, channels, taps, scale,
+        launch_pdl(conv1_kernel, dim3(grid(channels, 128)), dim3(128), 0, cs(stream), x, state, w, dyn, heads, out, channels, taps, scale,
                                                                   snap && (snaps & 1u) ? snap : nullptr, res, push);
         return;
     }
@@ -1986,7 +2013,7 @@ void ink_conv(const float* x, float* state, const float* w, const float* dyn, in
 void ink_copies(const RowCopies& c, int count, int stride, int n, int rows, void* stream) {
     if (rows <= 0 || count <= 0) return;
     if (count > 8) throw std::invalid_argument("ink_copies: at most 8 copies");
-    copies_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(c, count, stride, n);
+    launch_pdl(copies_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), c, count, stride, n);
 }
 
 size_t ink_attend_floats(int rows, int heads, int max_ctx) {
@@ -2255,8 +2282,8 @@ bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* cons
     const cudaStream_t st = cs(stream);
     by_rows(rows, [&](auto rr) {
         constexpr int R = decltype(rr)::value;
-        if (n_in >= 512) gemv_wide_kernel<R><<<dim3(n_out, jobs), 256, 0, st>>>(J, n_in, n_out);
-        else gemv_short_kernel<R><<<dim3(grid(n_out, 8), jobs), 8 * WARP, 0, st>>>(J, n_in, n_out);
+        if (n_in >= 512) launch_pdl(gemv_wide_kernel<R>, dim3(dim3(n_out, jobs)), dim3(256), 0, st, J, n_in, n_out);
+        else launch_pdl(gemv_short_kernel<R>, dim3(dim3(grid(n_out, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n_out);
     });
     ck("ink_gemv_f32");
     return true;
@@ -2272,7 +2299,7 @@ bool ink_gate_gemv(const float* const* w, const float* const* h, const float* co
     const cudaStream_t st = cs(stream);
     by_rows(rows, [&](auto rr) {
         constexpr int R = decltype(rr)::value;
-        gate_gemv_kernel<R><<<dim3(grid(n, 8), jobs), 8 * WARP, 0, st>>>(J, n_in, n, cur_stride, msg_stride);
+        launch_pdl(gate_gemv_kernel<R>, dim3(dim3(grid(n, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n, cur_stride, msg_stride);
     });
     ck("ink_gate_gemv");
     return true;
@@ -2281,13 +2308,13 @@ bool ink_gate_gemv(const float* const* w, const float* const* h, const float* co
 void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream) {
     if (rows <= 0) return;
     if (n % 32 != 0) throw std::invalid_argument("ink_mul_sigmoid_q8: n must be a multiple of 32");
-    mul_sigmoid_q8_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(acc, g, n, g_stride, (Q81*) y_q8_1);
+    launch_pdl(mul_sigmoid_q8_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), acc, g, n, g_stride, (Q81*) y_q8_1);
     ck("ink_mul_sigmoid_q8");
 }
 
 void ink_rows(const float* src, int src_stride, float* dst, int dst_stride, int n, int rows, bool add, void* stream) {
     if (rows <= 0) return;
-    rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(src, src_stride, dst, dst_stride, n, add);
+    launch_pdl(rows_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), src, src_stride, dst, dst_stride, n, add);
 }
 
 size_t ink_shortlist_floats(int rows) { return (size_t) rows * HEAD_CHUNKS; }
