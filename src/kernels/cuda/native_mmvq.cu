@@ -946,6 +946,8 @@ __device__ __forceinline__ float small_q8_dot(const MXFP4Block* __restrict__ w,
 
 // QI=4 for Q4_0/Q5_0/IQ4_NL/MXFP4 and QI=8 for Q8_0. With VDR=2 this preserves
 // the pinned 64/32-block iteration and 2048/1024-element small-K thresholds.
+template<typename Weight, int Qi> struct SmallTraits;   // below: a format's weights apart from its product
+
 template<typename Weight, int Qi, bool SmallK>
 __launch_bounds__(WARPS * WARP, 1)
 __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
@@ -953,15 +955,38 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
                                          float* y_, int n_in, int n_out) {
     const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
-    pdl_trigger();   // PDL (pdl.hpp): launched with it where the caller allows (launch_pdl), otherwise a no-op
-    pdl_wait();
     constexpr int ROWS = SmallK ? WARPS : 1;
     constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     const int row0 = ROWS * int(blockIdx.x);
     const int blocks_per_row = n_in / 32;
     float tmp[ROWS] = {};
-    for (int kbx = tid / (Qi / 2); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+    int kbx = tid / (Qi / 2);
+    if constexpr (kPdlPrefetch) {
+        // PDL (pdl.hpp; launched with it where the caller allows, launch_pdl): the first block's weights are loaded
+        // before waiting for the activations, then that block is applied as the loop below applies it
+        // (native_mmvq_multi_kernel's SmallTraits: the same operations as small_q8_dot)
+        using F = SmallTraits<Weight, Qi>;
+        typename F::W w0[ROWS];
+        const int kqs = F::kqs(tid);
+        if (kbx < blocks_per_row) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                if (row0 + i < n_out) w0[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+        }
+        pdl_trigger();
+        pdl_wait();
+        if (kbx < blocks_per_row) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                if (row0 + i < n_out) tmp[i] += F::apply(w0[i], x + kbx, kqs);
+        }
+        kbx += BLOCKS_PER_ITER;
+    } else {
+        pdl_trigger();
+        pdl_wait();
+    }
+    for (; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
         const int kqs = 2 * (tid % (Qi / 2));
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) {
