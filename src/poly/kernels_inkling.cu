@@ -2,6 +2,8 @@
 // inkling2 graph (src/models/inkling2.cpp) and its relative positions (llama_kv_cache::set_input_relative_pos).
 // Where a kernel takes several tokens, blockIdx.y is the token unless it says otherwise.
 #include "strata/poly/kernels.hpp"
+#include "strata/kernels/pdl.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -17,6 +19,10 @@
 
 namespace strata::poly {
 namespace {
+
+using kernels::launch_pdl;
+using kernels::pdl_trigger;
+using kernels::pdl_wait;
 
 constexpr int WARP = 32;
 constexpr int MIX_THREADS = 256;   // a warp a state: MIX_STATES warps
@@ -191,47 +197,83 @@ __global__ void mix_kernel(const float* __restrict__ r, int r_stride, InkStates 
     }
 }
 
-// The same for a few tokens, spread over MIX_CHUNKS blocks a token: each block sums its part of the vectors into
-// `part` (MIX_PART floats a block); mix_out_kernel adds the parts, takes the softmax and writes its part.
+// The same for a few tokens, in one launch of MIX_CHUNKS blocks a token: each block works out the whole sums - every
+// state's sum of squares and products with the queries, as MIX_CHUNKS partial sums of n / MIX_CHUNKS values each, a
+// warp a (state, chunk), added in the chunks' order - then the softmax, and writes its chunk of the outputs.  The
+// partial sums are the ones a block a chunk would make (it was two launches, those blocks' sums through scratch into a
+// second kernel), so the result does not depend on the threads a block has.  A lane's values of a chunk are read
+// before they are summed, in its order: a loop that waited for each read took most of the time.
 constexpr int MIX_CHUNKS = 8;
 constexpr int MIX_PART = MIX_STATES * (1 + MIX_QUERIES);
+constexpr int MIX_FEW_THREADS = 1024;   // 32 warps: a state's 8 chunks over 4 of them, two each
+constexpr int MIX_LANE = 9;             // a lane's values of a chunk read ahead (n up to 2304; past it, a loop)
 
-__global__ void mix_part_kernel(const float* __restrict__ r, int r_stride, InkStates s, const float* __restrict__ query,
-                                int nq, float* __restrict__ part, int n) {
-    const float* row = r + (size_t) blockIdx.y * r_stride;
-    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
-    const int per = (n + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = min(n, i0 + per);
-    float* pp = part + ((size_t) blockIdx.y * gridDim.x + blockIdx.x) * MIX_PART;
-    if (warp >= s.n) {
-        if (warp < MIX_STATES && lane < 1 + MIX_QUERIES) pp[lane == 0 ? warp : MIX_STATES + warp * MIX_QUERIES + lane - 1] = 0.f;
-        return;
-    }
-    const float* x = row + s.off[warp];
+template <int NQ>
+__device__ __forceinline__ void mix_chunk(const float* x, const float* query, int n,
+                                          int i0, int i1, int lane, float* pp, int j) {
     float ss = 0.f, d[MIX_QUERIES] = {0.f, 0.f, 0.f, 0.f};
-    for (int i = i0 + lane; i < i1; i += WARP) {
-        const float v = x[i];
-        ss += v * v;
+    float v[MIX_LANE], qv[NQ][MIX_LANE];
 #pragma unroll
-        for (int q = 0; q < MIX_QUERIES; ++q)
-            if (q < nq) d[q] += v * query[(size_t) q * n + i];
+    for (int k = 0; k < MIX_LANE; ++k) {
+        const int i = i0 + lane + k * WARP;
+        v[k] = i < i1 ? x[i] : 0.f;
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) qv[q][k] = i < i1 ? query[(size_t) q * n + i] : 0.f;
+    }
+#pragma unroll
+    for (int k = 0; k < MIX_LANE; ++k) {
+        if (i0 + lane + k * WARP >= i1) break;
+        ss += v[k] * v[k];
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) d[q] += v[k] * qv[q][k];
+    }
+    for (int i = i0 + lane + MIX_LANE * WARP; i < i1; i += WARP) {
+        const float vi = x[i];
+        ss += vi * vi;
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) d[q] += vi * query[(size_t) q * n + i];
     }
     ss = warp_sum(ss);
 #pragma unroll
     for (int q = 0; q < MIX_QUERIES; ++q) d[q] = warp_sum(d[q]);
     if (lane == 0) {
-        pp[warp] = ss;
+        pp[j] = ss;
 #pragma unroll
-        for (int q = 0; q < MIX_QUERIES; ++q) pp[MIX_STATES + warp * MIX_QUERIES + q] = q < nq ? d[q] : 0.f;
+        for (int q = 0; q < MIX_QUERIES; ++q) pp[MIX_STATES + j * MIX_QUERIES + q] = q < NQ ? d[q] : 0.f;
     }
 }
 
-__global__ void mix_out_kernel(const float* __restrict__ r, int r_stride, InkStates s, int nq,
-                               const float* __restrict__ part, float* __restrict__ out, size_t q_stride, int n) {
+template <int NQ>
+__global__ void __launch_bounds__(MIX_FEW_THREADS)
+mix_few_kernel(const float* r, int r_stride, InkStates s, const float* query,
+               float* out, size_t q_stride, int n) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    constexpr int nq = NQ;
+    __shared__ float part[MIX_CHUNKS][MIX_PART];
     __shared__ float wsum[MIX_PART], inv[MIX_STATES], weight[MIX_QUERIES][MIX_STATES];
     const int t = blockIdx.y;
+    const float* row = r + (size_t) t * r_stride;
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP, warps = blockDim.x / WARP;
+    const int per = (n + MIX_CHUNKS - 1) / MIX_CHUNKS;
+    const int j = warp % MIX_STATES;
+    int off_j = 0;   // s.off[j], selected: indexing the parameter would copy it to local memory
+#pragma unroll
+    for (int k = 0; k < MIX_STATES; ++k)
+        if (k == j) off_j = s.off[k];
+    for (int c = warp / MIX_STATES; c < MIX_CHUNKS; c += warps / MIX_STATES) {
+        float* pp = part[c];
+        if (j >= s.n) {
+            if (lane < 1 + MIX_QUERIES) pp[lane == 0 ? j : MIX_STATES + j * MIX_QUERIES + lane - 1] = 0.f;
+            continue;
+        }
+        const int i0 = c * per;
+        mix_chunk<NQ>(row + off_j, query, n, i0, min(n, i0 + per), lane, pp, j);
+    }
+    __syncthreads();
     if (threadIdx.x < MIX_PART) {
         float v = 0.f;
-        for (int c = 0; c < (int) gridDim.x; ++c) v += part[((size_t) t * gridDim.x + c) * MIX_PART + threadIdx.x];
+        for (int c = 0; c < MIX_CHUNKS; ++c) v += part[c][threadIdx.x];
         wsum[threadIdx.x] = v;
     }
     __syncthreads();
@@ -240,40 +282,68 @@ __global__ void mix_out_kernel(const float* __restrict__ r, int r_stride, InkSta
     if (threadIdx.x < nq) {
         const int q = threadIdx.x;
         const float sc = rsqrtf((float) n);
+        // each operation rounded on its own, as in the loops over memory this was (no product fused into the
+        // subtraction of the max, nor the exponential's last product into the sum)
         float mx = -INFINITY, sc_j[MIX_STATES];
-        for (int j = 0; j < s.n; ++j) {
-            sc_j[j] = wsum[MIX_STATES + j * MIX_QUERIES + q] * inv[j] * sc;
-            mx = fmaxf(mx, sc_j[j]);
-        }
+#pragma unroll
+        for (int k = 0; k < MIX_STATES; ++k)
+            if (k < s.n) {
+                sc_j[k] = __fmul_rn(__fmul_rn(wsum[MIX_STATES + k * MIX_QUERIES + q], inv[k]), sc);
+                mx = fmaxf(mx, sc_j[k]);
+            }
         float sum = 0.f;
-        for (int j = 0; j < s.n; ++j) sum += sc_j[j] = expf(sc_j[j] - mx);
-        for (int j = 0; j < s.n; ++j) weight[q][j] = sc_j[j] / sum * inv[j];
+#pragma unroll
+        for (int k = 0; k < MIX_STATES; ++k)
+            if (k < s.n) {
+                sc_j[k] = expf(__fsub_rn(sc_j[k], mx));
+                sum = __fadd_rn(sum, sc_j[k]);
+            }
+#pragma unroll
+        for (int k = 0; k < MIX_STATES; ++k)
+            if (k < s.n) weight[q][k] = __fmul_rn(__fdiv_rn(sc_j[k], sum), inv[k]);
     }
     __syncthreads();
-    const float* row = r + (size_t) t * r_stride;
     float* o = out + (size_t) t * n;
-    const int per = (n + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = min(n, i0 + per);
+    const int i0 = blockIdx.x * per, i1 = min(n, i0 + per);
     for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
         float x[MIX_STATES];
 #pragma unroll
-        for (int j = 0; j < MIX_STATES; ++j) x[j] = j < s.n ? row[s.off[j] + i] : 0.f;
+        for (int k = 0; k < MIX_STATES; ++k) x[k] = k < s.n ? row[s.off[k] + i] : 0.f;
         for (int q = 0; q < nq; ++q) {
             float v = 0.f;
 #pragma unroll
-            for (int j = 0; j < MIX_STATES; ++j) v += j < s.n ? weight[q][j] * x[j] : 0.f;
+            for (int k = 0; k < MIX_STATES; ++k) v += k < s.n ? weight[q][k] * x[k] : 0.f;
             o[(size_t) q * q_stride + i] = v;
         }
     }
 }
 
 // ---- F32 products of a few tokens with narrow matrices (the router, the loop's controllers): a block an output
-// when its row is long, a warp an output when it is short; the weights read once for all of the call's tokens.
+// when its row is long, a warp an output when it is short; the weights read once for all of the call's tokens.  Up
+// to four products of the same shape in one launch (blockIdx.y picks which), each its own matrix, input and output.
 constexpr int GEMV_ROWS = 8;
+constexpr int GEMV_JOBS = 4;
+
+struct GemvJobs {
+    const float* w[GEMV_JOBS];
+    const float* x[GEMV_JOBS];
+    float* y[GEMV_JOBS];
+};
+
+// a[j] of a kernel parameter's array: a select, where a[j] would copy the parameters to local memory to index them
+template <class T>
+__device__ __forceinline__ T pick(const T (&a)[GEMV_JOBS], int j) {
+    return j == 0 ? a[0] : j == 1 ? a[1] : j == 2 ? a[2] : a[3];
+}
 
 template <int R>
-__global__ void gemv_wide_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
-                                 int n_in, int n_out) {
+__global__ void gemv_wide_kernel(GemvJobs jobs, int n_in, int n_out) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     __shared__ float red[R][8];
+    const float* w = pick(jobs.w, blockIdx.y);
+    const float* x = pick(jobs.x, blockIdx.y);
+    float* y = pick(jobs.y, blockIdx.y);
     const int o = blockIdx.x;
     const float* wr = w + (size_t) o * n_in;
     float acc[R];
@@ -301,13 +371,10 @@ __global__ void gemv_wide_kernel(const float* __restrict__ w, const float* __res
     }
 }
 
+// A warp's output o of R tokens: its lanes' products, then the warp's sum
 template <int R>
-__global__ void gemv_short_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
-                                  int n_in, int n_out) {
-    const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
-    if (o >= n_out) return;
-    const float* wr = w + (size_t) o * n_in;
-    float acc[R];
+__device__ __forceinline__ void gemv_short_row(const float* wr, const float* x, int n_in,
+                                               int lane, float* acc) {
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
     for (int i = lane; i < n_in; i += WARP) {
@@ -316,20 +383,109 @@ __global__ void gemv_short_kernel(const float* __restrict__ w, const float* __re
         for (int r = 0; r < R; ++r) acc[r] += wv * x[(size_t) r * n_in + i];
     }
 #pragma unroll
-    for (int r = 0; r < R; ++r) {
-        const float v = warp_sum(acc[r]);
-        if (lane == 0) y[(size_t) r * n_out + o] = v;
-    }
+    for (int r = 0; r < R; ++r) acc[r] = warp_sum(acc[r]);
 }
 
-__global__ void gate_kernel(const float* __restrict__ cur, int cur_stride, const float* __restrict__ msg,
-                            int msg_stride, const float* __restrict__ g, const float* __restrict__ f, int gf_stride,
-                            float* __restrict__ out, int n) {
+template <int R>
+__global__ void gemv_short_kernel(GemvJobs jobs, int n_in, int n_out) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    if (o >= n_out) return;
+    float acc[R];
+    const int j = blockIdx.y;
+    gemv_short_row<R>(pick(jobs.w, j) + (size_t) o * n_in, pick(jobs.x, j), n_in, lane, acc);
+    float* y = pick(jobs.y, j);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        if (lane == 0) y[(size_t) r * n_out + o] = acc[r];
+}
+
+// The loop controller's gate: out = (1 - tanh(f)) * cur + tanh(g) * msg, n values a row - with the one rounding of a
+// fused multiply-add the compiler gave the expression written out (gate_kernel's, before the gate had other callers:
+// left to the compiler, its contraction depends on the code around it)
+__device__ __forceinline__ float ctl_gate(float c, float m, float g, float f) {
+    return __fmaf_rn(1.f - tanhf(f), c, __fmul_rn(tanhf(g), m));
+}
+
+__global__ void gate_kernel(const float* cur, int cur_stride, const float* msg,
+                            int msg_stride, const float* g, const float* f, int gf_stride,
+                            float* out, int n) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const size_t t = blockIdx.y;
-    const float c = cur[t * cur_stride + i], m = msg[t * msg_stride + i];
-    out[t * n + i] = (1.f - tanhf(f[t * gf_stride + i])) * c + tanhf(g[t * gf_stride + i]) * m;
+    out[t * n + i] = ctl_gate(cur[t * cur_stride + i], msg[t * msg_stride + i], g[t * gf_stride + i], f[t * gf_stride + i]);
+}
+
+// The controller's second product (its gain then its forget rows, 2n of them, of h) and its gate in one launch: a
+// warp takes an output o's gain and forget rows as gemv_short_kernel takes a row, and gates value o of each token.
+// Up to four controllers (blockIdx.y), each its own matrix, h, cur, msg and out.
+struct GateJobs {
+    const float* w[GEMV_JOBS];
+    const float* h[GEMV_JOBS];
+    const float* cur[GEMV_JOBS];
+    const float* msg[GEMV_JOBS];
+    float* out[GEMV_JOBS];
+};
+
+template <int R>
+__global__ void gate_gemv_kernel(GateJobs jobs, int n_in, int n, int cur_stride, int msg_stride) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    if (o >= n) return;
+    const int j = blockIdx.y;
+    const float* w = pick(jobs.w, j);
+    const float* h = pick(jobs.h, j);
+    float g[R], f[R];
+    gemv_short_row<R>(w + (size_t) o * n_in, h, n_in, lane, g);
+    gemv_short_row<R>(w + (size_t) (n + o) * n_in, h, n_in, lane, f);
+    if (lane >= R) return;
+    const float* cur = pick(jobs.cur, j);
+    const float* msg = pick(jobs.msg, j);
+    float* out = pick(jobs.out, j);
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        if (r == lane) out[(size_t) r * n + o] = ctl_gate(cur[(size_t) r * cur_stride + o], msg[(size_t) r * msg_stride + o], g[r], f[r]);
+}
+
+// ---- the attention's gated output in Q8_1 for its product: acc *= sigmoid(g) (poly's mul_sigmoid_kernel, the same
+// operations) and the products' Q8_1 blocks of it (native_quantize_q8_1_kernel's: a warp a 32-value block).  That
+// kernel is built with --use_fast_math: its divisions are div.approx(.ftz), which __fdividef is here (no denormal
+// takes part in a finite block's scale or code).
+struct Q81 {
+    __half2 ds;
+    int8_t qs[32];
+};
+
+__device__ __forceinline__ void store_q8_1(float xi, Q81* y, size_t i) {
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o, WARP));
+#pragma unroll
+    for (int o = WARP / 2; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o, WARP);
+    const float d = kernels::q8_1_finite(__fdividef(amax, 127.0f));
+    int8_t q = 0;
+    if (amax != 0.0f) {
+        const float r = roundf(__fdividef(xi, d));
+        q = (int8_t) (r > 127.0f ? 127.0f : r < -127.0f ? -127.0f : r);
+    }
+    y[i / 32].qs[i % 32] = q;
+    if (i % 32 == 0) y[i / 32].ds = kernels::q8_1_ds(d, sum);
+}
+
+__global__ void mul_sigmoid_q8_kernel(float* acc, const float* g, int n, int g_stride,
+                                      Q81* yq) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;   // n is a multiple of 32: whole warps return
+    const size_t at = (size_t) blockIdx.y * n + i;
+    const float v = acc[at] * (1.0f / (1.0f + expf(-g[(size_t) blockIdx.y * g_stride + i])));
+    acc[at] = v;
+    store_q8_1(v, yq, at);
 }
 
 // ---- the queries', keys' and relative terms' clip, a warp a head
@@ -367,32 +523,46 @@ struct ClipJobs {
     ClipJob j[3];
 };
 
+// A warp's clip of one vector of dim values (clip3_kernel's job): v times its scale (null: none), scaled down to an L2
+// norm of at most limit, and where alpha > 0 times 1 + alpha * log(max(1, (p + 1) / floor)).  Its operations written
+// out as the compiler gave them, so that another kernel that clips gives the same values.
+__device__ __forceinline__ void clip_vec(float* v, const float* s, float limit, int dim, float alpha, float floor_,
+                                         int64_t p, int lane) {
+    float ss = 0.f;
+    for (int i = lane; i < dim; i += WARP) {
+        const float y = s ? __fmul_rn(v[i], s[i]) : v[i];
+        ss = __fmaf_rn(y, y, ss);
+    }
+    ss = warp_sum(ss);
+    float factor = fminf(fmaxf(limit / (sqrtf(ss) + 1e-6f), 0.f), 1.f);
+    if (alpha > 0.f) factor = __fmul_rn(factor, __fmaf_rn(alpha, logf(fmaxf((float) (p + 1) / floor_, 1.f)), 1.f));
+    for (int i = lane; i < dim; i += WARP) v[i] = __fmul_rn(s ? __fmul_rn(v[i], s[i]) : v[i], factor);
+}
+
 __global__ void clip3_kernel(ClipJobs jobs, int rows, float floor_, int64_t pos, const long long* at) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const ClipJob& J = jobs.j[blockIdx.z];
     const int head = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const int t = blockIdx.y;
     if (head >= J.heads || t >= rows) return;
-    float* v = J.x + (size_t) t * J.x_stride + (size_t) head * J.dim;
-    const float* s = J.scale ? J.scale + (size_t) head * J.dim : nullptr;
-    float ss = 0.f;
-    for (int i = lane; i < J.dim; i += WARP) {
-        const float y = s ? v[i] * s[i] : v[i];
-        ss += y * y;
-    }
-    ss = warp_sum(ss);
-    float factor = fminf(fmaxf(J.limit / (sqrtf(ss) + 1e-6f), 0.f), 1.f);
-    if (J.alpha > 0.f) {
-        const int64_t p = (at ? (int64_t) at[0] : pos) + t;
-        factor *= 1.f + J.alpha * logf(fmaxf((float) (p + 1) / floor_, 1.f));
-    }
-    for (int i = lane; i < J.dim; i += WARP) v[i] = (s ? v[i] * s[i] : v[i]) * factor;
+    clip_vec(J.x + (size_t) t * J.x_stride + (size_t) head * J.dim, J.scale ? J.scale + (size_t) head * J.dim : nullptr,
+             J.limit, J.dim, J.alpha, floor_, (at ? (int64_t) at[0] : pos) + t, lane);
 }
 
-// rms of two vectors a token (no weights) into the halves of a 2n row: the loop controller's input
-__global__ void rms2_kernel(const float* __restrict__ a, const float* __restrict__ b, float* __restrict__ out, int n,
-                            float eps) {
+// rms of two vectors a token (no weights) into the halves of a 2n row: the loop controller's input.  Up to four
+// controllers' (blockIdx.z), each its own a and b; controller j's rows from out + j * rows * 2n.
+struct Rms2Jobs {
+    const float* a[GEMV_JOBS];
+    const float* b[GEMV_JOBS];
+};
+
+__global__ void rms2_kernel(Rms2Jobs jobs, float* out_, int n, float eps) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     __shared__ float red[2][8];
-    const float* src = blockIdx.y ? b : a;
+    const float* src = blockIdx.y ? pick(jobs.b, blockIdx.z) : pick(jobs.a, blockIdx.z);
+    float* out = out_ + (size_t) blockIdx.z * gridDim.x * 2 * n;
     const float* x = src + (size_t) blockIdx.x * n;
     float ss = 0.f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
@@ -433,12 +603,12 @@ __global__ void conv_kernel(const float* __restrict__ x, const float* __restrict
     out[(size_t) t * channels + c] = (xt + acc) * scale;
 }
 
-// One token: its output and the state's advance in one thread a channel (no other thread reads the channel).
-__global__ void conv1_kernel(const float* __restrict__ x, float* __restrict__ state, const float* __restrict__ w,
-                             const float* __restrict__ dyn, int heads, float* __restrict__ out, int channels, int taps,
-                             float scale, float* __restrict__ snap) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c >= channels) return;
+// One token: its output and the state's advance in one thread a channel (no other thread reads the channel).  With
+// res, the output also goes into the residual stream there: added to it, or with push, in place of it, its value
+// before going to push (ink_conv's rows_kernel launches, the same values).
+// conv1_kernel's channel c: its output, and the state advanced (and its snapshot)
+__device__ __forceinline__ float conv1_channel(const float* x, float* state, const float* w, const float* dyn, int heads,
+                                               int channels, int taps, float scale, float* snap, int c) {
     const int keep = taps - 1;
     float* st = state + (size_t) c * keep;
     const float* wc = w + (size_t) c * taps;
@@ -452,11 +622,113 @@ __global__ void conv1_kernel(const float* __restrict__ x, float* __restrict__ st
         acc += d[0] * xt;
         for (int lag = 1; lag < taps; ++lag) acc += d[lag] * past[keep - lag];
     }
-    out[c] = (xt + acc) * scale;
+    const float o = __fmul_rn(xt + acc, scale);   // rounded as stored: no fused add of a residual after it
     for (int j = 0; j + 1 < keep; ++j) st[j] = past[j + 1];
     st[keep - 1] = xt;
     if (snap)
         for (int j = 0; j < keep; ++j) snap[(size_t) c * keep + j] = st[j];
+    return o;
+}
+
+__global__ void conv1_kernel(const float* x, float* state, const float* w,
+                             const float* dyn, int heads, float* out, int channels, int taps,
+                             float scale, float* snap, float* res, float* push) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    const float o = conv1_channel(x, state, w, dyn, heads, channels, taps, scale, snap, c);
+    out[c] = o;
+    if (push) {
+        push[c] = res[c];
+        res[c] = o;
+    } else if (res) {
+        res[c] = __fadd_rn(res[c], o);
+    }
+}
+
+// ---- one token's keys and values from their products to a Q8_0 cache (ink_kv_chain): a block a head of each side,
+// a thread a channel.  The short convolution (conv1_kernel's), then the keys' clip (clip3_kernel's: a warp's lanes
+// over the head, in its order, with no scale and no position factor) or the values' norm (head_norm_rope_kernel's
+// with no weights or rotation: the block's sum), then the store (store_q8_at_kernel's: a warp a 32-value block; the
+// block's largest magnitude is the same whatever the order).  Each the operations of the launch it stands for.
+struct KvChain {
+    InkKvSide k, v;
+};
+
+// Blocks past the keys' and values' (2 * heads): the queries' and the relative terms' clips (clip3_kernel's), a warp a
+// head, `per` blocks each.
+__global__ void __launch_bounds__(ATT_DIM)
+kv_chain_kernel(KvChain kc, int heads, int taps, float scale, float limit, float eps, int64_t pos, const long long* at,
+                int ring, InkClip cq, InkClip cr, int per, float floor_) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    if ((int) blockIdx.x >= 2 * heads) {
+        const int b = (int) blockIdx.x - 2 * heads;
+        const bool r = b >= per;
+        const int head = (r ? b - per : b) * (ATT_DIM / WARP) + (int) threadIdx.x / WARP;
+        const int dim = r ? cr.dim : cq.dim;
+        if (head >= (r ? cr.heads : cq.heads)) return;
+        const float* sc = r ? cr.scale : cq.scale;
+        clip_vec((r ? cr.x : cq.x) + (size_t) head * dim, sc ? sc + (size_t) head * dim : nullptr, r ? cr.limit : cq.limit,
+                 dim, r ? cr.alpha : cq.alpha, floor_, at ? (int64_t) at[0] : pos, (int) threadIdx.x % WARP);
+        return;
+    }
+    __shared__ float sh[ATT_DIM], part[ATT_DIM / WARP], fac;
+    const bool vs = (int) blockIdx.x >= heads;
+    const int channels = heads * ATT_DIM, c = (vs ? (int) blockIdx.x - heads : (int) blockIdx.x) * ATT_DIM + threadIdx.x;
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    InkKvSide S;   // the block's side, a field at a time (a reference into the parameters would copy them)
+    S.x = vs ? kc.v.x : kc.k.x;
+    S.state = vs ? kc.v.state : kc.k.state;
+    S.w = vs ? kc.v.w : kc.k.w;
+    S.dyn = vs ? kc.v.dyn : kc.k.dyn;
+    S.out = vs ? kc.v.out : kc.k.out;
+    S.fin = vs ? kc.v.fin : kc.k.fin;
+    S.codes = vs ? kc.v.codes : kc.k.codes;
+    S.scales = vs ? kc.v.scales : kc.k.scales;
+    S.snap = vs ? kc.v.snap : kc.k.snap;
+    const float o = conv1_channel(S.x, S.state, S.w, S.dyn, heads, channels, taps, scale, S.snap, c);
+    float y;
+    if (!vs) {   // the keys' clip: the head's L2 norm as clip3_kernel's warp sums it
+        sh[threadIdx.x] = o;
+        __syncthreads();
+        if (warp == 0) {
+            float ss = 0.f;
+            for (int i = lane; i < ATT_DIM; i += WARP) {
+                const float v = sh[i];
+                ss += v * v;
+            }
+            ss = warp_sum(ss);
+            if (lane == 0) fac = fminf(fmaxf(limit / (sqrtf(ss) + 1e-6f), 0.f), 1.f);
+        }
+        __syncthreads();
+        y = o * fac;
+    } else {     // the values' norm: head_norm_rope_kernel's block_sum of a value a thread
+        S.out[c] = o;
+        float ss = 0.0f;
+        ss += o * o;
+        ss = warp_sum(ss);
+        if (lane == 0) part[warp] = ss;
+        __syncthreads();
+        float sum = 0.0f;
+        for (int k = 0; k < ATT_DIM / WARP; ++k) sum += part[k];
+        // the division by a constant power of two is a product here, which must not fuse with the add of eps
+        y = o * (1.0f / sqrtf(__fadd_rn(__fdiv_rn(sum, (float) ATT_DIM), eps)));
+    }
+    S.fin[c] = y;
+    // the store: row (at ? at[0] : pos), modulo ring where ring > 0
+    const long long p = at ? *at : (long long) pos;
+    const long long row = ring > 0 ? p % ring : p;
+    float amax = fabsf(y);
+#pragma unroll
+    for (int o2 = WARP / 2; o2 > 0; o2 >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o2, WARP));
+    const float d = amax / 127.0f;
+    const float id = d > 0.f ? 1.0f / d : 0.0f;
+    if (lane == 0) S.scales[(size_t) row * (channels / 32) + c / 32] = __half_as_ushort(__float2half(d));
+    float q = rintf(y * id);
+    q = fminf(fmaxf(q, -127.0f), 127.0f);
+    S.codes[(size_t) row * channels + c] = (int8_t) q;
 }
 
 __global__ void conv_state_kernel(const float* __restrict__ x, float* __restrict__ state, int channels, int taps,
@@ -1602,8 +1874,20 @@ __global__ void store_q4_kernel(const float* __restrict__ x, uint8_t* __restrict
     if (i % 32 == 0) scales[v0 / 32] = __half_as_ushort(__float2half_rn(d));
 }
 
-__global__ void rows_kernel(const float* __restrict__ src, int src_stride, float* __restrict__ dst, int dst_stride,
+// ink_copies(): each element through the copies in their order (a later one may read what an earlier one wrote)
+__global__ void copies_kernel(RowCopies c, int count, int stride, int n) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const size_t at = (size_t) blockIdx.y * stride + i;
+    for (int k = 0; k < count; ++k) c.dst[k][at] = c.src[k][at];
+}
+
+__global__ void rows_kernel(const float* src, int src_stride, float* dst, int dst_stride,
                             int n, bool add) {
+    pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
+    pdl_wait();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float v = src[(size_t) blockIdx.y * src_stride + i];
@@ -1720,17 +2004,23 @@ int attend_splits(int rows, int kv_heads, int64_t span) {
 
 }  // namespace
 
-size_t ink_mix_floats(int rows) { return (size_t) std::min(rows, MIX_FEW) * MIX_CHUNKS * MIX_PART; }
-
 void ink_mix(const float* r, int r_stride, const InkStates& s, const float* query, int nq, float* out,
-             size_t q_stride, int n_embd, int rows, void* stream, float* scratch) {
+             size_t q_stride, int n_embd, int rows, void* stream) {
     if (rows <= 0) return;
     if (s.n < 1 || s.n > MIX_STATES || nq < 1 || nq > MIX_QUERIES)
         throw std::invalid_argument("ink_mix: 1 to 8 states and 1 to 4 queries");
-    if (scratch && rows <= MIX_FEW) {   // a few tokens: MIX_CHUNKS blocks each
+    if (rows <= MIX_FEW) {   // a few tokens: MIX_CHUNKS blocks each
         const dim3 g(MIX_CHUNKS, rows);
-        mix_part_kernel<<<g, MIX_THREADS, 0, cs(stream)>>>(r, r_stride, s, query, nq, scratch, n_embd);
-        mix_out_kernel<<<g, MIX_THREADS, 0, cs(stream)>>>(r, r_stride, s, nq, scratch, out, q_stride, n_embd);
+        const auto few = [&](auto k) {
+            launch_pdl(mix_few_kernel<decltype(k)::value>, dim3(g), dim3(MIX_FEW_THREADS), 0, cs(stream), r, r_stride, s, query, out,
+                                                                                    q_stride, n_embd);
+        };
+        switch (nq) {
+        case 1: few(std::integral_constant<int, 1>{}); break;
+        case 2: few(std::integral_constant<int, 2>{}); break;
+        case 3: few(std::integral_constant<int, 3>{}); break;
+        default: few(std::integral_constant<int, 4>{}); break;
+        }
         ck("ink_mix");
         return;
     }
@@ -1741,7 +2031,7 @@ void ink_mix(const float* r, int r_stride, const InkStates& s, const float* quer
 void ink_gate(const float* cur, int cur_stride, const float* msg, int msg_stride, const float* g, const float* f,
               int gf_stride, float* out, int n, int rows, void* stream) {
     if (rows <= 0) return;
-    gate_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(cur, cur_stride, msg, msg_stride, g, f, gf_stride,
+    launch_pdl(gate_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), cur, cur_stride, msg, msg_stride, g, f, gf_stride,
                                                                   out, n);
 }
 
@@ -1762,12 +2052,20 @@ void ink_clip3(float* x0, int s0, const float* sc0, float lim0, int dim0, int he
                    {x2, sc2, lim2, alpha2, s2, dim2, heads2}}};
     const int heads = std::max({heads0, heads1, heads2});
     constexpr int per = 4;
-    clip3_kernel<<<dim3(grid(heads, per), rows, 3), per * WARP, 0, cs(stream)>>>(jobs, rows, floor_, pos, at);
+    launch_pdl(clip3_kernel, dim3(dim3(grid(heads, per), rows, 3)), dim3(per * WARP), 0, cs(stream), jobs, rows, floor_, pos, at);
 }
 
 void ink_rms2(const float* a, const float* b, float* out, int n, int rows, float eps, void* stream) {
+    ink_rms2_jobs(&a, &b, 1, out, n, rows, eps, stream);
+}
+
+void ink_rms2_jobs(const float* const* a, const float* const* b, int jobs, float* out, int n, int rows, float eps,
+                   void* stream) {
     if (rows <= 0) return;
-    rms2_kernel<<<dim3(rows, 2), 256, 0, cs(stream)>>>(a, b, out, n, eps);
+    if (jobs < 1 || jobs > GEMV_JOBS) throw std::invalid_argument("ink_rms2_jobs: 1 to 4 controllers");
+    Rms2Jobs J{};
+    for (int j = 0; j < jobs; ++j) J.a[j] = a[j], J.b[j] = b[j];
+    launch_pdl(rms2_kernel, dim3(dim3(rows, 2, jobs)), dim3(256), 0, cs(stream), J, out, n, eps);
 }
 
 void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
@@ -1786,20 +2084,42 @@ void ink_set_offsets(long long* dst, const long long* v, int n, void* stream) {
 }
 
 void ink_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* out, int channels,
-              int taps, int rows, float scale, void* stream, float* snap, size_t stride, unsigned snaps, int x_stride) {
+              int taps, int rows, float scale, void* stream, float* snap, size_t stride, unsigned snaps, int x_stride,
+              float* res, int res_stride, float* push) {
     const int xs = x_stride > 0 ? x_stride : channels;
     if (rows <= 0) return;
     if (taps < 2 || taps > 8) throw std::invalid_argument("ink_conv: 2 to 8 taps");
     if (dyn && (heads < 1 || channels % heads != 0)) throw std::invalid_argument("ink_conv: heads do not divide the channels");
     if (out == x) throw std::invalid_argument("ink_conv: out must not be x");
+    if (push && !res) throw std::invalid_argument("ink_conv: push without res");
     if (rows == 1) {
-        conv1_kernel<<<grid(channels, 128), 128, 0, cs(stream)>>>(x, state, w, dyn, heads, out, channels, taps, scale,
-                                                                  snap && (snaps & 1u) ? snap : nullptr);
+        launch_pdl(conv1_kernel, dim3(grid(channels, 128)), dim3(128), 0, cs(stream), x, state, w, dyn, heads, out, channels, taps, scale,
+                                                                  snap && (snaps & 1u) ? snap : nullptr, res, push);
         return;
     }
     conv_kernel<<<dim3(grid(channels, 128), rows), 128, 0, cs(stream)>>>(x, state, w, dyn, heads, out, channels, taps,
                                                                          rows, scale, xs);
     conv_state_kernel<<<grid(channels, 128), 128, 0, cs(stream)>>>(x, state, channels, taps, rows, snap, stride, snaps, xs);
+    if (!res) return;
+    if (push) ink_rows(res, res_stride, push, res_stride, channels, rows, false, stream);
+    ink_rows(out, channels, res, res_stride, channels, rows, !push, stream);
+}
+
+void ink_kv_chain(const InkKvSide& k, const InkKvSide& v, int kv_heads, int dim, int taps, float conv_scale,
+                  float k_limit, float v_eps, int64_t pos, const long long* at, int ring, const InkClip& q,
+                  const InkClip& rel, float floor_, void* stream) {
+    if (dim != ATT_DIM) throw std::invalid_argument("ink_kv_chain: heads of 128 values only");
+    if (taps < 2 || taps > 8) throw std::invalid_argument("ink_kv_chain: 2 to 8 taps");
+    const int per = grid(std::max(q.heads, rel.heads), ATT_DIM / WARP);
+    launch_pdl(kv_chain_kernel, dim3(2 * kv_heads + 2 * per), dim3(ATT_DIM), 0, cs(stream), KvChain{k, v}, kv_heads,
+               taps, conv_scale, k_limit, v_eps, pos, at, ring, q, rel, per, floor_);
+    ck("ink_kv_chain");
+}
+
+void ink_copies(const RowCopies& c, int count, int stride, int n, int rows, void* stream) {
+    if (rows <= 0 || count <= 0) return;
+    if (count > 8) throw std::invalid_argument("ink_copies: at most 8 copies");
+    launch_pdl(copies_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), c, count, stride, n);
 }
 
 size_t ink_attend_floats(int rows, int heads, int max_ctx) {
@@ -2039,31 +2359,68 @@ void ink_hadamard(float* x, int stride, int n, int rows, int block, void* stream
     ck("ink_hadamard");
 }
 
-bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream) {
-    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0) return false;
-    const cudaStream_t st = cs(stream);
-    const auto go = [&](auto rr) {
-        constexpr int R = decltype(rr)::value;
-        if (n_in >= 512) gemv_wide_kernel<R><<<n_out, 256, 0, st>>>(w, x, y, n_in, n_out);
-        else gemv_short_kernel<R><<<grid(n_out, 8), 8 * WARP, 0, st>>>(w, x, y, n_in, n_out);
-    };
+namespace {
+// f(std::integral_constant<int, rows>) for 1 to 8 rows
+template <class F>
+void by_rows(int rows, F&& f) {
     switch (rows) {
-    case 1: go(std::integral_constant<int, 1>{}); break;
-    case 2: go(std::integral_constant<int, 2>{}); break;
-    case 3: go(std::integral_constant<int, 3>{}); break;
-    case 4: go(std::integral_constant<int, 4>{}); break;
-    case 5: go(std::integral_constant<int, 5>{}); break;
-    case 6: go(std::integral_constant<int, 6>{}); break;
-    case 7: go(std::integral_constant<int, 7>{}); break;
-    default: go(std::integral_constant<int, 8>{}); break;
+    case 1: f(std::integral_constant<int, 1>{}); break;
+    case 2: f(std::integral_constant<int, 2>{}); break;
+    case 3: f(std::integral_constant<int, 3>{}); break;
+    case 4: f(std::integral_constant<int, 4>{}); break;
+    case 5: f(std::integral_constant<int, 5>{}); break;
+    case 6: f(std::integral_constant<int, 6>{}); break;
+    case 7: f(std::integral_constant<int, 7>{}); break;
+    default: f(std::integral_constant<int, 8>{}); break;
     }
+}
+}  // namespace
+
+bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream) {
+    return ink_gemv_f32_jobs(&w, &x, &y, 1, n_in, n_out, rows, stream);
+}
+
+bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out,
+                       int rows, void* stream) {
+    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || jobs < 1 || jobs > GEMV_JOBS) return false;
+    GemvJobs J{};
+    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.x[j] = x[j], J.y[j] = y[j];
+    const cudaStream_t st = cs(stream);
+    by_rows(rows, [&](auto rr) {
+        constexpr int R = decltype(rr)::value;
+        if (n_in >= 512) launch_pdl(gemv_wide_kernel<R>, dim3(dim3(n_out, jobs)), dim3(256), 0, st, J, n_in, n_out);
+        else launch_pdl(gemv_short_kernel<R>, dim3(dim3(grid(n_out, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n_out);
+    });
     ck("ink_gemv_f32");
     return true;
 }
 
+bool ink_gate_gemv(const float* const* w, const float* const* h, const float* const* cur, int cur_stride,
+                   const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
+                   void* stream) {
+    // gemv_short_kernel's shape only: below it, the product is gemv_wide_kernel's and the sums are others
+    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || n_in >= 512 || jobs < 1 || jobs > GEMV_JOBS) return false;
+    GateJobs J{};
+    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.h[j] = h[j], J.cur[j] = cur[j], J.msg[j] = msg[j], J.out[j] = out[j];
+    const cudaStream_t st = cs(stream);
+    by_rows(rows, [&](auto rr) {
+        constexpr int R = decltype(rr)::value;
+        launch_pdl(gate_gemv_kernel<R>, dim3(dim3(grid(n, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n, cur_stride, msg_stride);
+    });
+    ck("ink_gate_gemv");
+    return true;
+}
+
+void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream) {
+    if (rows <= 0) return;
+    if (n % 32 != 0) throw std::invalid_argument("ink_mul_sigmoid_q8: n must be a multiple of 32");
+    launch_pdl(mul_sigmoid_q8_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), acc, g, n, g_stride, (Q81*) y_q8_1);
+    ck("ink_mul_sigmoid_q8");
+}
+
 void ink_rows(const float* src, int src_stride, float* dst, int dst_stride, int n, int rows, bool add, void* stream) {
     if (rows <= 0) return;
-    rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(src, src_stride, dst, dst_stride, n, add);
+    launch_pdl(rows_kernel, dim3(dim3(grid(n, 256), rows)), dim3(256), 0, cs(stream), src, src_stride, dst, dst_stride, n, add);
 }
 
 size_t ink_shortlist_floats(int rows) { return (size_t) rows * HEAD_CHUNKS; }

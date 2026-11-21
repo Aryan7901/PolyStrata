@@ -181,6 +181,8 @@ struct Layer {
     std::vector<void*> heads;          ///< up to the router
     std::vector<void*> shared;         ///< the shared expert
     std::vector<void*> tail;           ///< after the experts
+    std::vector<void*> tail_heads;     ///< the tail and the next layer's head as one (Engine::merge_heads()): by the
+                                       ///< call's tokens and the next layer's Engine::head_key()
     std::vector<void*> card_moe;       ///< the routed experts, routed on the card (moe_card())
     /// the head of step()'s rows in one call (Engine::batch_heads()): by the rows, their sequences and head keys
     std::map<std::vector<int>, void*> rows_heads;
@@ -503,6 +505,12 @@ protected:
     /// state and attention rows from its own sequence (rows_of_, seq_state(), seq_buf()), its position from at_.
     /// Otherwise step() runs the head a row at a time, with the row's sequence bound.
     virtual bool batch_heads() const { return false; }
+    /// record() lets the recorded kernels that opt in (launch_pdl, pdl.hpp) start while the kernel before them
+    /// finishes: each waits for what it reads.  The architecture says whether its launches are all ready for it.
+    virtual bool pdl_graphs() const { return false; }
+    /// run() records a layer's tail and the next layer's head as one, where both are recorded: the card goes on to
+    /// the next layer without waiting for this thread to launch its head.  The head is a sequence's (Seq).
+    virtual bool merge_heads() const { return false; }
     /// The architecture's step() rows leave the recurrent state after a row at Row::snap (step() with guesses).
     virtual bool rows_snaps() const { return false; }
     /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
@@ -807,6 +815,7 @@ protected:
         std::vector<Buf> bufs;
         std::vector<Image> images;
         std::vector<std::vector<void*>> heads;   ///< Layer::heads, by layer
+        std::vector<std::vector<void*>> tail_heads;   ///< Layer::tail_heads, by layer
         std::map<std::vector<int>, void*> passes;
         void* tail = nullptr;
         // A sequence's own fp16 twin of its int8 caches (Gemma 4's --kv int8), and the halves of it that have

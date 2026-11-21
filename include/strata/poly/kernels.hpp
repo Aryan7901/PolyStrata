@@ -437,14 +437,19 @@ struct InkStates {
 /// Attention over the depth for `rows` tokens, each a row of r_stride floats in r: the states (n_embd values each,
 /// at s.off) RMS-normed without weights (eps 1e-6), weighed for each of nq queries (query: nq vectors of n_embd)
 /// by the softmax of their products over the root of n_embd, and summed.  Query q's sum of token t goes to
-/// out + q * q_stride + t * n_embd.  nq is at most 4.
-/// scratch: ink_mix_floats(rows) floats, which a call of a few tokens spreads its sums over (null: a block a token).
-size_t ink_mix_floats(int rows);
+/// out + q * q_stride + t * n_embd.  nq is at most 4.  A query's sums are the same whatever nq is.
 void ink_mix(const float* r, int r_stride, const InkStates& s, const float* query, int nq, float* out,
-             size_t q_stride, int n_embd, int rows, void* stream, float* scratch = nullptr);
+             size_t q_stride, int n_embd, int rows, void* stream);
 /// dst[t] = src[t] (or dst[t] += src[t] with `add`) for `rows` vectors of n values, src_stride and dst_stride
 /// floats from one token's to the next's.
 void ink_rows(const float* src, int src_stride, float* dst, int dst_stride, int n, int rows, bool add, void* stream);
+/// Up to 8 copies of `rows` rows of n values in one launch, dst[k][t] = src[k][t] for each k in order (a copy may read
+/// what one before it wrote), every row `stride` floats from the one before.
+struct RowCopies {
+    const float* src[8];
+    float* dst[8];
+};
+void ink_copies(const RowCopies& c, int count, int stride, int n, int rows, void* stream);
 /// The loop's message controller after its products: out = (1 - tanh(f)) * cur + tanh(g) * msg, n values a row;
 /// cur, msg and g / f start their rows cur_stride, msg_stride and gf_stride floats apart.
 void ink_gate(const float* cur, int cur_stride, const float* msg, int msg_stride, const float* g, const float* f,
@@ -461,15 +466,50 @@ void ink_clip3(float* x0, int s0, const float* sc0, float lim0, int dim0, int he
                const long long* at, void* stream);
 /// out[t] = [rms(a[t]); rms(b[t])] (no weights), 2n values a token.
 void ink_rms2(const float* a, const float* b, float* out, int n, int rows, float eps, void* stream);
+/// Up to 4 ink_rms2()s in one launch: job j's (a[j], b[j]) into out + j * rows * 2n.
+void ink_rms2_jobs(const float* const* a, const float* const* b, int jobs, float* out, int n, int rows, float eps,
+                   void* stream);
 /// The causal short convolution of taps values (at most 8) a channel with its residual, for `rows` tokens of
 /// `channels` values: out = (x + sum_k w[k] x[t - taps + 1 + k] + dynamic) * scale, w as ggml's ssm_conv takes it
 /// (taps values a channel, the oldest first).  dyn, when not null: taps values a head (heads equal parts of the
 /// channels) a token, dyn[lag] times the input lag tokens back.  state: taps - 1 past inputs a channel, the oldest
 /// first, advanced by the rows.  out must not be x.
 /// snap, stride, snaps: as conv4_silu's - the state after each token whose bit is set, in order, stride floats apart.
+/// res (null: none): the output also goes into the residual stream's rows there (res_stride floats apart): added to
+/// them, or with push, in place of them, their values before going to push (the same stride).
 void ink_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* out, int channels,
               int taps, int rows, float scale, void* stream, float* snap = nullptr, size_t stride = 0,
-              unsigned snaps = 0, int x_stride = 0);   ///< x_stride: floats from a token's x to the next (0: channels)
+              unsigned snaps = 0, int x_stride = 0,   ///< x_stride: floats from a token's x to the next (0: channels)
+              float* res = nullptr, int res_stride = 0, float* push = nullptr);
+/// One side (keys or values) of ink_kv_chain(): ink_conv()'s x, state, w, dyn and out (out unused for the keys), what
+/// goes to the cache (fin: the keys clipped, the values normed), the Q8_0 cache's codes and scales (store_q8_at()'s
+/// layout), and the state's snapshot after the token (null: none).
+struct InkKvSide {
+    const float* x;
+    float* state;
+    const float* w;
+    const float* dyn;
+    float* out;
+    float* fin;
+    int8_t* codes;
+    uint16_t* scales;
+    float* snap;
+};
+/// One token's ink_clip() of `heads` vectors of dim values at x, in place (ink_kv_chain()'s queries and relative terms).
+struct InkClip {
+    float* x;
+    const float* scale;
+    float limit, alpha;
+    int dim, heads;
+};
+/// One token's keys and values from their products to a Q8_0 cache in one launch: what ink_conv() of each side (one
+/// row), ink_clip()'s of the keys (no scale, limit k_limit, no position factor), head_norm_rope() of the values (no
+/// weights, no rotation, v_eps) and store_q8_at() of both (row at[0], or pos without at; modulo ring where ring > 0)
+/// give, the same operations; and the clips of q and rel (heads 0: none) with position at[0] or pos and floor_, as
+/// ink_clip3() makes them.  kv_heads heads of dim (128) values a side.
+void ink_kv_chain(const InkKvSide& k, const InkKvSide& v, int kv_heads, int dim, int taps, float conv_scale,
+                  float k_limit, float v_eps, int64_t pos, const long long* at, int ring, const InkClip& q,
+                  const InkClip& rel, float floor_, void* stream);
 /// ink_conv for rows of different sequences, a token each: row t's state is at state + off[t] floats (off on the card).
 void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
                    int heads, float* out, int channels, int taps, int rows, float scale, void* stream);
@@ -506,6 +546,17 @@ void ink_hadamard(float* x, int stride, int n, int rows, int block, void* stream
 /// y = w x for 1 to 8 tokens of an F32 matrix (n_out rows of n_in, n_in a multiple of 4); false (nothing done) for
 /// other shapes.  For narrow matrices, where the general gemv gives too few blocks.
 bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream);
+/// Up to 4 ink_gemv_f32()s of one shape in one launch, job j's w[j] x[j] into y[j]: each the same sums as alone.
+bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out,
+                       int rows, void* stream);
+/// The loop's message controllers after their first product, up to 4 in one launch: job j's g and f = w[j] h[j] (w:
+/// 2n rows of n_in, gain then forget; h: n_in values a row), then out[j] = ink_gate()'s (1 - tanh(f)) * cur[j] +
+/// tanh(g) * msg[j] (n values a row; cur and msg rows cur_stride and msg_stride apart; out n apart; out may be cur).
+/// The products' sums are ink_gemv_f32()'s; false (nothing done) where its kernel for the shape is another (n_in of
+/// 512 or more) or for more than 8 rows.
+bool ink_gate_gemv(const float* const* w, const float* const* h, const float* const* cur, int cur_stride,
+                   const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
+                   void* stream);
 /// For each of `rows` rows of approximate logits (n of them, stride apart): the indices within `margin` of the row's
 /// largest into ids (cap a row; more are left out) and how many matched into count[row] (it may pass cap).
 /// scratch: ink_shortlist_floats(rows) floats.
@@ -515,6 +566,9 @@ void ink_shortlist(const float* approx, int n, int stride, float margin, int* id
 /// logits[row][ids[k]] = the Q8_0 matrix w's row ids[k] times h[row] (n_embd values), for k below count[row] and cap.
 void ink_rescore_q8(const void* w, const float* h, int n_embd, const int* ids, const int* count, int cap,
                     float* logits, int stride, int rows, void* stream);
+/// mul_sigmoid(acc, g, n, rows, g_stride, false) and native_quantize_q8_1() of acc into y_q8_1 in one launch, the same
+/// bytes in both.  n a multiple of 32.
+void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream);
 /// x[r][i] = -inf for i in [from, n) of `rows` rows of n values: a padded vocabulary's tail.
 void ink_fill_tail(float* x, int from, int n, int rows, void* stream);
 

@@ -20,6 +20,7 @@
 #include "strata/gpu/metal.hpp"
 #endif
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/pdl.hpp"
 #include "strata/platform/memory.hpp"
 
 #include "ggml.h"
@@ -1040,13 +1041,13 @@ void Engine::metal_invalidate_graphs() {
     for (void* g : graphs_) ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "invalidating Metal graphs");
     graphs_.clear();
     for (Layer& l : layers_) {
-        l.heads.clear(); l.shared.clear(); l.tail.clear(); l.card_moe.clear(); l.rows_heads.clear();
+        l.heads.clear(); l.shared.clear(); l.tail.clear(); l.tail_heads.clear(); l.card_moe.clear(); l.rows_heads.clear();
         l.card = -1;
     }
     passes_.clear();
     tail_ = nullptr;
     for (Seq& q : seqs_) {
-        q.heads.clear(); q.passes.clear(); q.tail = nullptr;
+        q.heads.clear(); q.tail_heads.clear(); q.passes.clear(); q.tail = nullptr;
     }
     recorded_ = false;
     // Force the next GPU-routed call to upload fresh expert addresses, including indirect dependencies.
@@ -1235,6 +1236,8 @@ void Engine::park_bound() {
     q.images = std::exchange(images_, {});
     q.heads.resize(layers_.size());
     for (size_t il = 0; il < layers_.size(); ++il) q.heads[il] = std::exchange(layers_[il].heads, {});
+    q.tail_heads.resize(layers_.size());
+    for (size_t il = 0; il < layers_.size(); ++il) q.tail_heads[il] = std::exchange(layers_[il].tail_heads, {});
     q.passes = std::exchange(passes_, {});
     q.tail = std::exchange(tail_, nullptr);
     // The fp16 twin of the int8 caches is the sequence's too (Gemma 4's --kv int8).
@@ -1259,6 +1262,8 @@ void Engine::take_bound(int s) {
     images_ = std::exchange(q.images, {});
     ++images_set_;
     for (size_t il = 0; il < layers_.size() && il < q.heads.size(); ++il) layers_[il].heads = std::exchange(q.heads[il], {});
+    for (size_t il = 0; il < layers_.size(); ++il)
+        layers_[il].tail_heads = il < q.tail_heads.size() ? std::exchange(q.tail_heads[il], {}) : std::vector<void*>{};
     passes_ = std::exchange(q.passes, {});
     tail_ = std::exchange(q.tail, nullptr);
     // The fp16 twin of the int8 caches (Gemma 4's --kv int8) comes back with the sequence it belongs to.
@@ -4944,14 +4949,19 @@ void* Engine::record(F&& work) {
     cudaGraph_t g = nullptr;
     ck(cudaStreamBeginCapture(cs(st_), cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
     recording_ = recorded_ = true;
+    bool& pdl = kernels::pdl_scope();
+    const bool pdl_was = pdl;
+    pdl = pdl_graphs();
     try {
         work();
     } catch (...) {
+        pdl = pdl_was;
         recording_ = false;
         if (cudaStreamEndCapture(cs(st_), &g) == cudaSuccess && g) cudaGraphDestroy(g);
         cudaGetLastError();   // a capture the failure broke does not end cleanly: the work's exception says why
         throw;
     }
+    pdl = pdl_was;
     recording_ = false;
     ck(cudaStreamEndCapture(cs(st_), &g), "cudaStreamEndCapture");
     cudaGraphExec_t exec = nullptr;
@@ -5177,14 +5187,34 @@ void Engine::run(const int32_t* tokens, int n) {
         for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += has_moe(layers_[(size_t) il]) ? n * n_used_ : 0;
         return;
     }
+    // merge_heads(): a layer's tail and the next layer's head one recording, launched once the experts' sum is in;
+    // up() then goes on past the head
+    const bool merge = replay && merge_heads();
+    bool headed = false;   // this layer's head ran in the recording before, with the layer before's tail
     for (int il = lo_; il < hi_; ++il) {
         Layer& L = layers_[(size_t) il];
-        up(il, n, (size_t) n - 1);
+        if (!headed) {
+            up(il, n, (size_t) n - 1);
+        } else if (has_moe(L) && !batched(layers_[(size_t) ex(il)], n)) {
+            ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
+            replayed(L.shared, (size_t) n - 1, [&] { moe_shared(L, il, n); });
+        }
+        headed = false;
         if (!has_moe(L)) continue;
         Layer& X = layers_[(size_t) ex(il)];
         if (batched(X, n)) moe_rows(X, ex(il), n);
         else if (!on_card(il, n, (size_t) n - 1) && moe(X, ex(il), n)) moe_add(n);
-        tail(il, n, (size_t) n - 1);
+        Layer* N = il + 1 < hi_ ? &layers_[(size_t) il + 1] : nullptr;
+        if (merge && N && L.fixed && N->fixed) {
+            const size_t key = (size_t) head_key(il + 1, n) * recs + (size_t) n - 1;
+            replayed(L.tail_heads, key, [&] {
+                layer_tail(L, il, n);
+                layer_head(*N, il + 1, n);
+            });
+            headed = true;
+        } else {
+            tail(il, n, (size_t) n - 1);
+        }
     }
 }
 

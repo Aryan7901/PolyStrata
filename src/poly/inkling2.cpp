@@ -77,6 +77,35 @@ Dev Inkling2::fused(int il, std::initializer_list<const char*> names, int64_t n_
     return d;
 }
 
+// The loop's message queries (loop_res_query, loop_kv_res_query: two rows a run of the core each) as one table, a
+// later pass's four rows together - (q, experts) then (k, v) - so that one mix of the bank takes all four.
+Dev Inkling2::msg_queries() {
+    const TensorInfo* tq = gg_->find("loop_res_query.weight");
+    const TensorInfo* tkv = gg_->find("loop_kv_res_query.weight");
+    const int64_t rows = 2 * (core_end_ - core_start_);
+    for (const TensorInfo* t : {tq, tkv})
+        if (!t || t->type != kTypeF32 || (int64_t) t->shape[0] != n_embd_ || (int64_t) (t->elements() / n_embd_) != rows)
+            throw std::runtime_error("unsupported model: loop_res_query / loop_kv_res_query are not F32 [n_embd, " +
+                                     std::to_string(rows) + "]");
+    const size_t row = (size_t) n_embd_ * sizeof(float), bytes = 2 * (size_t) rows * row;
+    const Dev d{dense_ ? dense_ + dense_at_ : nullptr, kTypeF32, n_embd_, (int) (2 * rows)};
+    dense_at_ += pad(bytes) + kTail;
+    if (!dense_) return d;
+    if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for the loop's message queries");
+    const uint8_t* q = (const uint8_t*) home(*tq).data(*tq);
+    const uint8_t* kv = (const uint8_t*) home(*tkv).data(*tkv);
+    uploaded_.emplace_back(q, home(*tq).payload(*tq));
+    uploaded_.emplace_back(kv, home(*tkv).payload(*tkv));
+    std::vector<uint8_t> h(bytes);
+    for (int64_t p = 0; p < rows; p += 2) {
+        uint8_t* dst = h.data() + (size_t) (2 * p) * row;
+        std::memcpy(dst, q + (size_t) p * row, 2 * row);
+        std::memcpy(dst + 2 * row, kv + (size_t) p * row, 2 * row);
+    }
+    h2d(d.p, h.data(), bytes);
+    return d;
+}
+
 Inkling2::~Inkling2() {
     if (head_host_) cudaFreeHost(head_host_);
     if (igpu_) set_igpu(nullptr);
@@ -300,12 +329,7 @@ void Inkling2::load_layer(int il) {
         }
         tok_norm_ = upload(gg_->find("token_embd_norm.weight"), "token_embd_norm.weight", n_embd_, 1, kF32);
         out_query_ = upload(gg_->find("output_res_query.weight"), "output_res_query.weight", n_embd_, 1, kF32);
-        if (passes_ > 1) {
-            const int rows = 2 * (core_end_ - core_start_);
-            loop_query_ = upload(gg_->find("loop_res_query.weight"), "loop_res_query.weight", n_embd_, rows, kF32);
-            loop_kv_query_ =
-                upload(gg_->find("loop_kv_res_query.weight"), "loop_kv_res_query.weight", n_embd_, rows, kF32);
-        }
+        if (passes_ > 1) msg_query_ = msg_queries();
     }
     if (B.twin) {
         // a later pass of the loop: its first run's weights, and its own caches, state and plan
@@ -501,10 +525,12 @@ void Inkling2::alloc_caches() {
 void Inkling2::assign_scratch() {
     const size_t n = (size_t) rows_, e = (size_t) n_embd_, hq = (size_t) n_head_ * dim_, kvw = (size_t) n_kv_ * dim_;
     mix_ = fbuf(3 * n * e);
-    msg_a_ = fbuf(2 * n * e);
-    msg_b_ = fbuf(2 * n * e);
-    ctl_ = fbuf(2 * n * e);
-    ctl_h_ = fbuf(n * (size_t) std::max(gate_rank_, 1));
+    msg_ = fbuf(4 * n * e);
+    // a controller's rows, or the three controllers' of a call of a few tokens (control3): no more scratch than one
+    // controller's of a prompt batch, which the expert cache would give up
+    const size_t ctl_rows = std::max(n, 3 * (size_t) std::min(rows_, kStageRows - 1));
+    ctl_ = fbuf(2 * ctl_rows * e);
+    ctl_h_ = fbuf(ctl_rows * (size_t) std::max(gate_rank_, 1));
     ctl_g_ = fbuf(2 * n * e);   // gain then forget, a token's 2 * n_embd together
     xin_ = fbuf(3 * n * e);
     q_ = fbuf(n * (2 * hq + (size_t) n_head_ * n_rel_ + 2 * kvw));   // a token's q, gate, rel (and k, v: wall)
@@ -513,7 +539,7 @@ void Inkling2::assign_scratch() {
     k_ = fbuf(n * kvw);
     vraw_ = fbuf(n * kvw);
     v_ = fbuf(n * kvw);
-    dyn_ = fbuf(n * (size_t) taps_ * n_kv_);
+    dyn_ = fbuf(2 * n * (size_t) taps_ * n_kv_);   // the keys' taps, then the values
     att_ = fbuf(n * hq);
     part_ = fbuf(ink_attend_floats(rows_, n_head_, opt_.max_context));
     tmp_ = fbuf(n * e);
@@ -525,7 +551,9 @@ void Inkling2::assign_scratch() {
         const char* hc = std::getenv("INK_HEAD_CHECK");
         if (hc && std::atoi(hc) == 1) head_exact_ = (float*) dmalloc(r * (size_t) n_vocab_ * sizeof(float), "head check");
     }
-    mixp_ = fbuf(ink_mix_floats(rows_));
+    // the attention's three inputs in Q8_1, then its gated output (fewer values a token than the three inputs), for a
+    // call of fewer than kStageRows tokens (layer_head)
+    xq3_ = fbuf(3 * (size_t) std::min(rows_, kStageRows - 1) * kernels::native_q8_1_bytes(n_embd_) / sizeof(float));
     if (!row_off_) row_off_ = (long long*) dmalloc(8 * sizeof(long long), "the step's state offsets");
 }
 
@@ -534,8 +562,56 @@ void Inkling2::assign_scratch() {
 void Inkling2::control(Block& B, int m, float* x, const float* msg, int n) {
     ink_rms2(x, msg, ctl_, n_embd_, n, kMixEps, st_);
     lin_f32(B.loop_down[m], ctl_, ctl_h_, n);
-    lin_f32(B.loop_gf[m], ctl_h_, ctl_g_, n);
+    // G h, F h and the gate in one launch, where the product would be ink_gemv_f32's (lin_f32)
+    const Dev& gf = B.loop_gf[m];
+    const float* w = fp(gf);
+    const float* h = ctl_h_;
+    const float* cur = x;
+    if (gf.type == kTypeF32 && gf.scale == 1.0f && n < kStageRows &&
+        ink_gate_gemv(&w, &h, &cur, n_embd_, &msg, n_embd_, &x, 1, gf.n_in, n_embd_, n, st_))
+        return;
+    lin_f32(gf, ctl_h_, ctl_g_, n);
     ink_gate(x, n_embd_, msg, n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, x, n_embd_, n, st_);
+}
+
+// The attention's three controllers (q, k and v: modules 0 to 2), out[j] from x[j] and msg[j] as control() makes it
+// in place: each step of the three in one launch where the products are ink_gemv_f32's (a few tokens), the same sums.
+void Inkling2::control3(Block& B, float* const* x, const float* const* msg, float* const* out, int n) {
+    const size_t e = (size_t) n_embd_, rank = (size_t) std::max(gate_rank_, 1);
+    bool jobs = n < kStageRows;
+    for (int j = 0; j < 3; ++j)
+        for (const Dev* d : {&B.loop_down[j], &B.loop_gf[j]})
+            jobs = jobs && d->type == kTypeF32 && d->scale == 1.0f;
+    if (!jobs) {   // a prompt batch: control()'s launches each, into out[j]
+        for (int j = 0; j < 3; ++j) {
+            ink_rms2(x[j], msg[j], ctl_, n_embd_, n, kMixEps, st_);
+            lin_f32(B.loop_down[j], ctl_, ctl_h_, n);
+            lin_f32(B.loop_gf[j], ctl_h_, ctl_g_, n);
+            ink_gate(x[j], n_embd_, msg[j], n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, out[j], n_embd_, n, st_);
+        }
+        return;
+    }
+    const float* xs[3] = {x[0], x[1], x[2]};
+    const float* down[3];
+    const float* gf[3];
+    const float* c[3];
+    const float* hc[3];
+    float* h[3];
+    for (int j = 0; j < 3; ++j) {
+        down[j] = fp(B.loop_down[j]);
+        gf[j] = fp(B.loop_gf[j]);
+        c[j] = ctl_ + (size_t) j * n * 2 * e;
+        h[j] = ctl_h_ + (size_t) j * n * rank;
+        hc[j] = h[j];
+    }
+    ink_rms2_jobs(xs, msg, 3, ctl_, n_embd_, n, kMixEps, st_);
+    if (!ink_gemv_f32_jobs(down, c, h, 3, B.loop_down[0].n_in, B.loop_down[0].n_out, n, st_))
+        for (int j = 0; j < 3; ++j) lin_f32(B.loop_down[j], c[j], h[j], n);
+    if (ink_gate_gemv(gf, hc, xs, n_embd_, msg, n_embd_, out, 3, B.loop_gf[0].n_in, n_embd_, n, st_)) return;
+    for (int j = 0; j < 3; ++j) {
+        lin_f32(B.loop_gf[j], h[j], ctl_g_, n);
+        ink_gate(x[j], n_embd_, msg[j], n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, out[j], n_embd_, n, st_);
+    }
 }
 
 // A run from its input to its router's copy.  r_ holds a token's streams; slot 0 is the residual.
@@ -549,7 +625,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         for (int i = 0; i < n; ++i) off[i] = (long long) (seq_state(rows_of_[i].seq, state_) - state_);
         ink_set_offsets(row_off_, off, n, st_);
     }
-    if (il == 0) {   // the token's embedding, normed; a picture's rows go in as the encoder made them (llama.cpp
+    if (il == 0 && n == 1 && (images_.empty() || rows_of_ || !image_at(pos_))) {   // a token: normed where it is
+        rms_norm(cur, fp(tok_norm_), cur, n_embd_, 1, rms_eps_, st_);
+    } else if (il == 0) {   // the token's embedding, normed; a picture's rows go in as the encoder made them (llama.cpp
                      // norms only tokens).  Row t is at pos_ + t here: a batch with a picture's rows is not replayed
                      // from a recording, and step()'s rows (rows_of_) are tokens an answer writes
         ink_rows(cur, rs, tmp_, n_embd_, n_embd_, n, false, st_);
@@ -570,46 +648,56 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         }
     }
     if (B.restart) {   // a later pass: the pass before's blocks to the bank, and the stream from the loop's start
-        for (const auto& [from, to] : bank_)
-            ink_rows(r_ + (size_t) from * n_embd_, rs, r_ + (size_t) to * n_embd_, rs, n_embd_, n, false, st_);
-        ink_rows(cur, rs, r_ + (size_t) bank_last_ * n_embd_, rs, n_embd_, n, false, st_);
-        ink_rows(r_ + (size_t) prelude_ * n_embd_, rs, cur, rs, n_embd_, n, false, st_);
+        RowCopies c{};
+        int k = 0;
+        const auto copy = [&](int from, int to) {
+            if (k == 8) {
+                ink_copies(c, k, rs, n_embd_, n, st_);
+                k = 0;
+            }
+            c.src[k] = r_ + (size_t) from * n_embd_;
+            c.dst[k++] = r_ + (size_t) to * n_embd_;
+        };
+        for (const auto& [from, to] : bank_) copy(from, to);
+        copy(cur_, bank_last_);
+        copy(prelude_, cur_);
+        ink_copies(c, k, rs, n_embd_, n, st_);
     }
     const bool msgs = B.pass > 0;
-    if (msgs) {   // the messages: (q, experts) and (k, v)
-        ink_mix(r_, rs, bank_states_, fp(loop_query_) + (size_t) B.msg_row * n_embd_, 2, msg_a_, plane, n_embd_, n,
-                st_, mixp_);
-        ink_mix(r_, rs, bank_states_, fp(loop_kv_query_) + (size_t) B.msg_row * n_embd_, 2, msg_b_, plane, n_embd_,
-                n, st_, mixp_);
-    }
+    // the messages, four planes of msg_: (q, experts), then (k, v) - one mix of the bank with four queries
+    float* const msg_b = msg_ + 2 * plane;
+    if (msgs) ink_mix(r_, rs, bank_states_, fp(msg_query_) + (size_t) 2 * B.msg_row * n_embd_, 4, msg_, plane, n_embd_, n, st_);
     // the attention's inputs: a window run reads one mix of the depth, a full run one each for q, k and v
     float* in[3];
     const int nq = B.swa ? 1 : 3;
-    if (B.attn_mix.n > 0) ink_mix(r_, rs, B.attn_mix, fp(B.attn_query), nq, mix_, plane, n_embd_, n, st_, mixp_);
+    if (B.attn_mix.n > 0) ink_mix(r_, rs, B.attn_mix, fp(B.attn_query), nq, mix_, plane, n_embd_, n, st_);
     else ink_rows(cur, rs, mix_, n_embd_, n_embd_, n, false, st_);
     for (int j = 0; j < 3; ++j) in[j] = mix_ + (size_t) (B.attn_mix.n > 0 && !B.swa ? j : 0) * plane;
-    if (msgs) {
-        if (B.swa || B.attn_mix.n == 0) {   // the messages differ by input: three of them
-            ink_rows(mix_, n_embd_, mix_ + plane, n_embd_, n_embd_, n, false, st_);
-            ink_rows(mix_, n_embd_, mix_ + 2 * plane, n_embd_, n_embd_, n, false, st_);
-            for (int j = 0; j < 3; ++j) in[j] = mix_ + (size_t) j * plane;
-        }
-        const float* m[3] = {msg_a_, msg_b_, msg_b_ + plane};
-        for (int j = 0; j < 3; ++j) control(B, j, in[j], m[j], n);
+    if (msgs) {   // the messages differ by input: three inputs, from the one mix of a window run, into xin_
+        const float* m[3] = {msg_, msg_b, msg_b + plane};
+        float* out[3];
+        for (int j = 0; j < 3; ++j) out[j] = xin_ + (size_t) j * plane;
+        control3(B, in, m, out, n);
+        for (int j = 0; j < 3; ++j) in[j] = out[j];   // their norms below are in place
     }
     float* xq = xin_;
     float* xk = xin_ + plane;
     float* xv = xin_ + 2 * plane;
-    if (B.swa && !msgs) {
-        rms_norm(in[0], fp(L.attn_norm), xq, n_embd_, n, rms_eps_, st_);
-        xk = xv = xq;
-    } else if (B.swa) {
-        for (int j = 0; j < 3; ++j) rms_norm(in[j], fp(L.attn_norm), xin_ + (size_t) j * plane, n_embd_, n, rms_eps_, st_);
+    // the inputs' norms (a window run's one input, or q, k and v) in one launch, which for a few tokens also
+    // quantizes them for the products: the bytes lin() would make of them
+    const bool one = B.swa && !msgs;
+    const int planes = one ? 1 : 3;
+    const float* nw[3];
+    for (int j = 0; j < 3; ++j) nw[j] = fp(B.swa ? L.attn_norm : j == 0 ? B.q_norm : j == 1 ? B.k_norm : B.v_norm);
+    const void* xq8[3] = {nullptr, nullptr, nullptr};
+    if (n < kStageRows) {
+        kernels::native_rms_norm_q8_1_planes(in, nw, planes, xin_, xq3_, n_embd_, n, rms_eps_, sum_threads(n_embd_), st_);
+        const size_t qp = (size_t) n * kernels::native_q8_1_bytes(n_embd_);
+        for (int j = 0; j < 3; ++j) xq8[j] = (const uint8_t*) xq3_ + (size_t) (one ? 0 : j) * qp;
     } else {
-        rms_norm(in[0], fp(B.q_norm), xq, n_embd_, n, rms_eps_, st_);
-        rms_norm(in[1], fp(B.k_norm), xk, n_embd_, n, rms_eps_, st_);
-        rms_norm(in[2], fp(B.v_norm), xv, n_embd_, n, rms_eps_, st_);
+        for (int j = 0; j < planes; ++j) rms_norm(in[j], nw[j], xin_ + (size_t) j * plane, n_embd_, n, rms_eps_, st_);
     }
+    if (one) xk = xv = xq;
     dbg("attn_in", il, xq, n_embd_);
 
     // self-attention
@@ -624,14 +712,14 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         float* gate = q_ + hq;
         float* rel = q_ + 2 * hq;
         if (all) {
-            lin(B.wall, xq, q_, n);
+            lin(B.wall, xq, q_, n, xq8[0]);
         } else if (B.wqgr.n_out > 0) {
-            lin(B.wqgr, xq, q_, n);
+            lin(B.wqgr, xq, q_, n, xq8[0]);
         } else {
             const Dev* part[3] = {&B.wq, &B.wgate, &B.wrel};
             const int at_col[3] = {0, hq, 2 * hq};
             for (int j = 0; j < 3; ++j) {   // att_ is free until the attention writes it
-                lin(*part[j], xq, att_, n);
+                lin(*part[j], xq, att_, n, xq8[0]);
                 ink_rows(att_, part[j]->n_out, q_ + at_col[j], qgr, part[j]->n_out, n, false, st_);
             }
         }
@@ -639,32 +727,58 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
         const float* kin = all ? q_ + (2 * hq + n_head_ * n_rel_) : kraw_;
         const float* vin = all ? kin + kvw : vraw_;
         const int kv_stride = all ? qgr : kvw;
-        if (!all) lin(B.wk, xk, kraw_, n);
-        if (!B.swa) lin(B.kconv_proj, xk, dyn_, n);
         const bool rows = rows_of_ != nullptr;   // step(): each row a sequence of its own, with its own state
-        if (rows) ink_conv_rows(kin, kv_stride, B.state, row_off_, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw,
-                                taps_, n, B.swa ? conv_s : conv_d, st_);
-        else ink_conv(kin, B.state, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw, taps_, n,
-                 B.swa ? conv_s : conv_d, st_, snap_bits_ ? snap_at_ + (B.state - state_) : nullptr, rec_n_, snap_bits_,
-                 kv_stride);
-        if (!all) lin(B.wv, xv, vraw_, n);
-        if (!B.swa) lin(B.vconv_proj, xv, dyn_, n);
-        if (rows) ink_conv_rows(vin, kv_stride, B.state + keep * kvw, row_off_, fp(B.v_conv), B.swa ? nullptr : dyn_,
-                                n_kv_, v_, kvw, taps_, n, B.swa ? conv_s : conv_d, st_);
-        else ink_conv(vin, B.state + keep * kvw, fp(B.v_conv), B.swa ? nullptr : dyn_, n_kv_, v_, kvw, taps_, n,
-                 B.swa ? conv_s : conv_d, st_, snap_bits_ ? snap_at_ + (B.state + keep * kvw - state_) : nullptr, rec_n_, snap_bits_,
-                 kv_stride);
-        // q, k and the relative terms clipped (q and r scaled by the position on the full runs), v normed
-        const float alpha = B.swa ? 0.f : log_alpha_;
-        if (rows)   // a row's position is its own: at_ holds one a row
+        // INK_KV_SIM=v4|v4r|k4v4r|k4r (a quality experiment, with --no-graphs): the rows a 4-bit cache would give
+        // back, unrotated or rotated as llama.cpp rotates them (V in blocks of 64, K by the head), into the Q8_0 store
+        static const std::string kv_sim = std::getenv("INK_KV_SIM") ? std::getenv("INK_KV_SIM") : "";
+        // a token's keys and values from their products into a Q8_0 cache in one launch (ink_kv_chain): their
+        // convolutions, the keys' clip, the values' norm and the stores
+        const bool chain = n == 1 && !rows && q8() && v4() == 0 && kv_sim.empty();
+        const float alpha = B.swa ? 0.f : log_alpha_;   // the queries' and relative terms' position factor
+        float* const dyn_v = dyn_ + (size_t) n * taps_ * n_kv_;   // the values' taps beside the keys'
+        if (!all) lin(B.wk, xk, kraw_, n, xq8[1]);
+        if (!B.swa) lin(B.kconv_proj, xk, dyn_, n);
+        if (rows) {
+            ink_conv_rows(kin, kv_stride, B.state, row_off_, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw,
+                          taps_, n, B.swa ? conv_s : conv_d, st_);
+        } else if (!chain) {
+            ink_conv(kin, B.state, fp(B.k_conv), B.swa ? nullptr : dyn_, n_kv_, k_, kvw, taps_, n,
+                     B.swa ? conv_s : conv_d, st_, snap_bits_ ? snap_at_ + (B.state - state_) : nullptr, rec_n_,
+                     snap_bits_, kv_stride);
+        }
+        if (!all) lin(B.wv, xv, vraw_, n, xq8[2]);
+        if (!B.swa) lin(B.vconv_proj, xv, dyn_v, n);
+        if (chain) {
+            const float* kdyn = B.swa ? nullptr : dyn_;
+            const float* vdyn = B.swa ? nullptr : dyn_v;
+            float* ks = snap_bits_ & 1u ? snap_at_ + (B.state - state_) : nullptr;
+            float* vs = snap_bits_ & 1u ? snap_at_ + (B.state + keep * kvw - state_) : nullptr;
+            const InkKvSide ksd{kin, B.state, fp(B.k_conv), kdyn, k_, k_, B.k_codes, B.k_sc, ks};
+            const InkKvSide vsd{vin, B.state + keep * kvw, fp(B.v_conv), vdyn, v_, vraw_, B.v_codes, B.v_sc, vs};
+            const InkClip cq{q_, fp(B.q_clip), qk_clip_, alpha, dim_, n_head_};
+            const InkClip cr{rel, fp(B.rel_clip), rel_clip_, alpha, n_rel_, n_head_};
+            ink_kv_chain(ksd, vsd, n_kv_, dim_, taps_, B.swa ? conv_s : conv_d, qk_clip_, rms_eps_, pos_, at,
+                         B.swa ? ring_ : 0, cq, cr, log_floor_, st_);
+        } else if (rows) {
+            ink_conv_rows(vin, kv_stride, B.state + keep * kvw, row_off_, fp(B.v_conv), B.swa ? nullptr : dyn_v,
+                          n_kv_, v_, kvw, taps_, n, B.swa ? conv_s : conv_d, st_);
+        } else {
+            ink_conv(vin, B.state + keep * kvw, fp(B.v_conv), B.swa ? nullptr : dyn_v, n_kv_, v_, kvw, taps_, n,
+                     B.swa ? conv_s : conv_d, st_,
+                     snap_bits_ ? snap_at_ + (B.state + keep * kvw - state_) : nullptr, rec_n_, snap_bits_, kv_stride);
+        }
+        // q, k and the relative terms clipped (q and r scaled by the position on the full runs), v normed: the
+        // chain's are already
+        if (rows) {   // a row's position is its own: at_ holds one a row
             for (int i = 0; i < n; ++i)
                 ink_clip3(q_ + (size_t) i * qgr, qgr, fp(B.q_clip), qk_clip_, dim_, n_head_, alpha, k_ + (size_t) i * kvw,
                           kvw, nullptr, qk_clip_, dim_, n_kv_, 0.f, rel + (size_t) i * qgr, qgr, fp(B.rel_clip),
                           rel_clip_, n_rel_, n_head_, alpha, 1, log_floor_, rows_of_[i].pos, at_ + 2 * i, st_);
-        else
+        } else if (!chain) {
             ink_clip3(q_, qgr, fp(B.q_clip), qk_clip_, dim_, n_head_, alpha, k_, kvw, nullptr, qk_clip_, dim_, n_kv_, 0.f,
                       rel, qgr, fp(B.rel_clip), rel_clip_, n_rel_, n_head_, alpha, n, log_floor_, pos_, at, st_);
-        head_norm_rope(v_, dim_, nullptr, vraw_, dim_, n_kv_, 0, 1.f, pos_, n, rms_eps_, st_);
+        }
+        if (!chain) head_norm_rope(v_, dim_, nullptr, vraw_, dim_, n_kv_, 0, 1.f, pos_, n, rms_eps_, st_);
         const float* k = k_;
         const int ring = B.swa ? ring_ : 0;
         // INK_KV4_CHECK=1 (k8v4 or k4v4, with --no-graphs): the same attention over Q8_0 caches of the rows
@@ -710,12 +824,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                            sized, ks, vs, v4());
             }
         }
-        // INK_KV_SIM=v4|v4r|k4v4r|k4r (a quality experiment, with --no-graphs): the rows a 4-bit cache would give
-        // back, unrotated or rotated as llama.cpp rotates them (V in blocks of 64, K by the head), into the Q8_0 store
-        static const std::string kv_sim = std::getenv("INK_KV_SIM") ? std::getenv("INK_KV_SIM") : "";
         static float* sim_buf = nullptr;
         static size_t sim_n = 0;
-        for (int side = 0; side < 2 && q8() && !rows; ++side) {
+        for (int side = 0; side < 2 && q8() && !rows && !chain; ++side) {
             const float* x = side ? vraw_ : k;
             if (!kv_sim.empty() && !v4() && kv_sim.find(side ? "v4" : "k4") != std::string::npos) {
                 const size_t need = (size_t) n * kvw;
@@ -763,26 +874,34 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                    1.f / std::sqrt((float) dim_), pos_, n, B.swa ? window_ : 0, ring, st_, at, room_rows,
                    q8() ? B.k_sc : nullptr, q8() ? B.v_sc : nullptr, v4());
         if (kv4_check) kv4_compare(B, il, n);
-        mul_sigmoid(att_, gate, hq, n, qgr, false, st_);
-        lin(B.wo, att_, tmp_, n);
-        if (rows) ink_conv_rows(tmp_, n_embd_, B.state + 2 * keep * kvw, row_off_, fp(B.attn_conv), nullptr, 1, ao_, n_embd_,
-                                taps_, n, conv_s, st_);
-        else ink_conv(tmp_, B.state + 2 * keep * kvw, fp(B.attn_conv), nullptr, 1, ao_, n_embd_, taps_, n, conv_s, st_, snap_bits_ ? snap_at_ + (B.state + 2 * keep * kvw - state_) : nullptr, rec_n_, snap_bits_);
+        if (n < kStageRows) {   // the gate, and the Q8_1 blocks of the product's input, in one launch
+            ink_mul_sigmoid_q8(att_, gate, hq, n, qgr, xq3_, st_);
+            lin(B.wo, att_, tmp_, n, xq3_);
+        } else {
+            mul_sigmoid(att_, gate, hq, n, qgr, false, st_);
+            lin(B.wo, att_, tmp_, n);
+        }
+        // into the residual: the first run of a block keeps the stream as a block and starts again from the
+        // attention's output, the others add it
+        float* push = B.push >= 0 ? r_ + (size_t) B.push * n_embd_ : nullptr;
+        if (rows) {
+            ink_conv_rows(tmp_, n_embd_, B.state + 2 * keep * kvw, row_off_, fp(B.attn_conv), nullptr, 1, ao_, n_embd_,
+                          taps_, n, conv_s, st_);
+            if (push) ink_rows(cur, rs, push, rs, n_embd_, n, false, st_);
+            ink_rows(ao_, n_embd_, cur, rs, n_embd_, n, !push, st_);
+        } else {
+            ink_conv(tmp_, B.state + 2 * keep * kvw, fp(B.attn_conv), nullptr, 1, ao_, n_embd_, taps_, n, conv_s, st_,
+                     snap_bits_ ? snap_at_ + (B.state + 2 * keep * kvw - state_) : nullptr, rec_n_, snap_bits_, 0, cur,
+                     rs, push);
+        }
     }
     dbg("attn", il, ao_, n_embd_);
 
-    // the residual: the first run of a block keeps the stream as a block and starts again from the attention
-    if (B.push >= 0) {
-        ink_rows(cur, rs, r_ + (size_t) B.push * n_embd_, rs, n_embd_, n, false, st_);
-        ink_rows(ao_, n_embd_, cur, rs, n_embd_, n, false, st_);
-    } else {
-        ink_rows(ao_, n_embd_, cur, rs, n_embd_, n, true, st_);
-    }
     // the experts' input
-    ink_mix(r_, rs, B.ffn_mix, fp(B.ffn_query), 1, mix_, plane, n_embd_, n, st_, mixp_);
-    if (msgs) control(B, 3, mix_, msg_a_ + plane, n);
-    rms_norm(mix_, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
-    kernels::native_quantize_q8_1(xn_, xq_, n * n_embd_, 1, st_);
+    ink_mix(r_, rs, B.ffn_mix, fp(B.ffn_query), 1, mix_, plane, n_embd_, n, st_);
+    if (msgs) control(B, 3, mix_, msg_ + plane, n);
+    kernels::native_add_rms_norm_q8_1(mix_, nullptr, fp(L.ffn_norm), xn_, xq_, n_embd_, n, rms_eps_,
+                                      sum_threads(n_embd_), st_);
     dbg("ffn_in", il, xn_, n_embd_);
     Layer& X = layers_[(size_t) ex(il)];   // the experts' layer: this one, or the loop's first run of it
     if (!batched(X, n)) moe_router(X, n);
@@ -878,20 +997,26 @@ void Inkling2::kv4_compare(const Block& B, int il, int n) {
 void Inkling2::layer_tail(Layer&, int il, int n) {
     Block& B = blocks_[(size_t) il];
     const size_t keep = (size_t) (taps_ - 1), kvw = (size_t) n_kv_ * dim_;
-    if (stepping_ > 0)   // step(): each row its sequence's state, from the offsets its head left (row_off_)
+    float* cur = r_ + (size_t) cur_ * n_embd_;
+    const int rs = n_streams_ * n_embd_;
+    if (stepping_ > 0) {   // step(): each row its sequence's state, from the offsets its head left (row_off_)
         ink_conv_rows(fo_, n_embd_, B.state + keep * (2 * kvw + n_embd_), row_off_, fp(B.ffn_conv), nullptr, 1, tmp_,
                       n_embd_, taps_, n, 1.f / std::sqrt((float) (taps_ + 1)), st_);
-    else ink_conv(fo_, B.state + keep * (2 * kvw + n_embd_), fp(B.ffn_conv), nullptr, 1, tmp_, n_embd_, taps_, n,
-             1.f / std::sqrt((float) (taps_ + 1)), st_, snap_bits_ ? snap_at_ + (B.state + keep * (2 * kvw + n_embd_) - state_) : nullptr, rec_n_, snap_bits_);
+        ink_rows(tmp_, n_embd_, cur, rs, n_embd_, n, true, st_);
+    } else {   // its output added to the residual as it is written
+        ink_conv(fo_, B.state + keep * (2 * kvw + n_embd_), fp(B.ffn_conv), nullptr, 1, tmp_, n_embd_, taps_, n,
+                 1.f / std::sqrt((float) (taps_ + 1)), st_,
+                 snap_bits_ ? snap_at_ + (B.state + keep * (2 * kvw + n_embd_) - state_) : nullptr, rec_n_, snap_bits_,
+                 0, cur, rs);
+    }
     dbg("ffn", il, tmp_, n_embd_);
-    ink_rows(tmp_, n_embd_, r_ + (size_t) cur_ * n_embd_, n_streams_ * n_embd_, n_embd_, n, true, st_);
 }
 
 // The output reads the blocks and the stream through its own query over the depth, then its norm.
 void Inkling2::output_rows(int first, int rows, float* h) {
     const int rs = n_streams_ * n_embd_;
     ink_mix(r_ + (size_t) first * rs, rs, out_mix_, fp(out_query_), 1, tmp_, (size_t) rows * n_embd_, n_embd_, rows,
-            st_, mixp_);
+            st_);
     rms_norm(tmp_, fp(out_norm_), h, n_embd_, rows, rms_eps_, st_);
 }
 
@@ -1044,6 +1169,34 @@ void Inkling2::router_scores(const Layer& L, int n) { lin_f32(L.gate_inp, xn_, r
 
 void Inkling2::moe_shared(const Layer&, int, int n) {
     ck(cudaMemsetAsync(fo_, 0, (size_t) n * n_embd_ * sizeof(float), cs(st_)), "experts");
+}
+
+// The recorded layers' launches with programmatic dependent launch (pdl.hpp) on sm_90+: every kernel of Inkling's
+// that is launched with launch_pdl waits (pdl_wait) before it reads or writes anything; the attention's kernels are
+// launched as before.  INK_PDL=0 turns it off.
+bool Inkling2::pdl_graphs() const {
+    static const bool on = [] {
+        const char* e = std::getenv("INK_PDL");
+        if (e && std::atoi(e) == 0) return false;
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess ||
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            return false;
+        }
+        return major >= 9;
+    }();
+    return on;
+}
+
+// A layer's tail (the experts' sum's convolution into the residual) and the next layer's head recorded as one: the
+// card goes on to the next layer as soon as the experts' sum is in.  INK_MERGE=0 turns it off.
+bool Inkling2::merge_heads() const {
+    static const bool on = [] {
+        const char* e = std::getenv("INK_MERGE");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
 }
 
 int Inkling2::head_key(int il, int n) const { return blocks_[(size_t) il].swa ? 0 : room_key(n); }

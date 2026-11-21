@@ -2136,7 +2136,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
 
     add_executable(poly_gdn_mma_test src/poly/gdn_mma_test.cu src/poly/kernels.cu)
     target_include_directories(poly_gdn_mma_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(poly_gdn_mma_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+    target_link_libraries(poly_gdn_mma_test PRIVATE strata_kernels strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
     add_test(NAME poly_gdn_mma_test COMMAND poly_gdn_mma_test)
     set_tests_properties(poly_gdn_mma_test PROPERTIES SKIP_RETURN_CODE 77)
     # Optional model/state check; run by hand with an MTP GGUF and frozen prompt IDs.
@@ -2188,9 +2188,9 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_route_test src/poly/route_test.cu src/poly/kernels.cu)
   target_include_directories(poly_route_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                     ${_strata_gpu_include_directories})
-  target_link_libraries(poly_route_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_route_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # the fused residual sum, RMS norm and Q8_1 quantization against the three launches; needs a card, run by hand
-  add_executable(poly_norm_q8_test src/poly/norm_q8_test.cu src/poly/kernels.cu)
+  add_executable(poly_norm_q8_test src/poly/norm_q8_test.cu src/poly/kernels.cu src/poly/kernels_inkling.cu)
   target_include_directories(poly_norm_q8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                       ${_strata_gpu_include_directories})
   target_link_libraries(poly_norm_q8_test PRIVATE strata_kernels ${_strata_gpu_blas_target}
@@ -2199,16 +2199,16 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_gemm_small_test src/poly/gemm_small_test.cu src/poly/kernels.cu)
   target_include_directories(poly_gemm_small_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                          ${_strata_gpu_include_directories})
-  target_link_libraries(poly_gemm_small_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_gemm_small_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # attend()'s blocks of rows against its other kernels and itself; needs a card, so it is run by hand
   add_executable(poly_attend_test src/poly/attend_test.cu src/poly/kernels.cu)
   target_include_directories(poly_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                      ${_strata_gpu_include_directories})
-  target_link_libraries(poly_attend_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_attend_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   add_executable(poly_hip_value_split_test src/poly/hip_value_split_test.cu src/poly/kernels.cu)
   target_include_directories(poly_hip_value_split_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                             ${_strata_gpu_include_directories})
-  target_link_libraries(poly_hip_value_split_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_hip_value_split_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   add_test(NAME poly_hip_value_split_test COMMAND poly_hip_value_split_test)
   set_tests_properties(poly_hip_value_split_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
   # STRATA_HIP_SPLIT_ATTEND (heads of 256 over a q8_0 cache): against an FP64 reference and the old kernels, the position on the card, the
@@ -2216,20 +2216,20 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_hip_split_attend_test src/poly/hip_split_attend_test.cu src/poly/kernels.cu)
   target_include_directories(poly_hip_split_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                             ${_strata_gpu_include_directories})
-  target_link_libraries(poly_hip_split_attend_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_hip_split_attend_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   add_test(NAME poly_hip_split_attend_test COMMAND poly_hip_split_attend_test)
   set_tests_properties(poly_hip_split_attend_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # attend_batch() against attend() with Flint's heads, sinks and window ring; needs a card
   add_executable(poly_sink_attend_test src/poly/sink_attend_test.cu src/poly/kernels.cu)
   target_include_directories(poly_sink_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                           ${_strata_gpu_include_directories})
-  target_link_libraries(poly_sink_attend_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_sink_attend_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # STRATA_HIP_PREFILL_FP32 (attend_batch() on FP32 inputs over a q8_0 cache): against an FP64 reference and the default path, and the
   # fallbacks; needs a card (77 = skipped)
   add_executable(poly_hip_prefill_fp32_test src/poly/hip_prefill_fp32_test.cu src/poly/kernels.cu)
   target_include_directories(poly_hip_prefill_fp32_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                             ${_strata_gpu_include_directories})
-  target_link_libraries(poly_hip_prefill_fp32_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_hip_prefill_fp32_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   add_test(NAME poly_hip_prefill_fp32_test COMMAND poly_hip_prefill_fp32_test)
   set_tests_properties(poly_hip_prefill_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # fattn_q8() and fattn_f16() (llama.cpp's flash-attention kernel) against attend_batch(), and with `dec` fdec_q8()
@@ -2237,7 +2237,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_fattn_test src/poly/fattn_test.cu src/poly/kernels.cu)
   target_include_directories(poly_fattn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/poly
                                                     ${_strata_gpu_include_directories})
-  target_link_libraries(poly_fattn_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_fattn_test PRIVATE strata_kernels strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # STRATA_POLY_STAGED_TILES: the staged experts in size classes, each a launch of its own tile width, against one
   # launch, bit for bit; needs a card
   add_executable(poly_mmq_tiles_test src/poly/mmq_tiles_test.cu)
@@ -2250,12 +2250,12 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(poly_shortconv_test src/poly/shortconv_test.cu src/poly/kernels.cu)
   target_include_directories(poly_shortconv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                         ${_strata_gpu_include_directories})
-  target_link_libraries(poly_shortconv_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_shortconv_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # DeepSeek V4's kernels against the same arithmetic on the host; needs a card, so it is run by hand
   add_executable(poly_dsv4_test src/poly/dsv4_test.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu)
   target_include_directories(poly_dsv4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                    ${_strata_gpu_include_directories})
-  target_link_libraries(poly_dsv4_test PRIVATE ${_strata_gpu_runtime_target})
+  target_link_libraries(poly_dsv4_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   # the pool of the CPU experts, without a model
   add_executable(poly_workers_test src/poly/workers_test.cpp src/poly/cpu_experts.cpp)
   target_include_directories(poly_workers_test PRIVATE ${_strata_gg}/include)
@@ -2271,7 +2271,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     add_executable(poly_kv_q8_test src/poly/kv_q8_test.cpp src/poly/kernels.cu)
     target_include_directories(poly_kv_q8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                        ${_strata_gpu_include_directories})
-    target_link_libraries(poly_kv_q8_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
+    target_link_libraries(poly_kv_q8_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                                   Threads::Threads)
     add_test(NAME poly_kv_q8_test COMMAND poly_kv_q8_test)
   endif()
@@ -2282,7 +2282,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     add_executable(poly_kv_int8_test src/poly/kv_int8_test.cpp src/poly/kernels.cu)
     target_include_directories(poly_kv_int8_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                       ${_strata_gpu_include_directories} ${_strata_gg}/include)
-    target_link_libraries(poly_kv_int8_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
+    target_link_libraries(poly_kv_int8_test PRIVATE strata_kernels ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                                   ggml-cpu ggml-base Threads::Threads)
     add_test(NAME poly_kv_int8_test COMMAND poly_kv_int8_test)
   endif()
