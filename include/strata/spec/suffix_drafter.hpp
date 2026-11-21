@@ -19,6 +19,7 @@ namespace strata::spec {
 class SuffixDrafter {
 public:
     static constexpr int WAYS = 4;
+    static constexpr int GRAM = 8;   ///< the longer index's n-gram (STRATA_SUFFIX_GRAM8=0 turns it off)
 
     explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19);
 
@@ -47,12 +48,15 @@ private:
         uint8_t n = 0;
     };
     Slot* find_slot(uint64_t key, bool insert);
+    Slot* find_slot_in(std::vector<Slot>& t, size_t mask, uint64_t key, bool insert);
     uint64_t key_at(size_t end) const;
+    uint64_t key8_at(size_t end) const;
 
     int min_match_, max_match_;
     std::vector<int32_t> hist_;
-    std::vector<Slot> table_;
+    std::vector<Slot> table_, table8_;   // trigram index; and the 8-gram's, which common trigrams cannot flood
     size_t mask_ = 0;
+    bool gram8_ = true;
     int last_match_ = 0;
 };
 

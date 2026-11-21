@@ -128,6 +128,21 @@ void unit_tests() {
         check(d.propose(3, out) == 0, "propose after propose_after");
         check(d.propose_after(nullptr, 0, 3, out) == d.propose(3, out), "propose_after with no drafts == propose");
     }
+    if (!std::getenv("STRATA_SUFFIX_GRAM8") || std::atoi(std::getenv("STRATA_SUFFIX_GRAM8")) != 0) {
+        // the 8-gram index: an early long repeat survives a trigram that later text kept using
+        SuffixDrafter d(3, 32, 512);
+        std::vector<int32_t> doc;
+        for (int i = 0; i < 20; ++i) doc.push_back(100 + i);                       // S, once
+        for (int r = 0; r < 8; ++r) {                                              // S[7..9] again and again
+            for (int i = 7; i < 10; ++i) doc.push_back(100 + i);
+            for (int i = 0; i < 4; ++i) doc.push_back(1000 + r * 10 + i);
+        }
+        for (int i = 0; i < 10; ++i) doc.push_back(100 + i);                       // S's start again
+        d.append(doc.data(), doc.size());
+        int32_t out[4] = {};
+        check(d.propose(4, out) == 4 && out[0] == 110 && out[1] == 111, "8-gram index finds the long repeat");
+        check(d.last_match() >= 8, "8-gram match length");
+    }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }
 }  // namespace

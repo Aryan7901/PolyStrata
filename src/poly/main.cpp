@@ -387,6 +387,8 @@ struct Session {
         // drafts verified and right, the lookup's
         int64_t rounds = 0, drafted = 0, by_t[strata::spec::DraftPolicy::kMaxT + 1] = {};
         int64_t ds_verified = 0, ds_right = 0, lk_verified = 0, lk_right = 0;
+        double ms_by_t[strata::spec::DraftPolicy::kMaxT + 1] = {};   // round ms by window (timed rounds), their count:
+        int64_t timed_by_t[strata::spec::DraftPolicy::kMaxT + 1] = {};
         double prompt_ms = 0, decode_ms = 0;
         const char* finish = "length";
     };
@@ -548,12 +550,24 @@ struct Session {
                     }
                     const bool ask = room && !sure && !resting && guesses.gate.ask();
                     // the drafts stop once no window could hold the next one (DraftWindows::may_verify)
-                    const std::function<bool(int)> wanted = [&](int j) { return windows.may_verify(chance, j, most - 1); };
+                    static const int cap_t = [] {   // STRATA_DRAFT_CAP=n: no window above n tokens from the drafter
+                        const char* v = std::getenv("STRATA_DRAFT_CAP");
+                        return v ? std::atoi(v) : 0;
+                    }();
+                    const int dmost = cap_t > 1 ? std::min(most, cap_t) : most;
+                    static const int force_t = [] {   // STRATA_FORCE_T=n: every window n tokens (measuring costs)
+                        const char* v = std::getenv("STRATA_FORCE_T");
+                        return v ? std::atoi(v) : 0;
+                    }();
+                    const std::function<bool(int)> wanted = [&](int j) {
+                        return force_t > 0 ? true : windows.may_verify(chance, j, dmost - 1);
+                    };
                     const Clock::time_point drafting = Clock::now();
-                    const int n_d = ask ? engine.draft_block(t, most - 1, d, chance, &wanted) : 0;
+                    const int n_d = ask ? engine.draft_block(t, dmost - 1, d, chance, &wanted) : 0;
                     if (n_d > 0) draft_ms = draft_ms > 0 ? draft_ms + 0.1 * (ms_since(drafting) - draft_ms) : ms_since(drafting);
-                    const DraftWindows::Pick use =
+                    DraftWindows::Pick use =
                         n_d > 0 ? windows.choose_window(chance, n_d, k, match) : windows.choose_lookup(k, match);
+                    if (force_t > 0 && n_d > 0) use = DraftWindows::Pick{false, std::min(force_t, n_d + 1)};
                     int right = 0;
                     bool more = true;
                     if (use.t == 1) {
@@ -577,6 +591,10 @@ struct Session {
                     r.drafted += n_d > 0;
                     // a round that recorded launches took many rounds' time: it says nothing of the rounds to come
                     const double ms = engine.took_record() ? 0.0 : ms_since(round);
+                    if (ms > 0 && r.rounds > 8) {
+                        r.ms_by_t[use.t] += ms;
+                        ++r.timed_by_t[use.t];
+                    }
                     // the costs are a drafted round's: one the drafter was not in counts as if it had drafted
                     const double as_drafted = ms > 0 && n_d == 0 ? ms + draft_ms : ms;
                     if (use.lookup) windows.observe(true, use.t, right, match, as_drafted);
@@ -1372,7 +1390,11 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
     if (ss.engine.drafts_blocks()) {   // DSpark: its drafts and windows
         std::string by;
         for (int t = 1; t <= strata::spec::DraftPolicy::kMaxT; ++t)
-            if (r.by_t[t]) by += " " + std::to_string(t) + ":" + std::to_string(r.by_t[t]);
+            if (r.by_t[t]) {
+                char c[48] = "";
+                if (r.timed_by_t[t]) std::snprintf(c, sizeof c, "@%.2fms", r.ms_by_t[t] / (double) r.timed_by_t[t]);
+                by += " " + std::to_string(t) + ":" + std::to_string(r.by_t[t]) + c;
+            }
         std::fprintf(stderr,
                      "dspark: %lld rounds, %.2f tokens a round, drafted in %lld; drafts accepted %lld of %lld (%.1f%%), "
                      "lookup %lld of %lld; windows by tokens%s; %s\n",
