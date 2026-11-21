@@ -57,13 +57,21 @@ struct CpuExpert {
     float gate_scale = 1.f, up_scale = 1.f;   ///< NVFP4's global scales (ExpertScales), on the products
 };
 
+/// The routed experts' activation of gate and up: SiLU within the layer's limits, GELU (tanh form), or Inkling 2's
+/// SITU: beta * tanh(g / beta) * sigmoid(g) * lb * tanh(u / lb), the tanh of up left out where lb <= 0.
+struct Act {
+    enum Kind { kSilu, kGelu, kSitu } kind = kSilu;
+    float beta = 0.f, lb = 0.f;
+};
+
 /// Checks that ggml-cpu has a dot product for both types.  Call once per layer format at load.
 bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::string& err);
 
 
 /// For each of `rows` tokens, with n_embd values of x and of out each:
 /// out = sum over the token's experts of weight * down(silu(min(gate x, limit)) * clamp(up x, -limit, limit)),
-/// or with `gelu` of weight * down(gelu(gate x) * up x), in the tanh form of GELU the GPU experts compute.
+/// or with act GELU of weight * down(gelu(gate x) * up x), in the tanh form of GELU the GPU experts compute, or
+/// with act SITU of weight * down(situ(gate x, up x)) (limit unused for both).
 /// The n experts come token after token, a token's together.  An expert that several of the tokens use is read
 /// once for all of them: reading it is most of the work.  A token's result is the one it has in a call of its own.
 /// `meanwhile`, when given, is run once by one of the threads, beside the first products.  It must not throw.
@@ -71,7 +79,7 @@ bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::str
 /// `late`, when given, marks the experts whose weights are still being read: their products come after the others',
 /// and `wait(j)` is called before experts[j]'s are read.  The sums are as without them.
 void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, int gu_type, int u_type, int d_type,
-                 int n_embd, int n_ff, const float* x, float limit, bool gelu, float* out,
+                 int n_embd, int n_ff, const float* x, float limit, const Act& act, float* out,
                  const std::function<void()>* meanwhile = nullptr, const uint8_t* late = nullptr,
                  const std::function<void(int)>* wait = nullptr);
 

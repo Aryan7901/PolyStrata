@@ -1009,6 +1009,19 @@ __global__ void geglu_rows_kernel(const float* __restrict__ gate_up, float* __re
     out[size_t(blockIdx.y) * n + i] = gelu(row[i] * sc.x) * (row[n + i] * sc.y);
 }
 
+// Inkling 2's experts: beta * tanh(g / beta) * sigmoid(g) * lb * tanh(u / lb) (llama.cpp's LLM_FFN_SITU)
+__global__ void situ_rows_kernel(const float* __restrict__ gate_up, float* __restrict__ out, int n, float beta,
+                                 float lb, ExpertScales s) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float* row = gate_up + size_t(blockIdx.y) * 2 * n;
+    const float2 sc = row_scales(s, blockIdx.y);
+    const float g = row[i] * sc.x;
+    float u = row[n + i] * sc.y;
+    if (lb > 0.f) u = lb * tanhf(u / lb);
+    out[size_t(blockIdx.y) * n + i] = beta * tanhf(g / beta) / (1.0f + expf(-g)) * u;
+}
+
 // A warp a token, a lane every 32nd expert.  The pick is the host's: the n_used largest of the probabilities plus
 // the bias, the lower expert first among equals, one after the other.
 constexpr int ROUTE_PER = 16;   // experts a lane: up to 512
@@ -2708,6 +2721,13 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
             "a batch's projections");
 }
 
+void gemm_f32_blas(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows) {
+    const float one = 1.0f, zero = 0.0f;
+    blas_ck(cublasSgemm((cublasHandle_t) blas, CUBLAS_OP_T, CUBLAS_OP_N, n_out, rows, n_in, &one, w, n_in, x, n_in,
+                        &zero, y, n_out),
+            "a batch's projection");
+}
+
 void guard_half_sums(float* x, int64_t ld, int width, int rows, float* factor, void* stream) {
     if (rows > 0) guard_half_sums_kernel<<<rows, 256, 0, cs(stream)>>>(x, size_t(ld), width, factor);
 }
@@ -3010,6 +3030,12 @@ void geglu(const float* gate, const float* up, float* out, int n, void* stream) 
 void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream, const ExpertScales* scales) {
     geglu_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n,
                                                                         scales ? *scales : ExpertScales{});
+}
+
+void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float lb, void* stream,
+               const ExpertScales* scales) {
+    situ_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n, beta, lb,
+                                                                       scales ? *scales : ExpertScales{});
 }
 
 void route_rows(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale, const float* bias,

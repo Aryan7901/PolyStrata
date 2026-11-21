@@ -7,6 +7,8 @@
 #include "gemma4.hpp"
 #include "glm5next.hpp"
 #include "kolibri1.hpp"
+#include "igpu.hpp"
+#include "inkling2.hpp"
 #include "lfm2moe.hpp"
 #include "flint.hpp"
 #include "mmq.hpp"
@@ -289,6 +291,7 @@ size_t page_bytes() {
 }
 
 void drop_pages(const uint8_t* p, size_t n) {
+    if (igpu_owns(p)) return;   // the iGPU's copy of experts: anonymous memory, which MADV_DONTNEED would zero
     const size_t page = page_bytes();
     const uintptr_t a = ((uintptr_t) p + page - 1) / page * page, b = ((uintptr_t) p + n) / page * page;
     if (!p || b <= a) return;
@@ -1478,6 +1481,7 @@ int64_t Engine::meta_u(const char* key, int64_t fallback) const {
 // A layer's tensor, under any of its names.  The draft block's are in the file it comes from.
 const TensorInfo* Engine::tensor(int il, const char* name) const {
     const Shards& g = block_ && il >= n_layer_ ? *block_ : *gg_;
+    if (il < n_layer_) il = file_layer(il);
     if (const TensorInfo* t = g.find(blk(il, name))) return t;
     if (const Names* n = tensor_alias(name))
         for (const char* other : n->other)
@@ -1619,8 +1623,9 @@ void Engine::load_moe(int il, bool shared) {
     // (llama.cpp's ffn_*_exps_s).  Gate's and up's go on their products ahead of the activation (ExpertScales),
     // down's on the expert's weight in its token's sum.  Only NVFP4's: Gemma 4's ffn_down_exps.scale is its own.
     const bool nv = L.gu_type == GGML_TYPE_NVFP4 || L.u_type == GGML_TYPE_NVFP4 || L.d_type == GGML_TYPE_NVFP4;
-    if (nv && tensor(il, "ffn_gate_up_exps.scale"))
-        throw std::runtime_error(blk(il, "ffn_gate_up_exps.scale: NVFP4 scales of a joined gate and up are not supported"));
+    // A joined gate and up has one scale an expert for both halves (Inkling 2's ffn_gate_up_exps.scale, llama.cpp's
+    // up_exps_s on the joined product).
+    const bool joined = tensor(il, "ffn_gate_up_exps.weight") != nullptr;
     // A projection of another type in the same layer has none (Qwen3.6 NVFP4-MTP-HQ: some ups are Q4_K).
     const auto one = [&](const char* n, uint32_t type, Dev& d, std::vector<float>& h) {
         const TensorInfo* t = tensor(il, n);
@@ -1631,8 +1636,14 @@ void Engine::load_moe(int il, bool shared) {
         h.resize((size_t) n_expert_);
         std::memcpy(h.data(), home(*t).data(*t), h.size() * sizeof(float));
     };
-    one("ffn_gate_exps.scale", L.gu_type, L.s_gate, L.h_s_gate);
-    one("ffn_up_exps.scale", L.u_type, L.s_up, L.h_s_up);
+    one(joined ? "ffn_gate_up_exps.scale" : "ffn_gate_exps.scale", L.gu_type, L.s_gate, L.h_s_gate);
+    if (joined) {
+        L.s_up = L.s_gate;
+        L.h_s_up = L.h_s_gate;
+    } else {
+        one("ffn_up_exps.scale", L.u_type, L.s_up, L.h_s_up);
+    }
+    (void) nv;
     one("ffn_down_exps.scale", L.d_type, L.s_down, L.h_s_down);
     std::string err;
     if (!cpu_expert_types_ok((int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_, err) ||
@@ -1649,8 +1660,9 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     const std::string name = arch ? arch->s : std::string();
     // Clover is a qwen35moe model trained to also guess a block of tokens at once (Qwen35)
     const bool qwen35 = name == "qwen35moe" || name == "clover_moe";
-    if (o.kv_format == KvFmt::kQ8_0 && !qwen35 && name != "kolibri1" && name != "flint" && name != "lfm2moe")
-        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint and lfm2moe models in v1; "
+    if (o.kv_format == KvFmt::kQ8_0 && !qwen35 && name != "kolibri1" && name != "flint" && name != "lfm2moe" &&
+        name != "inkling2")
+        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and inkling2 models; "
                                  "this is a '" + name + "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
@@ -1668,6 +1680,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         if (name == "lfm2moe") return std::make_unique<Lfm2Moe>();
         if (name == "flint") return std::make_unique<Flint>();
         if (name == "kolibri1") return std::make_unique<Kolibri1>();
+        if (name == "inkling2") return std::make_unique<Inkling2>();
         throw std::runtime_error(o.model + " is a '" + name + "' model, which this engine does not run");
     };
     int cards = 1, devices = 1;
@@ -2771,8 +2784,13 @@ void Engine::load(const Options& o) {
             out_norm_ = upload(norm, "output_norm.weight", n_embd_, 1, kF32);
             // a file without an output matrix ties the output to the token table
             const TensorInfo* head = gg_->find("output.weight");
-            output_ = upload(head ? head : gg_->find("token_embd.weight"), "output.weight", n_embd_, n_vocab_,
-                             kAnyMat);
+            if (output_in_vram()) {
+                output_ = upload(head ? head : gg_->find("token_embd.weight"), "output.weight", n_embd_, n_vocab_,
+                                 kAnyMat);
+            } else {
+                const TensorInfo* t = head ? head : gg_->find("token_embd.weight");
+                output_ = Dev{nullptr, t->type, n_embd_, n_vocab_};
+            }
         }
         if (draft_) load_drafter();
         if (pass == 0) {
@@ -2808,6 +2826,7 @@ void Engine::load(const Options& o) {
     // The card has the dense weights now, and the CPU does not read them again.
     for (const auto& [p, n] : uploaded_) drop_pages(p, n);
     uploaded_ = {};
+    after_load();
     // A card of a split that has less free beside its layers than the reserve it keeps by default runs out of VRAM
     // in a later request, where one card alone can do nothing else.  It may be that another program held VRAM when
     // the split was made.  A larger reserve asked for (--vram-reserve-mib) only leaves the card without experts.
@@ -3499,6 +3518,7 @@ const Stats& Engine::stats() const {
         all_stats_.batch_staged += s.batch_staged;
         all_stats_.swapped_experts += s.swapped_experts;
         all_stats_.tail_experts += s.tail_experts;
+        all_stats_.igpu_experts += s.igpu_experts;
         all_stats_.cpu_ms += s.cpu_ms;
         all_stats_.route_wait_ms += s.route_wait_ms;
     }
@@ -4177,8 +4197,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 }
                 ExpertScales es = expert_scales(L);
                 for (int j = 0; j < m && (es.gate || es.up); ++j) es.e[j] = cached[i0 + j].e;
-                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_, &es);
-                else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_, &es);
+                act_rows(g_, h_, n_ff_exp_, m, limit, &es);
                 kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
                 if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, n_embd_, st_)))
                     for (int j = 0; j < m; ++j)
@@ -4240,8 +4259,121 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 if (!pool_help()) std::this_thread::yield();
             }
         };
+        // INK_IGPU: some of one token's experts go to the integrated GPU, which reads RAM beside the CPU's threads
+        // (igpu.hpp); the CPU computes the rest meanwhile, and the iGPU's weighted outputs are added to its sum
+        Igpu* const ig = igpu();
+        int n_ig = 0;
+        const bool ig_ok = ig && m == 1 && !any_late && L.gu_type == GGML_TYPE_NVFP4 && L.d_type == GGML_TYPE_NVFP4 &&
+                           !L.mixed() && igpu_owns(host[0].gate);
+        if (ig_ok) {
+            n_ig = ig->take(n_host);
+            IgpuExpert ge[Igpu::kMax];
+            for (int i = 0; i < n_ig; ++i) {
+                const CpuExpert& c = host[n_host - n_ig + i];
+                ge[i] = {c.gate, c.up, c.down, c.gate_scale, c.up_scale, c.weight};
+            }
+            if (n_ig > 0) ig->start(ge, n_ig, h_x_ + (size_t) at * e_row);
+            static const bool serial = std::getenv("INK_IGPU_SERIAL") != nullptr;
+            if (n_ig > 0 && serial) {   // diagnosis: the iGPU alone, the CPU idle, timed
+                static double us = 0;
+                static int64_t calls[Igpu::kMax + 1] = {};
+                static double sum[Igpu::kMax + 1] = {};
+                const auto t = Clock::now();
+                ig->wait();
+                us = ms_since(t) * 1e3;
+                ++calls[n_ig];
+                sum[n_ig] += us;
+                static int64_t all = 0;
+                if (++all % 2000 == 0)
+                    for (int k = 1; k <= Igpu::kMax; ++k)
+                        if (calls[k])
+                            std::fprintf(stderr, "INK_IGPU_SERIAL igpu %d alone: %lld calls, %.0f us\n", k,
+                                         (long long) calls[k], sum[k] / (double) calls[k]);
+            }
+            n_host -= n_ig;
+            stats_.igpu_experts += n_ig;
+        }
+        const auto t_cpu = Clock::now();
+        bool ig_done = true;
         cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_,
-                    h_x_ + (size_t) at * e_row, limit, gelu_, cpu, meanwhile, any_late ? late : nullptr, &wait);
+                    h_x_ + (size_t) at * e_row, limit, act(), cpu, meanwhile, any_late ? late : nullptr, &wait);
+        if (ig_ok) ig->cpu_took(n_host, ms_since(t_cpu) * 1e3);
+        static const bool ig_stats = std::getenv("INK_IGPU_STATS") != nullptr;
+        if (ig_stats) {   // by (CPU experts, iGPU experts): calls, CPU ms, extra ms waiting for the iGPU
+            static double tab[9][9][3] = {};
+            static int64_t calls = 0;
+            const double c_ms = ms_since(t_cpu);
+            double w_ms = 0;
+            if (n_ig > 0) {
+                const auto t_w = Clock::now();
+                ig_done = ig->wait();
+                w_ms = ms_since(t_w);
+            }
+            double* r = tab[std::min(n_host, 8)][std::min(n_ig, 8)];
+            r[0] += 1;
+            r[1] += c_ms;
+            r[2] += w_ms;
+            if (++calls % 20000 == 0)
+                for (int a = 0; a < 9; ++a)
+                    for (int b = 0; b < 9; ++b)
+                        if (tab[a][b][0] > 0)
+                            std::fprintf(stderr, "INK_IGPU_STATS cpu %d igpu %d: %6.0f calls, cpu %.0f us, then wait %.0f us\n", a, b,
+                                         tab[a][b][0], 1e3 * tab[a][b][1] / tab[a][b][0], 1e3 * tab[a][b][2] / tab[a][b][0]);
+        }
+        if (n_ig > 0) {
+            if (ig->busy()) ig_done = ig->wait();
+            const float* part = ig->part();
+            if (!ig_done) {   // the iGPU failed: its experts on the CPU after all
+                static std::vector<float> again;
+                again.assign((size_t) n_ig * n_embd_, 0.f);
+                for (int i = 0; i < n_ig; ++i)
+                    cpu_experts(*workers_, host + n_host + i, 1, 1, (int) L.gu_type, (int) L.u_type, (int) L.d_type,
+                                n_embd_, n_ff_exp_, h_x_ + (size_t) at * e_row, limit, act(),
+                                again.data() + (size_t) i * n_embd_);
+                part = again.data();
+            }
+            static const int check = std::getenv("INK_IGPU_CHECK") ? std::atoi(std::getenv("INK_IGPU_CHECK")) : 0;
+            static int checked = 0;
+            static std::vector<float> refs;
+            if (check == 3) {   // does part change after wait() returned?
+                static int races = 0, calls = 0;
+                std::vector<float> early(part, part + (size_t) n_ig * n_embd_);
+                const auto t = Clock::now();
+                while (ms_since(t) < 0.2) {
+                }
+                int moved = 0;
+                for (size_t j = 0; j < early.size(); ++j) moved += std::memcmp(&early[j], &part[j], 4) != 0;
+                ++calls;
+                if (moved) ++races;
+                if (moved || calls % 500 == 0)
+                    std::fprintf(stderr, "INK_IGPU_CHECK race: %d of %zu values changed after wait (%d of %d calls)\n", moved,
+                                 early.size(), races, calls);
+            } else if (check) {   // the same experts on the CPU, one at a time; the ones that differ (2: the CPU's are used)
+                refs.assign((size_t) n_ig * n_embd_, 0.f);
+                for (int i = 0; i < n_ig; ++i) {
+                    float* const rp = refs.data() + (size_t) i * n_embd_;
+                    cpu_experts(*workers_, host + n_host + i, 1, 1, (int) L.gu_type, (int) L.u_type, (int) L.d_type,
+                                n_embd_, n_ff_exp_, h_x_ + (size_t) at * e_row, limit, act(), rp);
+                    const float* ref = rp;
+                    double d2 = 0, r2 = 0, mx = 0;
+                    for (int j = 0; j < n_embd_; ++j) {
+                        const double d = part[(size_t) i * n_embd_ + j] - ref[(size_t) j];
+                        d2 += d * d;
+                        r2 += (double) ref[(size_t) j] * ref[(size_t) j];
+                        mx = std::max(mx, std::fabs(d));
+                    }
+                    if (check == 1 && (std::sqrt(d2 / std::max(r2, 1e-30)) > 1e-5 || checked % 500 == 0))
+                    std::fprintf(stderr, "INK_IGPU_CHECK %d layer %d expert %d of %d: rel err %.3g, max %.3g, ref norm %.3g, ig[0..2] %g %g %g ref %g %g %g\n",
+                                 checked, il, i, n_ig, std::sqrt(d2 / std::max(r2, 1e-30)), mx, std::sqrt(r2),
+                                 part[(size_t) i * n_embd_], part[(size_t) i * n_embd_ + 1], part[(size_t) i * n_embd_ + 2],
+                                 ref[0], ref[1], ref[2]);
+                }
+                ++checked;
+                if (check == 2) part = refs.data();
+            }
+            for (int i = 0; i < n_ig; ++i)
+                for (int j = 0; j < n_embd_; ++j) cpu[j] += part[(size_t) i * n_embd_ + j];
+        }
         pool_reads_.clear();
         stats_.cpu_ms += ms_since(t0);
     }
@@ -4298,8 +4430,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
         kernels::native_mmvq_ids((int) L.u_type, up, rr, n_embd_, n_ff_exp_, st_);
     }
     const ExpertScales es = expert_scales(L, d_ids_);
-    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_, &es);
-    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_, &es);
+    act_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], &es);
     if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
     const kernels::MmvqIds down{table, d_ids_, L.gu2(), q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
@@ -4653,8 +4784,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             up_mul(slot_of(r.j), L.slot_bytes, r.m, d_cb + (size_t) r.c * cb_row + r.j, r.most);
         }
         if (rc > 0) {
-            if (gelu_) geglu_rows(gu_, hx_, n_ff_exp_, rc, st_, &es);
-            else swiglu_clamp_rows(gu_, hx_, n_ff_exp_, rc, limit, st_, &es);
+            act_rows(gu_, hx_, n_ff_exp_, rc, limit, &es);
             if (guard) guard_half_sums(hx_, ff, n_ff_exp_, rc, hf_, st_);
             Mmq::quantize(hx_, nullptr, mq2_, dt, ff, ff, rc, st_);
         }
@@ -4705,8 +4835,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             });
             ExpertScales er = es;
             if (er.ids) er.ids += r0;
-            if (gelu_) geglu_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, st_, &er);
-            else swiglu_clamp_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, limit, st_, &er);
+            act_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, limit, &er);
             if (guard) guard_half_sums(hx_ + (size_t) r0 * ff, ff, n_ff_exp_, rows, hf_ + r0, st_);
             Mmq::quantize(hx_ + (size_t) r0 * ff, nullptr, mq2_, dt, ff, ff, rows, st_);
             each_class([&](int k, int top) {
@@ -4732,7 +4861,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             ck(cudaStreamSynchronize(cs(st_)), "expert staging");
             done = Clock::now();
         });
-        cpu_experts(*workers_, host_.data(), (int) host_.size(), n, gt, ut, dt, n_embd_, n_ff_exp_, h_x_, limit, gelu_,
+        cpu_experts(*workers_, host_.data(), (int) host_.size(), n, gt, ut, dt, n_embd_, n_ff_exp_, h_x_, limit, act(),
                     h_cpu_, nullptr);
         const double cpu = ms_since(start);
         behind.wait();
@@ -4782,6 +4911,17 @@ void* Engine::record(F&& work) {
     cudaGraphExec_t exec = nullptr;
     const cudaError_t made = cudaGraphInstantiateWithFlags(&exec, g, 0);
     cudaGraphDestroy(g);
+    if (made == cudaErrorMemoryAllocation) {
+        // No VRAM left for one more recording (they are never freed, and a long conversation with windows of
+        // guesses makes many): the calls without one launch their kernels as they go, which is slower and the same.
+        // The caller runs the work itself: a capture records it without running it.
+        cudaGetLastError();
+        if (!graphs_full_)
+            std::fprintf(stderr, "strata-poly: no VRAM for more recorded launches (%zu kept); the others run unrecorded\n",
+                         graphs_.size());
+        graphs_full_ = true;
+        return nullptr;
+    }
     ck(made, "cudaGraphInstantiate");
     graphs_.push_back(exec);
     return exec;
@@ -4834,7 +4974,8 @@ void Engine::run(const int32_t* tokens, int n) {
     for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
-        if (!made[key]) made[key] = record(work);
+        if (!made[key] && !graphs_full_) made[key] = record(work);
+        if (!made[key]) return (void) work();
         ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
     };
     if (replay) {   // a pair a token: a window's tokens may go one by one, each from its own
@@ -4854,7 +4995,7 @@ void Engine::run(const int32_t* tokens, int n) {
         const size_t head = (size_t) head_key(il, m) * recs + rec;
         if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
         else layer_head(L, il, m);
-        if (!L.moe || batched(L, m)) return;
+        if (!has_moe(L) || batched(layers_[(size_t) ex(il)], m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
         if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
@@ -4904,7 +5045,7 @@ void Engine::run(const int32_t* tokens, int n) {
             }
             for (int j = il < 0 ? lo_ : il + 1; j < hi_; ++j) {
                 up(j, m, rec);
-                if (layers_[(size_t) j].moe) break;
+                if (has_moe(layers_[(size_t) j])) break;
             }
         };
         const auto back = [&] {
@@ -4922,8 +5063,8 @@ void Engine::run(const int32_t* tokens, int n) {
         try {
             for (int k = 0; k < 2; ++k) go_on(k, -1, false);
             for (int il = lo_; il < hi_; ++il) {
-                Layer& L = layers_[(size_t) il];
-                if (!L.moe) continue;
+                if (!has_moe(layers_[(size_t) il])) continue;
+                Layer& L = layers_[(size_t) ex(il)];   // the experts' layer: its own, or the one it repeats
                 for (int k = 0; k < 2; ++k) {
                     // by another thread while this one computes: it must leave the rows as it found them
                     const std::function<void()> other = [&] {
@@ -4936,7 +5077,7 @@ void Engine::run(const int32_t* tokens, int n) {
                         }
                     };
                     const int m = half(k);
-                    const bool add = moe(L, il, m, late.k >= 0 ? &other : nullptr);
+                    const bool add = moe(L, ex(il), m, late.k >= 0 ? &other : nullptr);
                     if (failed) std::rethrow_exception(failed);
                     late = {k, il, add};
                 }
@@ -4953,10 +5094,11 @@ void Engine::run(const int32_t* tokens, int n) {
     // shown it routes there (Layer::card).
     const bool card = n < kStageRows && card_moe(n);
     const auto on_card = [&](int il, int m, size_t rec) {
-        Layer& L = layers_[(size_t) il];
+        const int xi = ex(il);
+        Layer& L = layers_[(size_t) xi];
         if (!card) return false;
-        if (replay && L.card == 1) replayed(L.card_moe, rec, [&] { moe_card(L, il, m); });
-        else if (!moe_card(L, il, m)) return false;
+        if (replay && L.card == 1) replayed(L.card_moe, rec, [&] { moe_card(L, xi, m); });
+        else if (!moe_card(L, xi, m)) return false;
         stats_.gpu_experts += m * n_used_;
         return true;
     };
@@ -4965,7 +5107,7 @@ void Engine::run(const int32_t* tokens, int n) {
     bool whole = card && replay;
     for (int il = lo_; il < hi_ && whole; ++il) {
         const Layer& L = layers_[(size_t) il];
-        whole = L.fixed && (!L.moe || L.card == 1);
+        whole = L.fixed && (!has_moe(L) || layers_[(size_t) ex(il)].card == 1);
     }
     // A block of guesses is recorded whole or not at all: a layer's own recordings are a window's, of other kernels.
     if (block_pass_ && !whole) replay = false;
@@ -4973,27 +5115,29 @@ void Engine::run(const int32_t* tokens, int n) {
         std::vector<int> key{block_pass_ ? -n : n};
         for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
         void*& pass = passes_[key];
-        if (!pass)
-            pass = record([&] {
-                for (int il = lo_; il < hi_; ++il) {
-                    Layer& L = layers_[(size_t) il];
-                    layer_head(L, il, n);
-                    if (!L.moe) continue;
-                    moe_shared(L, il, n);
-                    moe_card(L, il, n);
-                    layer_tail(L, il, n);
-                }
-            });
-        ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
-        for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += layers_[(size_t) il].moe ? n * n_used_ : 0;
+        const auto all = [&] {
+            for (int il = lo_; il < hi_; ++il) {
+                Layer& L = layers_[(size_t) il];
+                layer_head(L, il, n);
+                if (!has_moe(L)) continue;
+                moe_shared(L, il, n);
+                moe_card(layers_[(size_t) ex(il)], ex(il), n);
+                layer_tail(L, il, n);
+            }
+        };
+        if (!pass && !graphs_full_) pass = record(all);
+        if (pass) ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
+        else all();
+        for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += has_moe(layers_[(size_t) il]) ? n * n_used_ : 0;
         return;
     }
     for (int il = lo_; il < hi_; ++il) {
         Layer& L = layers_[(size_t) il];
         up(il, n, (size_t) n - 1);
-        if (!L.moe) continue;
-        if (batched(L, n)) moe_rows(L, il, n);
-        else if (!on_card(il, n, (size_t) n - 1) && moe(L, il, n)) moe_add(n);
+        if (!has_moe(L)) continue;
+        Layer& X = layers_[(size_t) ex(il)];
+        if (batched(X, n)) moe_rows(X, ex(il), n);
+        else if (!on_card(il, n, (size_t) n - 1) && moe(X, ex(il), n)) moe_add(n);
         tail(il, n, (size_t) n - 1);
     }
 }
@@ -5066,10 +5210,18 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     copy2(h_at_, at_, R * 2 * (int) (sizeof(long long) / 4), nullptr, nullptr, 0, st_);
 
     const size_t wn = (size_t) opt_.window, recs = 3 * wn + (size_t) opt_.batch + 1, rec = (size_t) R - 1;
+    // the rows are sequences while the step runs (stepping_); its tails are recordings of their own, after a
+    // window's: a tail that keeps a sequence's state does its rows apart, not as a window's tokens in a row
+    struct Stepping {
+        int& r;
+        ~Stepping() { r = 0; }
+    } stepping{stepping_};
+    stepping_ = R;
     const bool replay = opt_.graphs && !opt_.dump;
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
-        if (!made[key]) made[key] = record(work);
+        if (!made[key] && !graphs_full_) made[key] = record(work);
+        if (!made[key]) return (void) work();
         ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
     };
     const bool card = R < kStageRows && card_moe(R);
@@ -5098,8 +5250,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             n_rows_of_ = R;
             if (replay && L.fixed) {
                 void*& made = L.rows_heads[key];
-                if (!made) made = record([&] { layer_head(L, il, R); });
-                ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
+                if (!made && !graphs_full_) made = record([&] { layer_head(L, il, R); });
+                if (made) ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
+                else layer_head(L, il, R);
             } else {
                 layer_head(L, il, R);
             }
@@ -5116,23 +5269,25 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
                 pos_ = at[(size_t) i];
             }
         }
-        if (!L.moe) continue;
-        if (batched(L, R)) {
-            moe_rows(L, il, R);
+        if (!has_moe(L)) continue;
+        const int xi = ex(il);
+        Layer& X = layers_[(size_t) xi];
+        if (batched(X, R)) {
+            moe_rows(X, xi, R);
         } else {
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
             if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
             else moe_shared(L, il, R);
-            if (card && L.card == 1 && replay) {
-                replayed(L.card_moe, rec, [&] { moe_card(L, il, R); });
+            if (card && X.card == 1 && replay) {
+                replayed(X.card_moe, rec, [&] { moe_card(X, xi, R); });
                 stats_.gpu_experts += R * n_used_;
-            } else if (card && moe_card(L, il, R)) {
+            } else if (card && moe_card(X, xi, R)) {
                 stats_.gpu_experts += R * n_used_;
-            } else if (moe(L, il, R)) {
+            } else if (moe(X, xi, R)) {
                 moe_add(R);
             }
         }
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, R); });
+        if (replay && L.fixed) replayed(L.tail, recs + rec, [&] { layer_tail(L, il, R); });
         else layer_tail(L, il, R);
     }
 
@@ -5144,7 +5299,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         next_->step(seqs, tokens, n);
     } else {
         output_rows(0, R, xn_);
-        lin(output_, xn_, wlogits_, R);
+        output_logits(xn_, wlogits_, R);
         finish_logits(wlogits_, R);
         ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) R * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                            cs(st_)),
@@ -5372,15 +5527,16 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
             output_rows(n - m, m, h);
             dbg("out_norm", n_layer_, h, n_embd_);
             if (!want_logits) return;
-            lin(output_, h + (size_t) (m - 1) * n_embd_, logits_, 1);
+            output_logits(h + (size_t) (m - 1) * n_embd_, logits_, 1);
             finish_logits(logits_, 1);
             ck(cudaMemcpyAsync(h_logits_, logits_, (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                                cs(st_)),
                "logits");
         };
         if (replay) {
-            if (!tail_) tail_ = record(tail);
-            ck(cudaGraphLaunch((cudaGraphExec_t) tail_, cs(st_)), "logits graph");
+            if (!tail_ && !graphs_full_) tail_ = record(tail);
+            if (tail_) ck(cudaGraphLaunch((cudaGraphExec_t) tail_, cs(st_)), "logits graph");
+            else tail();
         } else {
             tail();
         }
@@ -5393,16 +5549,24 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
 }
 
 // A layer for n tokens, as run() hands it to the card when nothing is replayed or printed.
+void Engine::act_rows(const float* gate_up, float* out, int n, int rows, float limit, const ExpertScales* es) {
+    if (situ_.kind == Act::kSitu) situ_rows(gate_up, out, n, rows, situ_.beta, situ_.lb, st_, es);
+    else if (gelu_) geglu_rows(gate_up, out, n, rows, st_, es);
+    else swiglu_clamp_rows(gate_up, out, n, rows, limit, st_, es);
+}
+
 void Engine::layer(int il, int n) {
     Layer& L = layers_[(size_t) il];
     layer_head(L, il, n);
-    if (!L.moe) return;
-    if (batched(L, n)) {
-        moe_rows(L, il, n);
+    if (!has_moe(L)) return;
+    const int xi = ex(il);
+    Layer& X = layers_[(size_t) xi];
+    if (batched(X, n)) {
+        moe_rows(X, xi, n);
     } else {
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
         moe_shared(L, il, n);
-        if (moe(L, il, n)) moe_add(n);
+        if (moe(X, xi, n)) moe_add(n);
     }
     layer_tail(L, il, n);
 }
@@ -5663,7 +5827,7 @@ void Engine::window(const int32_t* tokens, int t) {
     }
     float* h = draft_ ? hn_ + n_embd_ : xn_;
     output_rows(0, t, h);
-    lin(output_, h, wlogits_, t);
+    output_logits(h, wlogits_, t);
     finish_logits(wlogits_, t);
     ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
        "logits");

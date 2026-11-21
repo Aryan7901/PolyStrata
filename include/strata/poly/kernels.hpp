@@ -25,6 +25,9 @@ void gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out,
 void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows);
 /// n BF16 values as floats, for gemm_f32.
 void bf16_to_f32(const uint16_t* w, float* out, size_t n, void* stream);
+/// gemm_f32 always through cuBLAS's SGEMM (one group): for many tokens of a narrow matrix, where gemm_f32's own
+/// small-output kernels are slower.
+void gemm_f32_blas(void* blas, const float* w, const float* x, float* y, int n_in, int n_out, int rows);
 /// Before a Q8_1 quantization whose blocks keep their sums in halves (llama.cpp's MMQ for Q4_K, Q5_K, Q2_K, Q4_1,
 /// Q5_1 and IQ1_S rows; Mmq::half_sums()): each of the rows of x (ld floats apart, width values) whose sums or
 /// values would leave a half's range is divided by a power of two, and factor[r] holds it (1 for the others).  A
@@ -416,5 +419,87 @@ void dsv4_attend(const float* q, const uint16_t* raw, int ring, int window, cons
                  float scale, int64_t pos, int rows, void* stream, const long long* at = nullptr, int room = 0);
 /// y[g][t] = x[t][g] for `rows` tokens of `groups` groups of n values; with back, y[t][g] = x[g][t].
 void permute_groups(const float* x, float* y, int n, int groups, int rows, bool back, void* stream);
+
+// ---- Inkling 2 (kernels_inkling.cu).  The reference for every formula is llama.cpp's inkling2 graph
+// (src/models/inkling2.cpp).
+
+/// out = situ(gate) * situ_lin(up) for rows of n gate values then n up values (out: n a row), after
+/// ExpertScales: beta * tanh(g / beta) * sigmoid(g) * lb * tanh(u / lb), the tanh of up left out where lb <= 0.
+void situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float lb, void* stream,
+               const ExpertScales* scales = nullptr);
+/// Up to 8 vectors of a token's row that attention over the depth reads: each at offset off[i] floats into the row.
+struct InkStates {
+    int off[8];
+    int n;
+};
+/// Attention over the depth for `rows` tokens, each a row of r_stride floats in r: the states (n_embd values each,
+/// at s.off) RMS-normed without weights (eps 1e-6), weighed for each of nq queries (query: nq vectors of n_embd)
+/// by the softmax of their products over the root of n_embd, and summed.  Query q's sum of token t goes to
+/// out + q * q_stride + t * n_embd.  nq is at most 4.
+/// scratch: ink_mix_floats(rows) floats, which a call of a few tokens spreads its sums over (null: a block a token).
+size_t ink_mix_floats(int rows);
+void ink_mix(const float* r, int r_stride, const InkStates& s, const float* query, int nq, float* out,
+             size_t q_stride, int n_embd, int rows, void* stream, float* scratch = nullptr);
+/// dst[t] = src[t] (or dst[t] += src[t] with `add`) for `rows` vectors of n values, src_stride and dst_stride
+/// floats from one token's to the next's.
+void ink_rows(const float* src, int src_stride, float* dst, int dst_stride, int n, int rows, bool add, void* stream);
+/// The loop's message controller after its products: out = (1 - tanh(f)) * cur + tanh(g) * msg, n values a row;
+/// cur, msg and g / f start their rows cur_stride, msg_stride and gf_stride floats apart.
+void ink_gate(const float* cur, int cur_stride, const float* msg, int msg_stride, const float* g, const float* f,
+              int gf_stride, float* out, int n, int rows, void* stream);
+/// For `rows` tokens of `heads` vectors of dim values (x_stride floats a token): each vector times scale (dim values
+/// a head, null: none), then scaled down to an L2 norm of at most `limit` (ggml's 1e-6 under the norm), then, where
+/// alpha > 0, times 1 + alpha * log(max(1, (p + 1) / floor)) for the token's position p (pos + t, or from at[0]).
+void ink_clip(float* x, int x_stride, const float* scale, float limit, int dim, int heads, int rows, float alpha,
+              float floor, int64_t pos, const long long* at, void* stream);
+/// Three ink_clip()s in one launch (the queries, keys and relative terms), with one floor, position and `at`.
+void ink_clip3(float* x0, int s0, const float* sc0, float lim0, int dim0, int heads0, float alpha0, float* x1, int s1,
+               const float* sc1, float lim1, int dim1, int heads1, float alpha1, float* x2, int s2, const float* sc2,
+               float lim2, int dim2, int heads2, float alpha2, int rows, float floor_, int64_t pos,
+               const long long* at, void* stream);
+/// out[t] = [rms(a[t]); rms(b[t])] (no weights), 2n values a token.
+void ink_rms2(const float* a, const float* b, float* out, int n, int rows, float eps, void* stream);
+/// The causal short convolution of taps values (at most 8) a channel with its residual, for `rows` tokens of
+/// `channels` values: out = (x + sum_k w[k] x[t - taps + 1 + k] + dynamic) * scale, w as ggml's ssm_conv takes it
+/// (taps values a channel, the oldest first).  dyn, when not null: taps values a head (heads equal parts of the
+/// channels) a token, dyn[lag] times the input lag tokens back.  state: taps - 1 past inputs a channel, the oldest
+/// first, advanced by the rows.  out must not be x.
+/// snap, stride, snaps: as conv4_silu's - the state after each token whose bit is set, in order, stride floats apart.
+void ink_conv(const float* x, float* state, const float* w, const float* dyn, int heads, float* out, int channels,
+              int taps, int rows, float scale, void* stream, float* snap = nullptr, size_t stride = 0,
+              unsigned snaps = 0, int x_stride = 0);   ///< x_stride: floats from a token's x to the next (0: channels)
+/// ink_conv for rows of different sequences, a token each: row t's state is at state + off[t] floats (off on the card).
+void ink_conv_rows(const float* x, int x_stride, float* state, const long long* off, const float* w, const float* dyn,
+                   int heads, float* out, int channels, int taps, int rows, float scale, void* stream);
+/// dst[i] = v[i] for i < n (at most 8), the values in the launch itself: a recorded launch sets the same ones.
+void ink_set_offsets(long long* dst, const long long* v, int n, void* stream);
+/// Inkling's attention for `rows` tokens from position pos (or at[0]): query head h of a token (dim 128, q
+/// heads * dim a token) reads key head h / (heads / kv_heads) of the fp16 caches (kv_heads * dim a row; row p % ring
+/// for position p where ring > 0, else row p).  The score of position k for token position p is
+/// scale * q.k + bias - sink[t][h], where bias = sum_r rel[t][h][r] * table[d][r] for d = p - k below `extent`, else
+/// 0, and the softmax has one more logit, 0, that weighs no value.  window > 0: only the window positions up to p.
+/// q and rel start a token's heads q_stride and rel_stride floats apart.
+/// rel: n_rel (at most 16) a head a token; table: extent rows of n_rel.  out: heads * dim a token.  part: scratch of
+/// ink_attend_floats().  With `at`, the launch is sized for positions below room.
+size_t ink_attend_floats(int rows, int heads, int max_ctx);
+/// With kscales and vscales (Q8_0: an fp16 scale every 32 values), kcache and vcache are int8 codes (store_q8).
+void ink_attend(const float* q, int q_stride, const void* kcache, const void* vcache, const float* rel,
+                int rel_stride, const float* table, int n_rel, int extent, const float* sink, float* out, float* part, int dim, int heads, int kv_heads,
+                float scale, int64_t pos, int rows, int window, int ring, void* stream, const long long* at = nullptr,
+                int room = 0, const uint16_t* kscales = nullptr, const uint16_t* vscales = nullptr);
+/// y = w x for 1 to 8 tokens of an F32 matrix (n_out rows of n_in, n_in a multiple of 4); false (nothing done) for
+/// other shapes.  For narrow matrices, where the general gemv gives too few blocks.
+bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream);
+/// For each of `rows` rows of approximate logits (n of them, stride apart): the indices within `margin` of the row's
+/// largest into ids (cap a row; more are left out) and how many matched into count[row] (it may pass cap).
+/// scratch: ink_shortlist_floats(rows) floats.
+size_t ink_shortlist_floats(int rows);
+void ink_shortlist(const float* approx, int n, int stride, float margin, int* ids, int* count, int cap, int rows,
+                   void* stream, float* scratch);
+/// logits[row][ids[k]] = the Q8_0 matrix w's row ids[k] times h[row] (n_embd values), for k below count[row] and cap.
+void ink_rescore_q8(const void* w, const float* h, int n_embd, const int* ids, const int* count, int cap,
+                    float* logits, int stride, int rows, void* stream);
+/// x[r][i] = -inf for i in [from, n) of `rows` rows of n values: a padded vocabulary's tail.
+void ink_fill_tail(float* x, int from, int n, int rows, void* stream);
 
 }  // namespace strata::poly

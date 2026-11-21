@@ -1170,6 +1170,102 @@ def gemma_model_turn(prompt: str, thinking: bool) -> str:
 RCALL_MAX = 32768        # the most of a `<tool_call>` inside the reasoning that is held while waiting for its end (#804)
 
 
+# Inkling 2 (Thinking Machines) writes its reply as messages: <|message_model|>, a content type, the content and
+# <|end_message|>; its reasoning is <|content_thinking|>, its answer <|content_text|>, and a tool call is the tool's
+# name then <|content_invoke_tool_json|> and {"name": ..., "args": {...}}.  InklingText turns those into the tags the
+# parser reads: <think>...</think>, the answer as it is, and <tool_call>{...}</tool_call>.
+INKLING_TOKENS = ("<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>",
+                  "<|end_message|>", "<|content_model_end_sampling|>")
+
+
+class InklingText:
+    """Inkling 2's message tokens in the reply's text -> <think>, plain text and <tool_call> (see INKLING_TOKENS).  A
+    token's text may arrive split across deltas: a `<|` is held until its `|>` (or until it cannot be a token)."""
+
+    HOLD = max(len(t) for t in INKLING_TOKENS)
+
+    def __init__(self):
+        self.buf = ""
+        self.seg = None          # None, "head" (after <|message_model|>: a tool's name may follow), think, text, tool
+
+    def push(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            i = self.buf.find("<|")
+            if i < 0:
+                out.append(self._text(self.buf))
+                self.buf = ""
+                break
+            if i > 0:
+                out.append(self._text(self.buf[:i]))
+                self.buf = self.buf[i:]
+            j = self.buf.find("|>")
+            if j < 0:
+                if len(self.buf) < self.HOLD and any(t.startswith(self.buf) for t in INKLING_TOKENS):
+                    break                               # may be a token still arriving
+                out.append(self._text(self.buf[:2]))
+                self.buf = self.buf[2:]
+                continue
+            tok = self.buf[:j + 2]
+            if tok not in INKLING_TOKENS:
+                out.append(self._text(self.buf[:2]))
+                self.buf = self.buf[2:]
+                continue
+            self.buf = self.buf[j + 2:]
+            out.append(self._mark(tok))
+        return "".join(out)
+
+    def _text(self, text: str) -> str:
+        return "" if self.seg == "head" else text     # a tool's name before its JSON: the JSON names it again
+
+    def _mark(self, tok: str) -> str:
+        seg = self.seg
+        if tok == "<|message_model|>":
+            self.seg = "head"
+            return ""
+        if tok == "<|content_thinking|>":
+            self.seg = "think"
+            return "<think>"
+        if tok == "<|content_text|>":
+            self.seg = "text"
+            return ""
+        if tok == "<|content_invoke_tool_json|>":
+            self.seg = "tool"
+            return CALL_START
+        if tok == "<|end_message|>":
+            self.seg = None
+            return THINK_END if seg == "think" else CALL_END if seg == "tool" else ""
+        return ""                                       # <|content_model_end_sampling|>: the stop token
+
+
+_INKLING_NAME = re.compile(r'\{\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def inkling_call_name(text: str) -> str | None:
+    """An Inkling call's name ({"name": ...}), or None while it is still arriving."""
+    m = _INKLING_NAME.match(text.lstrip())
+    return json.loads('"' + m.group(1) + '"') if m else None
+
+
+def inkling_call_end(text: str) -> int:
+    return text.find(CALL_END)
+
+
+def parse_inkling_tool_call(body: str, schema: dict | None = None) -> list[ToolCall]:
+    """{"name": N, "args": {...}} (or "arguments") -> its call; anything else -> no call (the text is kept)."""
+    try:
+        obj = json.loads(body.strip())
+    except ValueError:
+        return []
+    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+        return []
+    args = obj.get("args", obj.get("arguments", {}))
+    if isinstance(args, str):
+        args = tool_arguments(args)
+    return [ToolCall(name=obj["name"], arguments=args if isinstance(args, dict) else {})]
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
@@ -1183,7 +1279,8 @@ class OutputParser:
         self.whole = {"glm": (glm_call_name, glm_call_end, parse_glm_tool_call),
                       "gemma": (gemma_call_name, gemma_call_end, parse_gemma_tool_call),
                       "dsml": (dsml_call_name, dsml_call_end, parse_dsml_tool_call),
-                      "lfm2": (lfm2_call_name, lfm2_call_end, parse_lfm2_tool_calls)}.get(call_format)
+                      "lfm2": (lfm2_call_name, lfm2_call_end, parse_lfm2_tool_calls),
+                      "inkling": (inkling_call_name, inkling_call_end, parse_inkling_tool_call)}.get(call_format)
         self.call_start, self.call_stop = {"gemma": (GEMMA_CALL, GEMMA_CALL_END),
                                            "dsml": (DSML_INVOKE, DSML_INVOKE_END),
                                            "lfm2": (LFM2_CALL, LFM2_CALL_END)}.get(call_format,
@@ -1195,7 +1292,9 @@ class OutputParser:
         # template writes it after a tool's answer), so the reply starts inside the reasoning.  GLM's calls come
         # with <think> either way: GLM's template opens it in the prompt (`opened`), Flint writes it itself.
         self.think_open, self.think_end = ("<|channel>thought\n", "<channel|>") if call_format == "gemma" \
-            else ("<think>", THINK_END) if call_format == "glm" else ("", THINK_END)
+            else ("<think>", THINK_END) if call_format in ("glm", "inkling") else ("", THINK_END)
+        # Inkling's message tokens, translated before anything else reads the reply (InklingText)
+        self.ink = InklingText() if call_format == "inkling" else None
         # #537 tells a quoted </think> by the line break the end has after it.  GLM's and Gemma's answers follow
         # their end tag at once ('say "Paris."</think>Paris'), so there every end tag ends the reasoning
         self.quotes_end = call_format == "function"
@@ -1507,6 +1606,8 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        if self.ink is not None:
+            delta = self.ink.push(delta)
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -1774,6 +1875,10 @@ class OutputParser:
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self.ink is not None and self.ink.buf:      # a held `<|` that never became a token is text
+            held, self.ink.buf = self.ink.buf, ""
+            self.ink.seg = self.ink.seg if self.ink.seg != "head" else None
+            out.extend(self.feed(held))
         if self.pending:
             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.bare and function_end(self.buf) >= 0:

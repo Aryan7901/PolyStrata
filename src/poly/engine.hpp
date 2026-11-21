@@ -142,6 +142,8 @@ struct Dev {
 /// What a layer has in every architecture.  Its attention's weights, and a dense FFN's, are the architecture's.
 struct Layer {
     bool moe = false;
+    int owner = -1;       ///< a run of an earlier layer's weights (Inkling 2's loop): that layer, whose routed experts
+                          ///< and expert cache it uses; its own moe is false (Engine::ex())
     bool mmq = false;     ///< the card has MMQ tiles for its routed experts' types (Engine::batched())
     bool fixed = false;   ///< one token's launches can be recorded and replayed for the next ones (eval()): they
                           ///< are the same for every token, or read the position on the card (Engine::at_)
@@ -189,6 +191,7 @@ struct Stats {
     int64_t tokens = 0, gpu_experts = 0, cpu_experts = 0, batch_cached = 0, batch_staged = 0;
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
+    int64_t igpu_experts = 0;      ///< CPU experts the integrated GPU computed (INK_IGPU)
     double cpu_ms = 0, route_wait_ms = 0;
 };
 
@@ -466,6 +469,11 @@ protected:
     virtual void router_scores(const Layer& L, int n);
     /// What is done to `rows` rows of logits on the card before they are copied out.
     virtual void finish_logits(float* logits, int rows) { (void) logits, (void) rows; }
+    /// The logits of `rows` normed outputs h: the output matrix's product, or an architecture's cheaper equal.
+    virtual void output_logits(const float* h, float* logits, int rows) { lin(output_, h, logits, rows); }
+    /// Whether load() puts the output matrix in VRAM (output_); false: the architecture keeps it where it wants, and
+    /// output_ only names its type and shape.
+    virtual bool output_in_vram() const { return true; }
     /// What a token's embedding is multiplied by on its way in.
     virtual float embed_scale() const { return 1.f; }
     /// What a sequence has beside its recurrent state and its rows, in bytes: it is saved and brought back with
@@ -513,11 +521,23 @@ protected:
     virtual void shift_rows(ptrdiff_t by);
     /// The tokens of a window of t that leave the recurrent state as it is after them, a bit a token.
     unsigned snap_tokens(int t) const;
+    /// The layer of the file whose weights layer il runs: il, unless the model runs some layers more than once
+    /// (Inkling 2's loop), where block_count counts the runs and the file has each layer once.
+    virtual int file_layer(int il) const { return il; }
+    /// Called once the weights and the expert cache are loaded, before the CPU's workers start (Inkling's INK_IGPU).
+    virtual void after_load() {}
     /// The other names of a tensor or a metadata key in the files of this architecture, or null.
     virtual const Names* tensor_alias(const char* name) const { (void) name; return nullptr; }
     virtual const Names* meta_alias(const char* key) const { (void) key; return nullptr; }
 
     // ---- what it builds on ----
+    /// The layer whose routed experts layer il runs: il, or the earlier layer it is a run of (Layer::owner).
+    int ex(int il) const {
+        const int o = layers_[(size_t) il].owner;
+        return o >= 0 ? o : il;
+    }
+    /// Whether the layer runs routed experts, its own or its owner's.
+    static bool has_moe(const Layer& L) { return L.moe || L.owner >= 0; }
     /// Whether layer il is this engine's: one of [lo_, hi_), or the draft block on the card that ends the model.
     bool runs(int il) const { return il >= lo_ && (il < hi_ || hi_ == n_layer_); }
     size_t card_state_bytes() const { return state_n_ * sizeof(float) + extra_bytes(); }
@@ -697,6 +717,8 @@ protected:
     long long* h_at_ = nullptr;   ///< pinned
     bool recording_ = false;      ///< a layer's launches are being recorded: positions are read from at_
     bool recorded_ = false;       ///< took_record()
+    bool graphs_full_ = false;    ///< a recording found no VRAM: no more are made, and those calls launch as they go
+    int stepping_ = 0;            ///< while step() runs: its rows, each a sequence's (an architecture's tail can tell)
 
     // geometry
     int n_embd_ = 0, n_layer_ = 0, n_vocab_ = 0;
@@ -717,6 +739,16 @@ protected:
     void* ev_out_[2] = {};    ///< marks the card done with a call in each half
     float rms_eps_ = 0;
     bool gelu_ = false;       ///< the routed experts' activation: GELU of the gate, else SiLU within the layer's limits
+    Act situ_;                ///< Inkling 2: SITU with its two constants, in place of gelu_ (kind kSitu)
+    /// The routed experts' activation as the CPU and the card compute it.
+    Act act() const {
+        if (situ_.kind == Act::kSitu) return situ_;
+        Act a;
+        a.kind = gelu_ ? Act::kGelu : Act::kSilu;
+        return a;
+    }
+    /// The activation of `rows` rows of n gate then n up values into rows of n (the card's experts).
+    void act_rows(const float* gate_up, float* out, int n, int rows, float limit, const ExpertScales* es);
     std::vector<float> clamp_exp_, clamp_shexp_;   ///< a layer's SwiGLU limits: the routed experts', the shared one's
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.

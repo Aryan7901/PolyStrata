@@ -2142,8 +2142,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     # Optional model/state check; run by hand with an MTP GGUF and frozen prompt IDs.
     add_executable(poly_gdn_mma_state_test src/poly/gdn_mma_state_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                    src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp
-                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
-                   src/poly/kernels_dsv4.cu src/core/conversation_memory.cpp)
+                   src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/igpu.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu
+                   src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu src/core/conversation_memory.cpp)
     target_include_directories(poly_gdn_mma_state_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
     target_link_libraries(poly_gdn_mma_state_test PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
                          ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target} CUDA::cuda_driver Threads::Threads)
@@ -2151,7 +2151,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
 
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
-                            src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
+                            src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/igpu.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
                             src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
@@ -2176,8 +2176,8 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   # poly_draft_race_test MODEL.gguf [RUNS] [LAYER_SPLIT]
   add_executable(poly_draft_race_test src/poly/draft_race_test.cpp src/poly/engine.cpp src/poly/glm5next.cpp
                                       src/poly/qwen35.cpp src/poly/gemma4.cpp src/poly/deepseek4.cpp
-                                      src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp
-                                      src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
+                                      src/poly/lfm2moe.cpp src/poly/flint.cpp src/poly/kolibri1.cpp src/poly/inkling2.cpp src/poly/igpu.cpp
+                                      src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu
                                       src/core/conversation_memory.cpp)
   target_include_directories(poly_draft_race_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                          ${_strata_gpu_include_directories})
@@ -2252,7 +2252,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                                         ${_strata_gpu_include_directories})
   target_link_libraries(poly_shortconv_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   # DeepSeek V4's kernels against the same arithmetic on the host; needs a card, so it is run by hand
-  add_executable(poly_dsv4_test src/poly/dsv4_test.cu src/poly/kernels_dsv4.cu)
+  add_executable(poly_dsv4_test src/poly/dsv4_test.cu src/poly/kernels_dsv4.cu src/poly/kernels_inkling.cu)
   target_include_directories(poly_dsv4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                    ${_strata_gpu_include_directories})
   target_link_libraries(poly_dsv4_test PRIVATE ${_strata_gpu_runtime_target})
