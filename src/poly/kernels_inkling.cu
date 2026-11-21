@@ -953,6 +953,10 @@ __device__ __forceinline__ void ldsm_x2_t(uint32_t& r0, uint32_t& r1, const void
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1) : "r"(smem_u32(p)));
 }
+__device__ __forceinline__ void ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
+}
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
                  "{%0,%1,%2,%3};\n"
@@ -1102,6 +1106,282 @@ prefill_kernel(const float* __restrict__ q, int q_stride, const void* __restrict
                 uint32_t b0, b1;
                 ldsm_x2_t(b0, b1, vs + (j * 16 + lane % 16) * PF_LD + dn * 8);
                 mma16816(o[dn], pa_, b0, b1);
+            }
+        }
+    }
+    const float da = la + (ma == -INFINITY ? 1.f : __expf(-ma)), db = lb + (mb == -INFINITY ? 1.f : __expf(-mb));
+#pragma unroll
+    for (int dn = 0; dn < ATT_DIM / 8; ++dn) {
+        const int d = dn * 8 + (lane % 4) * 2;
+        if (ta < rows) {
+            float* oa = out + ((size_t) ta * heads + h) * ATT_DIM + d;
+            oa[0] = o[dn][0] / da;
+            oa[1] = o[dn][1] / da;
+        }
+        if (tb < rows) {
+            float* ob = out + ((size_t) tb * heads + h) * ATT_DIM + d;
+            ob[0] = o[dn][2] / db;
+            ob[1] = o[dn][3] / db;
+        }
+    }
+}
+
+// ---- prefill_kernel's sums for a prompt batch deep into a long prompt, in the same order, a block a key head and
+// 32 tokens, but sized for the card to keep its tensor cores busy.  prefill_kernel holds a block a SM (6 warps for 3
+// query heads a key head: two of the SM's four schedulers have one warp, two have two) and every warp waits for each
+// tile's reads; over a full-attention run at 100K positions it ran at ~25% of the card's mma rate.  Here two blocks
+// share a SM (12 warps, 3 a scheduler): PL_KEYS positions a tile, the query rows in shared memory and read a 16-value
+// slice at a time, the relative terms there too, all to stay under 168 registers.  The next tile's codes are read
+// into registers while this one is scored.  A tile wholly before the block's tokens by `extent` or more (nearly every
+// tile of a long full-attention span) has no mask and no bias to work out: its scores are the products less the sink,
+// as prefill_kernel's are there.  The other tiles (the near ones, a windowed run's) take prefill_kernel's masks and
+// bias with a row's relative terms in registers and the table's rows read as float4s.  The tile size only moves where
+// the running maximum rescales the sums (float rounding); INK_ATT_CHECK=1 with --no-graphs compares the two kernels.
+constexpr int PL_KEYS = 32;            // positions a tile
+constexpr int PL_REL = ATT_REL + 1;    // a row's relative terms in shared memory, off the banks
+// a prompt batch that ends this many positions or more into the sequence takes prefill_long_kernel, its full and its
+// windowed runs (INK_PF_LONG=N changes it, 0: never); a shorter prompt's sums stay prefill_kernel's, bit for bit
+constexpr int64_t kPfLongFrom = 4096;
+
+template <int G>
+constexpr size_t prefill_long_smem() {
+    return sizeof(__half) * (size_t) (PF_TOKENS * G + 2 * PL_KEYS) * PF_LD + sizeof(float) * (size_t) PF_TOKENS * G * PL_REL;
+}
+
+// 16 values of a cache row as read: Q8_0 codes and their block's scale (bits), or fp16 values
+struct Piece16 {
+    uint4 a, b;
+    uint32_t d;
+};
+
+// Four Q8_0 codes (the bytes of x) times their scale d, as half2 {x0, x1} and {x2, x3}.  0x6400 | (code ^ 0x80) is
+// the half 1152 + code, so taking 1152 off is exact and the product is rounded once: what load8h's (float) code * d
+// rounded to half gives, bit for bit, without a conversion from int a value.
+__device__ __forceinline__ void deq4(uint32_t x, __half2 d, uint32_t& lo, uint32_t& hi) {
+    x ^= 0x80808080u;
+    const uint32_t a = __byte_perm(x, 0x64646464u, 0x4140), b = __byte_perm(x, 0x64646464u, 0x4342);
+    const __half2 off = __half2half2(__ushort_as_half((unsigned short) 0x6480));
+    const __half2 ha = __hmul2(__hsub2(*(const __half2*) &a, off), d);
+    const __half2 hb = __hmul2(__hsub2(*(const __half2*) &b, off), d);
+    lo = *(const uint32_t*) &ha;
+    hi = *(const uint32_t*) &hb;
+}
+
+template <int G, bool Q8>
+__global__ void __launch_bounds__(2 * G * WARP, G <= 3 ? 2 : 1)
+prefill_long_kernel(const float* __restrict__ q, int q_stride, const void* __restrict__ kcache,
+                    const void* __restrict__ vcache, const uint16_t* __restrict__ ksc, const uint16_t* __restrict__ vsc,
+                    const float* __restrict__ rel, int rel_stride, const float* __restrict__ table, int n_rel,
+                    int extent, const float* __restrict__ sink, float* __restrict__ out, int heads, int kv_heads,
+                    float scale, int64_t pos, int rows, int window, int ring) {
+    constexpr int R = PF_TOKENS * G, NT = 2 * G * WARP, KT = PL_KEYS;
+    constexpr int PIECES = 2 * KT * (ATT_DIM / 16);   // a tile's 16-value pieces: its keys', then its values'
+    constexpr int PER = (PIECES + NT - 1) / NT;
+    extern __shared__ __align__(16) unsigned char pl_smem[];
+    __half* qs = (__half*) pl_smem;          // R * PF_LD
+    __half* ks = qs + R * PF_LD;             // KT * PF_LD
+    __half* vs = ks + KT * PF_LD;            // KT * PF_LD
+    float* rs = (float*) (vs + KT * PF_LD);  // R * PL_REL
+    const int kvh = blockIdx.x, t0 = blockIdx.y * PF_TOKENS;
+    const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
+    const size_t kv_row = (size_t) kv_heads * ATT_DIM;
+    const int t_end = min(rows, t0 + PF_TOKENS);
+    const int64_t hi = pos + t_end;
+    const int64_t lo = window > 0 ? max((int64_t) 0, pos + t0 - window + 1) : 0;
+    const bool whole = t_end - t0 == PF_TOKENS;
+
+    for (int i = threadIdx.x; i < R * ATT_DIM; i += NT) {
+        const int r = i / ATT_DIM, d = i % ATT_DIM, g = r / PF_TOKENS, t = t0 + r % PF_TOKENS, h = kvh * G + g;
+        const float v = t < rows ? q[(size_t) t * q_stride + (size_t) h * ATT_DIM + d] * scale : 0.f;
+        qs[r * PF_LD + d] = __float2half(v);
+    }
+    for (int i = threadIdx.x; i < R * ATT_REL; i += NT) {
+        const int r = i / ATT_REL, k = i % ATT_REL, g = r / PF_TOKENS, t = t0 + r % PF_TOKENS, h = kvh * G + g;
+        rs[r * PL_REL + k] = (k < n_rel && t < rows) ? rel[(size_t) t * rel_stride + (size_t) h * n_rel + k] : 0.f;
+    }
+    Piece16 pc[PER];
+    const auto fetch = [&](int64_t kb) {   // the tile from kb into registers; past hi, zeros (as prefill_kernel)
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            const int c = threadIdx.x + i * NT;
+            if (c < PIECES) {
+                const int side = c / (KT * 8), w = c % (KT * 8), k = w / 8, col = (w % 8) * 16;
+                const int64_t kp = kb + k;
+                pc[i].a = pc[i].b = make_uint4(0, 0, 0, 0);
+                pc[i].d = 0;
+                if (kp < hi) {
+                    const size_t at = (size_t) (ring > 0 ? kp % ring : kp) * kv_row + (size_t) kvh * ATT_DIM + col;
+                    if constexpr (Q8) {
+                        pc[i].a = *(const uint4*) ((const int8_t*) (side ? vcache : kcache) + at);
+                        pc[i].d = (side ? vsc : ksc)[at / 32];
+                    } else {
+                        const uint4* p = (const uint4*) ((const uint16_t*) (side ? vcache : kcache) + at);
+                        pc[i].a = p[0];
+                        pc[i].b = p[1];
+                    }
+                }
+            }
+        }
+    };
+    const auto put = [&]() {   // the registers' tile into shared memory as halves
+#pragma unroll
+        for (int i = 0; i < PER; ++i) {
+            const int c = threadIdx.x + i * NT;
+            if (c < PIECES) {
+                const int side = c / (KT * 8), w = c % (KT * 8), k = w / 8, col = (w % 8) * 16;
+                __half* dst = (side ? vs : ks) + k * PF_LD + col;
+                if constexpr (Q8) {
+                    const __half2 d = __half2half2(__ushort_as_half((unsigned short) pc[i].d));
+                    uint4 lo, hi4;
+                    deq4(pc[i].a.x, d, lo.x, lo.y);
+                    deq4(pc[i].a.y, d, lo.z, lo.w);
+                    deq4(pc[i].a.z, d, hi4.x, hi4.y);
+                    deq4(pc[i].a.w, d, hi4.z, hi4.w);
+                    *(uint4*) dst = lo;
+                    *(uint4*) (dst + 8) = hi4;
+                } else {
+                    *(uint4*) dst = pc[i].a;
+                    *(uint4*) (dst + 8) = pc[i].b;
+                }
+            }
+        }
+    };
+
+    const int row0 = warp * 16, g = row0 / PF_TOKENS, h = kvh * G + g;
+    const int tt0 = row0 % PF_TOKENS + lane / 4, tt1 = tt0 + 8;
+    const int ta = t0 + tt0, tb = t0 + tt1;
+    const float* rva = rs + (row0 + lane / 4) * PL_REL;
+    const float* rvb = rva + 8 * PL_REL;
+    const float ska = ta < rows ? sink[(size_t) ta * heads + h] : 0.f;
+    const float skb = tb < rows ? sink[(size_t) tb * heads + h] : 0.f;
+    // the bias's table rows as float4s, where they are 16 terms from a 16-byte boundary
+    const bool vec = n_rel == ATT_REL && (((uintptr_t) table) & 15) == 0;
+    float ma = -INFINITY, mb = -INFINITY, la = 0.f, lb = 0.f;
+    float o[ATT_DIM / 8][4];
+#pragma unroll
+    for (int dn = 0; dn < ATT_DIM / 8; ++dn) o[dn][0] = o[dn][1] = o[dn][2] = o[dn][3] = 0.f;
+
+    fetch(lo);
+    for (int64_t kb = lo; kb < hi; kb += KT) {
+        __syncthreads();   // the tile before is read (and, the first time round, the rows are in)
+        put();
+        __syncthreads();
+        if (kb + KT < hi) fetch(kb + KT);
+        float s[KT / 8][4];
+#pragma unroll
+        for (int nt = 0; nt < KT / 8; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+#pragma unroll
+        for (int j = 0; j < ATT_DIM / 16; ++j) {   // a score's slices in prefill_kernel's order
+            uint32_t qa[4];
+            ldsm_x4(qa[0], qa[1], qa[2], qa[3], qs + (row0 + lane % 16) * PF_LD + j * 16 + (lane / 16) * 8);
+#pragma unroll
+            for (int np = 0; np < KT / 16; ++np) {
+                uint32_t b0, b1, b2, b3;
+                ldsm_x4(b0, b1, b2, b3, ks + (np * 16 + (lane / 16) * 8 + lane % 8) * PF_LD + j * 16 + ((lane / 8) % 2) * 8);
+                mma16816(s[2 * np], qa, b0, b1);
+                mma16816(s[2 * np + 1], qa, b2, b3);
+            }
+        }
+        const bool fast = window <= 0 && whole && (pos + t0) - (kb + KT - 1) >= extent;
+        float mxa = ma, mxb = mb;
+        if (fast) {   // every position before every token by extent or more: no mask, no bias
+#pragma unroll
+            for (int nt = 0; nt < KT / 8; ++nt) {
+                s[nt][0] -= ska;
+                s[nt][1] -= ska;
+                s[nt][2] -= skb;
+                s[nt][3] -= skb;
+                mxa = fmaxf(mxa, fmaxf(s[nt][0], s[nt][1]));
+                mxb = fmaxf(mxb, fmaxf(s[nt][2], s[nt][3]));
+            }
+        } else {   // prefill_kernel's masks and bias, a row at a time: its relative terms in registers meanwhile
+            const int klim = (int) min(hi - kb, (int64_t) KT);   // the tile's positions below hi
+            const int dbase = (int) (pos - kb);                  // token t's distance to the tile's position k: dbase + t - k
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const int t = half ? tb : ta;
+                const float sk = half ? skb : ska;
+                const float* rvp = half ? rvb : rva;
+                float rv[ATT_REL];
+#pragma unroll
+                for (int r = 0; r < ATT_REL; ++r) rv[r] = rvp[r];
+                float mx = half ? mxb : mxa;
+#pragma unroll
+                for (int nt = 0; nt < KT / 8; ++nt)
+#pragma unroll
+                    for (int e1 = 0; e1 < 2; ++e1) {
+                        const int k = nt * 8 + (lane % 4) * 2 + e1, e = half * 2 + e1;
+                        const int dist = dbase + t - k;
+                        float v = -INFINITY;
+                        if (t < rows && k < klim && dist >= 0 && (window <= 0 || dist < window)) {
+                            float b = 0.f;
+                            if (dist < extent) {
+                                const float* tb_ = table + (size_t) dist * n_rel;
+                                if (vec) {
+#pragma unroll
+                                    for (int c = 0; c < ATT_REL / 4; ++c) {
+                                        const float4 x = ((const float4*) tb_)[c];
+                                        b += rv[4 * c] * x.x;
+                                        b += rv[4 * c + 1] * x.y;
+                                        b += rv[4 * c + 2] * x.z;
+                                        b += rv[4 * c + 3] * x.w;
+                                    }
+                                } else {
+#pragma unroll
+                                    for (int r = 0; r < ATT_REL; ++r) b += r < n_rel ? rv[r] * tb_[r] : 0.f;
+                                }
+                            }
+                            v = s[nt][e] + b - sk;
+                        }
+                        s[nt][e] = v;
+                        mx = fmaxf(mx, v);
+                    }
+                if (half) mxb = mx;
+                else mxa = mx;
+            }
+        }
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 1));
+        mxa = fmaxf(mxa, __shfl_xor_sync(0xffffffffu, mxa, 2));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 1));
+        mxb = fmaxf(mxb, __shfl_xor_sync(0xffffffffu, mxb, 2));
+        const float ca = mxa == -INFINITY ? 1.f : __expf(ma - mxa), cb = mxb == -INFINITY ? 1.f : __expf(mb - mxb);
+        float suma = 0.f, sumb = 0.f;
+#pragma unroll
+        for (int nt = 0; nt < KT / 8; ++nt) {
+            s[nt][0] = s[nt][0] == -INFINITY ? 0.f : __expf(s[nt][0] - mxa);
+            s[nt][1] = s[nt][1] == -INFINITY ? 0.f : __expf(s[nt][1] - mxa);
+            s[nt][2] = s[nt][2] == -INFINITY ? 0.f : __expf(s[nt][2] - mxb);
+            s[nt][3] = s[nt][3] == -INFINITY ? 0.f : __expf(s[nt][3] - mxb);
+            suma += s[nt][0] + s[nt][1];
+            sumb += s[nt][2] + s[nt][3];
+        }
+        suma += __shfl_xor_sync(0xffffffffu, suma, 1);
+        suma += __shfl_xor_sync(0xffffffffu, suma, 2);
+        sumb += __shfl_xor_sync(0xffffffffu, sumb, 1);
+        sumb += __shfl_xor_sync(0xffffffffu, sumb, 2);
+        la = la * ca + suma;
+        lb = lb * cb + sumb;
+        ma = mxa;
+        mb = mxb;
+        if (__any_sync(0xffffffffu, ca != 1.f || cb != 1.f)) {   // times 1 changes nothing: most tiles skip it
+#pragma unroll
+            for (int dn = 0; dn < ATT_DIM / 8; ++dn) {
+                o[dn][0] *= ca;
+                o[dn][1] *= ca;
+                o[dn][2] *= cb;
+                o[dn][3] *= cb;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < KT / 16; ++j) {
+            const uint32_t pa_[4] = {pack_h2(s[2 * j][0], s[2 * j][1]), pack_h2(s[2 * j][2], s[2 * j][3]),
+                                     pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]), pack_h2(s[2 * j + 1][2], s[2 * j + 1][3])};
+#pragma unroll
+            for (int dn = 0; dn < ATT_DIM / 8; dn += 2) {
+                uint32_t b0, b1, b2, b3;
+                ldsm_x4_t(b0, b1, b2, b3, vs + (j * 16 + lane % 16) * PF_LD + (dn + lane / 16) * 8);
+                mma16816(o[dn], pa_, b0, b1);
+                mma16816(o[dn + 1], pa_, b2, b3);
             }
         }
     }
@@ -1463,29 +1743,85 @@ void ink_attend(const float* q, int q_stride, const void* kcache, const void* vc
     if (!at) {   // a prompt batch on the tensor cores
         const size_t bytes = sizeof(__half) * (size_t) (PF_TOKENS * g + 2 * PF_KEYS) * PF_LD;
         const dim3 gp(kv_heads, grid(rows, PF_TOKENS));
-        const auto pf = [&](auto gq) {
+        // A batch past the first kPfLongFrom positions (INK_PF_LONG=N: N, 0: never): prefill_long_kernel
+        static const int64_t long_from = [] {
+            const char* e = std::getenv("INK_PF_LONG");
+            return e ? (int64_t) std::atoll(e) : kPfLongFrom;
+        }();
+        const bool plong = long_from > 0 && pos + rows >= long_from;
+        const auto pf = [&](auto gq, bool use_long, float* dst) {
             constexpr int G = decltype(gq)::value;
             static bool raised = false;
             if (!raised) {
                 cudaFuncSetAttribute(prefill_kernel<G, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
                 cudaFuncSetAttribute(prefill_kernel<G, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
+                for (const void* f : {(const void*) prefill_long_kernel<G, false>, (const void*) prefill_long_kernel<G, true>}) {
+                    cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) prefill_long_smem<G>());
+                    cudaFuncSetAttribute(f, cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                }
                 raised = true;
+            }
+            if (use_long) {
+                const size_t lb = prefill_long_smem<G>();
+                if (q8)
+                    prefill_long_kernel<G, true><<<gp, 2 * G * WARP, lb, st>>>(q, q_stride, kcache, vcache, kscales,
+                        vscales, rel, rel_stride, table, n_rel, extent, sink, dst, heads, kv_heads, scale, pos, rows,
+                        window, ring);
+                else
+                    prefill_long_kernel<G, false><<<gp, 2 * G * WARP, lb, st>>>(q, q_stride, kcache, vcache, nullptr,
+                        nullptr, rel, rel_stride, table, n_rel, extent, sink, dst, heads, kv_heads, scale, pos, rows,
+                        window, ring);
+                return;
             }
             if (q8)
                 prefill_kernel<G, true><<<gp, 2 * G * WARP, bytes, st>>>(q, q_stride, kcache, vcache, kscales, vscales,
-                    rel, rel_stride, table, n_rel, extent, sink, out, heads, kv_heads, scale, pos, rows, window, ring);
+                    rel, rel_stride, table, n_rel, extent, sink, dst, heads, kv_heads, scale, pos, rows, window, ring);
             else
                 prefill_kernel<G, false><<<gp, 2 * G * WARP, bytes, st>>>(q, q_stride, kcache, vcache, nullptr, nullptr,
-                    rel, rel_stride, table, n_rel, extent, sink, out, heads, kv_heads, scale, pos, rows, window, ring);
+                    rel, rel_stride, table, n_rel, extent, sink, dst, heads, kv_heads, scale, pos, rows, window, ring);
         };
-        switch (g) {
-        case 1: pf(std::integral_constant<int, 1>{}); break;
-        case 2: pf(std::integral_constant<int, 2>{}); break;
-        case 3: pf(std::integral_constant<int, 3>{}); break;
-        case 4: pf(std::integral_constant<int, 4>{}); break;
-        default: throw std::invalid_argument("ink_attend: 1 to 4 query heads a key head");
-        }
+        const auto by_g = [&](bool use_long, float* dst) {
+            switch (g) {
+            case 1: pf(std::integral_constant<int, 1>{}, use_long, dst); break;
+            case 2: pf(std::integral_constant<int, 2>{}, use_long, dst); break;
+            case 3: pf(std::integral_constant<int, 3>{}, use_long, dst); break;
+            case 4: pf(std::integral_constant<int, 4>{}, use_long, dst); break;
+            default: throw std::invalid_argument("ink_attend: 1 to 4 query heads a key head");
+            }
+        };
+        by_g(plong, out);
         ck("ink_attend prefill");
+        // INK_ATT_CHECK=1 (with --no-graphs): the long kernel's output against prefill_kernel's, on the same inputs
+        static const bool check = std::getenv("INK_ATT_CHECK") != nullptr;
+        if (check && plong) {
+            static float* cout = nullptr;
+            static size_t cout_n = 0;
+            static int checked = 0;
+            static double worst = 0;
+            const size_t n = (size_t) rows * heads * ATT_DIM;
+            if (n > cout_n) {
+                if (cout) cudaFree(cout);
+                cudaMalloc(&cout, n * sizeof(float));
+                cout_n = n;
+            }
+            by_g(false, cout);
+            std::vector<float> a(n), b(n);
+            cudaMemcpyAsync(a.data(), out, n * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaMemcpyAsync(b.data(), cout, n * sizeof(float), cudaMemcpyDeviceToHost, st);
+            cudaStreamSynchronize(st);
+            double d2 = 0, r2 = 0, mx = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const double d = (double) a[i] - b[i];
+                d2 += d * d;
+                r2 += (double) b[i] * b[i];
+                mx = std::max(mx, std::fabs(d));
+            }
+            const double err = std::sqrt(d2 / std::max(r2, 1e-30));
+            worst = std::max(worst, err);
+            if (checked++ % 48 == 0 || err > 1e-4)
+                std::fprintf(stderr, "INK_ATT_CHECK prefill pos %lld rows %d window %d: long vs prefill_kernel: rel err %.3g, "
+                             "max %.3g (worst of %d: %.3g)\n", (long long) pos, rows, window, err, mx, checked, worst);
+        }
         return;
     }
     if (q8) throw std::invalid_argument("ink_attend: a recorded call of more than 8 tokens over a q8_0 cache");
