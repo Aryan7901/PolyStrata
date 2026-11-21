@@ -1178,6 +1178,16 @@ bool Inkling2::pdl_graphs() const {
     return on;
 }
 
+// A layer's tail (the experts' sum's convolution into the residual) and the next layer's head recorded as one: the
+// card goes on to the next layer as soon as the experts' sum is in.  INK_MERGE=0 turns it off.
+bool Inkling2::merge_heads() const {
+    static const bool on = [] {
+        const char* e = std::getenv("INK_MERGE");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
 int Inkling2::head_key(int il, int n) const { return blocks_[(size_t) il].swa ? 0 : room_key(n); }
 
 // ---- a sequence's state: the convolutions' past inputs (state_), the window runs' rings (extra), the full runs'
