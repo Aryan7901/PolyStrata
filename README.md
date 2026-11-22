@@ -55,6 +55,37 @@ PolyStrata was created by [VecSzn](https://github.com/VecSzn).
 PolyStrata is built on [Strata](https://github.com/Niko1221/Strata) by Niko1221.
 Why it is a separate repo, AMD and smaller cards, fine-tunes and other questions: [FAQ](docs/FAQ.md).
 
+## Inkling 2 Mini (this branch)
+
+This branch adds Inkling 2 Mini (26.4B, 3.4B active, looped MoE) to the PolyStrata engine: Unsloth's UD-Q4_K_XL file,
+its DSpark drafter and its vision encoder.
+
+Measured on a Lenovo Legion 5i laptop: RTX 5060 Laptop (8 GB, PCIe 5.0 x8), Core Ultra 7 255HX, 32 GB RAM.
+
+| | llama.cpp (Unsloth fork) | this branch |
+| --- | ---: | ---: |
+| Writing, short context | 13.6 tok/s | 64–70 tok/s |
+| Writing, after a 23K prompt | 13.9 tok/s | ~60 tok/s |
+| Writing, at 100K context | – | 47–50 tok/s |
+| Writing, at 235K context (256K mode) | – | 33 tok/s* |
+| Reading the prompt | 258 tok/s | 1,100–1,200 tok/s |
+
+\* without the drafter; it adds a few percent.
+
+In real coding-agent sessions (pi, up to 80K context) it averaged about 62 tok/s.
+
+What makes it fast:
+- **Attention:** custom long-context kernels, and a KV cache with 8-bit keys and 4-bit values (`--kv k8v4`).
+- **Experts:**
+  - routing that favours the experts already in VRAM (`--cache-bias 0.5`);
+  - two-term FP4 activations when reading prompts;
+  - fused kernels with fewer launches.
+- **Drafting:** the DSpark drafter (`--draft-model`) plus a suffix drafter.
+- **Prompt cache:** replies keep their own token ids, so the next prompt reuses the cache.
+
+Settings used: `--kv k8v4 --cache-bias 0.5 --threads 13 --draft-model <dspark gguf>`, with the environment
+`STRATA_PREFILL_NVFP4=w4a4x2 INK_ATT_NEW=1 INK_KV_CHAIN_V4=1 INK_ATT_DSPARK=1`.
+
 ## How fast is it?
 
 A token is about ¾ of a word.
