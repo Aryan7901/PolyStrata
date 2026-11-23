@@ -328,7 +328,9 @@ void Inkling2::load_layer(int il) {
     if (il == 0) {   // the model's own: the embedding's norm, the output's query, the loop's message queries
         const char* hs = std::getenv("INK_HEAD");
         const TensorInfo* head = gg_->find("output.weight");
-        head_short_ = !(hs && std::atoi(hs) == 0) && head && head->type == GGML_TYPE_Q8_0;
+        // the shortlist rescores from a Q8_0 matrix, or a Q6_K one (Unsloth's IQ4_XS file)
+        head_short_ = !(hs && std::atoi(hs) == 0) && head && ink_rescore_supported((int) head->type) &&
+                      (head->type != GGML_TYPE_Q6_K || n_embd_ % 256 == 0);
         if (head_short_) {
             out_q4_ = upload(head, "output.weight", n_embd_, n_vocab_, kGuessMat);
             // the Q8_0 matrix in pinned host memory, once: only the shortlist's rows are read, over the bus
@@ -1059,7 +1061,8 @@ void Inkling2::output_logits(const float* h, float* logits, int rows) {
     if (rows > std::max(opt_.window, 8)) return;   // more rows than the shortlist holds: the Q4_0 scores (step() only)
     ink_shortlist(logits, n_unpadded_, n_vocab_, kHeadMargin, head_ids_, head_count_, kHeadCap, rows, st_,
                   head_scratch_);
-    ink_rescore_q8(head_dev_, h, n_embd_, head_ids_, head_count_, kHeadCap, logits, n_vocab_, rows, st_);
+    ink_rescore((int) output_.type, head_dev_, h, n_embd_, head_ids_, head_count_, kHeadCap, logits, n_vocab_, rows,
+                st_);
     if (head_exact_ && !recording_) head_check(logits, h, rows);
 }
 

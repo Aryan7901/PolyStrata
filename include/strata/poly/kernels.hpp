@@ -570,6 +570,10 @@ void ink_shortlist(const float* approx, int n, int stride, float margin, int* id
 /// logits[row][ids[k]] = the Q8_0 matrix w's row ids[k] times h[row] (n_embd values), for k below count[row] and cap.
 void ink_rescore_q8(const void* w, const float* h, int n_embd, const int* ids, const int* count, int cap,
                     float* logits, int stride, int rows, void* stream);
+/// ink_rescore_q8 for an output matrix of ggml_type: Q8_0 (8) or Q6_K (14, n_embd whole 256-value blocks).
+bool ink_rescore_supported(int ggml_type);
+void ink_rescore(int ggml_type, const void* w, const float* h, int n_embd, const int* ids, const int* count, int cap,
+                 float* logits, int stride, int rows, void* stream);
 /// mul_sigmoid(acc, g, n, rows, g_stride, false) and native_quantize_q8_1() of acc into y_q8_1 in one launch, the same
 /// bytes in both.  n a multiple of 32.
 void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream);

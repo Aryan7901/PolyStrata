@@ -2483,6 +2483,53 @@ __global__ void rescore_kernel(const BlockQ8* __restrict__ w, const float* __res
     if (lane == 0) logits[(size_t) r * stride + row] = acc;
 }
 
+// ggml's block_q6_K: 256 values; ql the low 4 bits, qh the high 2, 16 int8 scales of 16 values, the fp16 scale
+struct BlockQ6K {
+    uint8_t ql[128];
+    uint8_t qh[64];
+    int8_t scales[16];
+    uint16_t d;
+};
+static_assert(sizeof(BlockQ6K) == 210, "ggml's block_q6_K");
+
+// rescore_kernel for a Q6_K output matrix (Unsloth's IQ4_XS file): lane l of a warp takes values l, l + 32, l + 64
+// and l + 96 of each half of every block, as dequantize_row_q6_K lays them out
+__global__ void rescore_q6k_kernel(const BlockQ6K* __restrict__ w, const float* __restrict__ h, int n_embd,
+                                   const int* __restrict__ ids, const int* __restrict__ count, int cap,
+                                   float* __restrict__ logits, int stride) {
+    const int r = blockIdx.y;
+    const int k = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, l = threadIdx.x % WARP;
+    if (k >= min(count[r], cap)) return;
+    const int row = ids[(size_t) r * cap + k];
+    const int nb = n_embd / 256;
+    const BlockQ6K* wr = w + (size_t) row * nb;
+    const float* hr = h + (size_t) r * n_embd;
+    const int is = l / 16;
+    float acc = 0.f;
+    for (int b = 0; b < nb; ++b) {
+        const BlockQ6K* blk = wr + b;
+        const float d = __half2float(*(const __half*) &blk->d);
+        float s = 0.f;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const uint8_t* ql = blk->ql + 64 * half;
+            const uint8_t qh = blk->qh[32 * half + l];
+            const int8_t* sc = blk->scales + 8 * half;
+            const float* x = hr + b * 256 + 128 * half;
+            const int a = ql[l], c = ql[l + 32];
+            const int q1 = ((a & 0xF) | ((qh & 3) << 4)) - 32;
+            const int q2 = ((c & 0xF) | (((qh >> 2) & 3) << 4)) - 32;
+            const int q3 = ((a >> 4) | (((qh >> 4) & 3) << 4)) - 32;
+            const int q4 = ((c >> 4) | (((qh >> 6) & 3) << 4)) - 32;
+            s += (float) (sc[is] * q1) * x[l] + (float) (sc[is + 2] * q2) * x[l + 32] +
+                 (float) (sc[is + 4] * q3) * x[l + 64] + (float) (sc[is + 6] * q4) * x[l + 96];
+        }
+        acc += d * s;
+    }
+    acc = warp_sum(acc);
+    if (l == 0) logits[(size_t) r * stride + row] = acc;
+}
+
 __global__ void fill_tail_kernel(float* x, int from, int n) {
     const int i = from + blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) x[(size_t) blockIdx.y * n + i] = -INFINITY;
@@ -3072,6 +3119,17 @@ void ink_rescore_q8(const void* w, const float* h, int n_embd, const int* ids, c
     if (rows <= 0) return;
     rescore_kernel<<<dim3(grid(cap, 8), rows), 8 * WARP, 0, cs(stream)>>>((const BlockQ8*) w, h, n_embd, ids, count, cap,
                                                                           logits, stride);
+}
+
+bool ink_rescore_supported(int ggml_type) { return ggml_type == 8 || ggml_type == 14; }   // Q8_0, Q6_K
+
+void ink_rescore(int ggml_type, const void* w, const float* h, int n_embd, const int* ids, const int* count, int cap,
+                 float* logits, int stride, int rows, void* stream) {
+    if (ggml_type == 8) return ink_rescore_q8(w, h, n_embd, ids, count, cap, logits, stride, rows, stream);
+    if (ggml_type != 14 || n_embd % 256 != 0) throw std::invalid_argument("ink_rescore: a type it has no kernel for");
+    if (rows <= 0) return;
+    rescore_q6k_kernel<<<dim3(grid(cap, 8), rows), 8 * WARP, 0, cs(stream)>>>((const BlockQ6K*) w, h, n_embd, ids, count,
+                                                                               cap, logits, stride);
 }
 
 void ink_fill_tail(float* x, int from, int n, int rows, void* stream) {
