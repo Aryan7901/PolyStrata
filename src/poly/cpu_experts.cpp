@@ -45,6 +45,12 @@ const bool kOldIdle = [] {
 
 const ggml_type_traits_cpu* traits(int type) { return ggml_get_type_traits_cpu((ggml_type) type); }
 
+// cpu_experts_use_ggml(): every product through ggml-cpu's dot products
+std::atomic<bool> g_use_ggml{[] {
+    const char* s = std::getenv("STRATA_CPU_GGML");
+    return s && std::atoi(s) == 1;
+}()};
+
 void init_once() {
     static std::once_flag once;
     std::call_once(once, [] { ggml_cpu_init(); });
@@ -77,16 +83,8 @@ void idle_wait(const std::atomic<uint32_t>&, uint32_t) {}
 #endif
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-#define STRATA_NVFP4_VNNI 1
-// compiled for AVX2 + AVX-VNNI whatever the unit's flags (the engine is built for any x86-64), used where the CPU
-// has both (fp4_ok())
-#define FP4_TARGET __attribute__((target("avx2,fma,f16c,avxvnni")))
-bool fp4_ok() {
-    static const bool ok = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
-                           __builtin_cpu_supports("avxvnni");
-    return ok;
-}
-// ggml's block_nvfp4 and block_q8_0 (ggml-common.h, which this unit does not include): the same bytes
+#define STRATA_CPU_DOTS 1
+// ggml's block layouts (ggml-common.h, which this unit does not include): the same bytes
 struct block_nvfp4 {
     uint8_t d[4];    // UE4M3 scales, one a 16-value sub-block
     uint8_t qs[32];  // E2M1 codes: sub-block s in qs[8s .. 8s+8), its values j (low nibble) and j + 8 (high)
@@ -95,12 +93,35 @@ struct block_q8_0 {
     uint16_t d;
     int8_t qs[32];
 };
-static_assert(sizeof(block_nvfp4) == 36 && sizeof(block_q8_0) == 34, "ggml's block layouts");
-// NVFP4 x Q8_0 on AVX-VNNI.  ggml's product (ggml_vec_dot_nvfp4_q8_0) reorders the activation's bytes, converts its
-// scales and multiplies with maddubs + madd for every row; here the activation is made ready once a call (Ready),
-// a weight's 4-bit codes look up E2M1 + 12 (unsigned, 0..24) so one vpdpbusd multiplies and sums them, and the 12 is
-// taken off with the activation's sums of four.  The sums are the same integers; only the order of the float adds
-// differs from ggml's.
+struct block_q8_K {
+    float d;
+    int8_t qs[256];
+    int16_t bsums[16];
+};
+struct block_iq4_xs {
+    uint16_t d;
+    uint16_t scales_h;    // the scales' high 2 bits, sub-block ib at bits 2ib
+    uint8_t scales_l[4];  // their low 4 bits, sub-block ib in byte ib / 2, nibble ib % 2
+    uint8_t qs[128];      // sub-block ib in qs[16ib .. 16ib + 16): values j (low nibble) and j + 16 (high)
+};
+struct block_iq4_nl {
+    uint16_t d;
+    uint8_t qs[16];       // values j (low nibble) and j + 16 (high)
+};
+struct block_q5_0 {
+    uint16_t d;
+    uint8_t qh[4];        // the fifth bit of value j at bit j
+    uint8_t qs[16];       // the low four: values j (low nibble) and j + 16 (high)
+};
+static_assert(sizeof(block_nvfp4) == 36 && sizeof(block_q8_0) == 34 && sizeof(block_q8_K) == 292 &&
+                  sizeof(block_iq4_xs) == 136 && sizeof(block_iq4_nl) == 18 && sizeof(block_q5_0) == 22,
+              "ggml's block layouts");
+
+// NVFP4 x Q8_0 on a byte dot product (VNNI).  ggml's product (ggml_vec_dot_nvfp4_q8_0) reorders the activation's
+// bytes, converts its scales and multiplies with maddubs + madd for every row; here the activation is made ready
+// once a call (Ready), a weight's 4-bit codes look up E2M1 + 12 (unsigned, 0..24) so one vpdpbusd multiplies and
+// sums them, and the 12 is taken off with the activation's sums of four.  The sums are the same integers; only the
+// order of the float adds differs from ggml's.
 struct Ready {                // one NVFP4 block (64 values) of an activation
     int8_t a[32], b[32];      // the values that meet sub-blocks (0, 2) and (1, 3): the weights' unpacklo / unpackhi order
     int32_t ca[8], cb[8];     // 12 * the sum of each four of a and b
@@ -129,69 +150,110 @@ void make_ready(const block_q8_0* y, int nb, Ready* r) {
     }
 }
 
+// IQ4_XS x Q8_K: a super-block (256 values) of a Q8_K activation in the order an IQ4_XS row's codes come in, its
+// sub-blocks two at a time (cpu_dots.inc)
+const uint8_t kIq4Plus128[16] = {1, 24, 45, 63, 79, 93, 106, 118, 129, 141, 153, 166, 181, 197, 217, 241};   // kvalues_iq4nl + 128
+struct alignas(32) ReadyK4 {
+    int8_t lo[4][32];     // pair p: values 0..15 of sub-blocks 2p and 2p + 1 (the codes' low nibbles)
+    int8_t hi[4][32];     // and their values 16..31 (the high nibbles)
+    int32_t corr[4][8];   // 128 * the sum of each lane's four lo and four hi values
+    float d;
+};
 
-// One block of one row into acc: the scale lanes of A are (s0 x4, s2 x4), of B (s1 x4, s3 x4).
-FP4_TARGET inline void fp4_block(const block_nvfp4& x, const Ready& r, __m256& acc, const __m256i lut, const __m256i m4) {
-    // lanes: lane 0 = qs 0..15 (sub 0, 1), lane 1 = qs 16..31 (sub 2, 3)
-    const __m256i qs = _mm256_loadu2_m128i((const __m128i*) (x.qs + 16), (const __m128i*) x.qs);
-    const __m256i lo = _mm256_shuffle_epi8(lut, _mm256_and_si256(qs, m4));
-    const __m256i hi = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(qs, 4), m4));
-    const __m256i wa = _mm256_unpacklo_epi64(lo, hi);   // lane 0: sub 0, lane 1: sub 2
-    const __m256i wb = _mm256_unpackhi_epi64(lo, hi);   // lane 0: sub 1, lane 1: sub 3
-    __m256i sa = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wa, _mm256_loadu_si256((const __m256i*) r.a));
-    __m256i sb = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wb, _mm256_loadu_si256((const __m256i*) r.b));
-    sa = _mm256_sub_epi32(sa, _mm256_loadu_si256((const __m256i*) r.ca));
-    sb = _mm256_sub_epi32(sb, _mm256_loadu_si256((const __m256i*) r.cb));
-    int32_t d4;
-    std::memcpy(&d4, x.d, 4);
-    const __m128i di = _mm_cvtepu8_epi32(_mm_cvtsi32_si128(d4));
-    // ggml_ue4m3_to_fp32 without a gather (slow on the E-cores): 2^(e-7) (1 + m/8) / 2 = float bits (e + 119, m),
-    // m 2^-10 where e is 0, and 0 for 0x7f
-    const __m128i e = _mm_and_si128(_mm_srli_epi32(di, 3), _mm_set1_epi32(15));
-    const __m128i m = _mm_and_si128(di, _mm_set1_epi32(7));
-    const __m128 normal = _mm_castsi128_ps(
-        _mm_or_si128(_mm_slli_epi32(_mm_add_epi32(e, _mm_set1_epi32(119)), 23), _mm_slli_epi32(m, 20)));
-    const __m128 sub = _mm_mul_ps(_mm_cvtepi32_ps(m), _mm_set1_ps(0.0009765625f));
-    __m128 ue = _mm_blendv_ps(normal, sub, _mm_castsi128_ps(_mm_cmpeq_epi32(e, _mm_setzero_si128())));
-    ue = _mm_andnot_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(_mm_and_si128(di, _mm_set1_epi32(0x7f)), _mm_set1_epi32(0x7f))), ue);
-    const __m128 sc = _mm_mul_ps(ue, _mm_loadu_ps(r.dy));   // s0..s3
-    const __m256 sc8 = _mm256_castps128_ps256(sc);
-    const __m256 scale_a = _mm256_permutevar8x32_ps(sc8, _mm256_setr_epi32(0, 0, 0, 0, 2, 2, 2, 2));
-    const __m256 scale_b = _mm256_permutevar8x32_ps(sc8, _mm256_setr_epi32(1, 1, 1, 1, 3, 3, 3, 3));
-    acc = _mm256_fmadd_ps(scale_a, _mm256_cvtepi32_ps(sa), acc);
-    acc = _mm256_fmadd_ps(scale_b, _mm256_cvtepi32_ps(sb), acc);
-}
-
-FP4_TARGET inline float hsum8(__m256 v) {
-    const __m128 s = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
-    const __m128 t = _mm_add_ps(s, _mm_movehl_ps(s, s));
-    return _mm_cvtss_f32(_mm_add_ss(t, _mm_movehdup_ps(t)));
-}
-
-// rows w0 and w1 (nb blocks each) against one ready activation
-FP4_TARGET void fp4_dot2(const block_nvfp4* w0, const block_nvfp4* w1, const Ready* r, int nb, float* s0, float* s1) {
-    const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) kFp4Plus12));
-    const __m256i m4 = _mm256_set1_epi8(0x0f);
-    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+void make_ready_k4(const block_q8_K* y, int nb, ReadyK4* r) {
     for (int ib = 0; ib < nb; ++ib) {
-        fp4_block(w0[ib], r[ib], a0, lut, m4);
-        fp4_block(w1[ib], r[ib], a1, lut, m4);
+        for (int p = 0; p < 4; ++p) {
+            const int8_t* s0 = y[ib].qs + 64 * p;
+            const int8_t* s1 = s0 + 32;
+            std::memcpy(r[ib].lo[p], s0, 16);
+            std::memcpy(r[ib].lo[p] + 16, s1, 16);
+            std::memcpy(r[ib].hi[p], s0 + 16, 16);
+            std::memcpy(r[ib].hi[p] + 16, s1 + 16, 16);
+            for (int k = 0; k < 8; ++k) {
+                int sum = 0;
+                for (int t = 0; t < 4; ++t) sum += r[ib].lo[p][4 * k + t] + r[ib].hi[p][4 * k + t];
+                r[ib].corr[p][k] = 128 * sum;
+            }
+        }
+        r[ib].d = y[ib].d;
     }
-    *s0 = hsum8(a0);
-    *s1 = hsum8(a1);
 }
 
-FP4_TARGET float fp4_dot1(const block_nvfp4* w, const Ready* r, int nb) {
-    const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) kFp4Plus12));
-    const __m256i m4 = _mm256_set1_epi8(0x0f);
-    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
-    int ib = 0;
-    for (; ib + 1 < nb; ib += 2) {
-        fp4_block(w[ib], r[ib], a0, lut, m4);
-        fp4_block(w[ib + 1], r[ib + 1], a1, lut, m4);
+// IQ4_NL and Q5_0 x Q8_0: two blocks (64 values) of a Q8_0 activation, block b's 16 values in one 128-bit lane and
+// block b + 1's in the other
+struct alignas(32) Ready32 {
+    int8_t lo[32];      // values 0..15 of each block
+    int8_t hi[32];      // values 16..31
+    int32_t sum[8];     // the sum of each lane's four lo and four hi values
+    float dy[8];        // the blocks' scales: d(b) x4, d(b + 1) x4
+};
+
+void make_ready32(const block_q8_0* y, int nb, Ready32* r) {
+    for (int i = 0; i + 1 < nb; i += 2) {
+        Ready32& R = r[i / 2];
+        std::memcpy(R.lo, y[i].qs, 16);
+        std::memcpy(R.lo + 16, y[i + 1].qs, 16);
+        std::memcpy(R.hi, y[i].qs + 16, 16);
+        std::memcpy(R.hi + 16, y[i + 1].qs + 16, 16);
+        for (int k = 0; k < 8; ++k) {
+            int sum = 0;
+            for (int t = 0; t < 4; ++t) sum += R.lo[4 * k + t] + R.hi[4 * k + t];
+            R.sum[k] = sum;
+        }
+        const float d0 = ggml_fp16_to_fp32(y[i].d), d1 = ggml_fp16_to_fp32(y[i + 1].d);
+        for (int k = 0; k < 4; ++k) R.dy[k] = d0, R.dy[4 + k] = d1;
     }
-    for (; ib < nb; ++ib) fp4_block(w[ib], r[ib], a0, lut, m4);
-    return hsum8(_mm256_add_ps(a0, a1));
+}
+
+// The products of one instruction set (cpu_dots.inc)
+struct Dots {
+    const char* name;
+    void (*fp4_dot2)(const block_nvfp4*, const block_nvfp4*, const Ready*, int, float*, float*);
+    float (*fp4_dot1)(const block_nvfp4*, const Ready*, int);
+    void (*iq4xs_dot2)(const block_iq4_xs*, const block_iq4_xs*, const ReadyK4*, int, float*, float*);
+    float (*iq4nl_dot1)(const block_iq4_nl*, const Ready32*, int);
+    float (*q50_dot1)(const block_q5_0*, const Ready32*, int);
+};
+
+// compiled for these sets whatever the unit's flags (the engine is built for any x86-64), used where the CPU has them
+namespace avx_vnni {   // Intel from Alder Lake, AMD from Zen 5
+#define KT __attribute__((target("avx2,fma,f16c,avxvnni")))
+#define DPBUSD(a, u, s) _mm256_dpbusd_avx_epi32(a, u, s)
+#define STRATA_DOTS_NAME "AVX-VNNI"
+#include "cpu_dots.inc"
+#undef KT
+#undef DPBUSD
+#undef STRATA_DOTS_NAME
+}  // namespace avx_vnni
+namespace avx512_vnni {   // the same products on 256-bit AVX-512 VNNI: Zen 4, Intel server parts without AVX-VNNI
+#define KT __attribute__((target("avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")))
+#define DPBUSD(a, u, s) _mm256_dpbusd_epi32(a, u, s)
+#define STRATA_DOTS_NAME "AVX-512 VNNI"
+#include "cpu_dots.inc"
+#undef KT
+#undef DPBUSD
+#undef STRATA_DOTS_NAME
+}  // namespace avx512_vnni
+
+// The set this CPU runs, or none (ggml's products for every type).  STRATA_CPU_ISA=avxvnni | avx512vnni | none picks
+// one, where the CPU has it (avx512vnni on a CPU with both: the AVX-512 build, for testing it).
+const Dots* dots() {
+    static const Dots* const d = [] {
+        const bool base = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") &&
+                          __builtin_cpu_supports("f16c");
+        const bool v256 = base && __builtin_cpu_supports("avxvnni");
+        const bool v512 = base && __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512vl") &&
+                          __builtin_cpu_supports("avx512bw") && __builtin_cpu_supports("avx512vnni");
+        const char* want = std::getenv("STRATA_CPU_ISA");
+        const Dots* pick = v256 ? &avx_vnni::kDots : v512 ? &avx512_vnni::kDots : nullptr;
+        if (want && std::strcmp(want, "none") == 0) pick = nullptr;
+        else if (want && std::strcmp(want, "avx512vnni") == 0) pick = v512 ? &avx512_vnni::kDots : nullptr;
+        else if (want && std::strcmp(want, "avxvnni") == 0) pick = v256 ? &avx_vnni::kDots : nullptr;
+        std::fprintf(stderr, "strata-poly: CPU experts: %s byte dot products for NVFP4, IQ4_XS, IQ4_NL and Q5_0%s\n",
+                     pick ? pick->name : "no", pick ? "" : " (ggml's products)");
+        return pick;
+    }();
+    return d;
 }
 #endif
 
@@ -303,6 +365,8 @@ void Workers::run(int n, const std::function<void(int)>& fn) {
     while (users_.load() != 0) _mm_pause();
 }
 
+void cpu_experts_use_ggml(bool on) { g_use_ggml.store(on); }
+
 bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::string& err) {
     init_once();
     for (const int type : {gu_type, d_type}) {
@@ -328,6 +392,8 @@ struct Prof {
     int64_t all = 0;
     // the gate|up phase of 1- and 2-expert calls: the GPU launches (meanwhile), the workers' start, the tail
     double mw[3] = {}, start_avg[3] = {}, start_max[3] = {}, tail[3] = {}, busy_avg[3] = {};
+    // by the gate|up type (one-token calls): calls, experts, microseconds
+    double by_type[64][3] = {};
 };
 constexpr int kMaxThreads = 64;
 std::atomic<int> next_widx{0};
@@ -379,19 +445,37 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         workers.run(rows, [&](int t) { au_from(x + (size_t) t * n_embd, actup + (size_t) t * au_bytes, n_embd); });
     }
     const size_t au_step = own_act ? au_bytes : a_bytes;
-#if defined(STRATA_NVFP4_VNNI)
-    // NVFP4 gate and up: each token's activation made ready once (Ready), the rows multiplied two at a time
-    const bool fp4_gu = fp4_ok() && gu_type == GGML_TYPE_NVFP4 && u_type == GGML_TYPE_NVFP4 && n_embd % 64 == 0 &&
-                        tg->vec_dot_type == GGML_TYPE_Q8_0;
-    const bool fp4_d = fp4_ok() && d_type == GGML_TYPE_NVFP4 && n_ff % 64 == 0 && td->vec_dot_type == GGML_TYPE_Q8_0;
+#if defined(STRATA_CPU_DOTS)
+    // This file's products (cpu_dots.inc), where the CPU has a byte dot product: each token's activation made ready
+    // once (Ready, ReadyK4), gate's and up's rows multiplied two at a time; the down rows against each expert's
+    // ready h (Ready, Ready32).  Others: ggml's.
+    const Dots* const dk = g_use_ggml.load(std::memory_order_relaxed) ? nullptr : dots();
+    enum { kGgml, kFp4, kIq4xs, kIq4nl, kQ50 };
+    const bool same_gu = gu_type == u_type;
+    const int gu_k = !dk || !same_gu ? kGgml
+                     : gu_type == GGML_TYPE_NVFP4 && n_embd % 64 == 0 && tg->vec_dot_type == GGML_TYPE_Q8_0 ? kFp4
+                     : gu_type == GGML_TYPE_IQ4_XS && n_embd % 256 == 0 && tg->vec_dot_type == GGML_TYPE_Q8_K ? kIq4xs
+                     : kGgml;
+    const int d_k = !dk || td->vec_dot_type != GGML_TYPE_Q8_0 ? kGgml
+                    : d_type == GGML_TYPE_NVFP4 && n_ff % 64 == 0 ? kFp4
+                    : d_type == GGML_TYPE_IQ4_NL && n_ff % 64 == 0 ? kIq4nl
+                    : d_type == GGML_TYPE_Q5_0 && n_ff % 64 == 0 ? kQ50
+                    : kGgml;
     static thread_local std::vector<Ready> ready, ready_h;
-    const int nb_gu = n_embd / 64, nb_d = n_ff / 64;
-    if (fp4_gu) {
+    static thread_local std::vector<ReadyK4> ready_k4;
+    static thread_local std::vector<Ready32> ready_32;
+    const int nb_gu = gu_k == kIq4xs ? n_embd / 256 : n_embd / 64, nb_d = n_ff / 64;
+    if (gu_k == kFp4) {
         ready.resize((size_t) rows * nb_gu);
         for (int t = 0; t < rows; ++t)
             make_ready((const block_q8_0*) (actp + (size_t) t * a_bytes), nb_gu, ready.data() + (size_t) t * nb_gu);
+    } else if (gu_k == kIq4xs) {
+        ready_k4.resize((size_t) rows * nb_gu);
+        for (int t = 0; t < rows; ++t)
+            make_ready_k4((const block_q8_K*) (actp + (size_t) t * a_bytes), nb_gu, ready_k4.data() + (size_t) t * nb_gu);
     }
     const Ready* readyp = ready.data();
+    const ReadyK4* readyk4p = ready_k4.data();
 #endif
 
     // The uses of one expert next to each other (by), and where each expert's run of them starts (run).
@@ -457,10 +541,13 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                 const uint8_t* a = actp + (size_t) experts[j].row * a_bytes;
                 const uint8_t* au = actup + (size_t) experts[j].row * au_step;
                 float g = 0.f, u = 0.f;
-#if defined(STRATA_NVFP4_VNNI)
-                if (fp4_gu) {
-                    fp4_dot2((const block_nvfp4*) gate, (const block_nvfp4*) up,
-                             readyp + (size_t) experts[j].row * nb_gu, nb_gu, &g, &u);
+#if defined(STRATA_CPU_DOTS)
+                if (gu_k == kFp4) {
+                    dk->fp4_dot2((const block_nvfp4*) gate, (const block_nvfp4*) up,
+                                 readyp + (size_t) experts[j].row * nb_gu, nb_gu, &g, &u);
+                } else if (gu_k == kIq4xs) {
+                    dk->iq4xs_dot2((const block_iq4_xs*) gate, (const block_iq4_xs*) up,
+                                   readyk4p + (size_t) experts[j].row * nb_gu, nb_gu, &g, &u);
                 } else
 #endif
                 {
@@ -508,13 +595,18 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     uint8_t* hqp = hq.data();
     const auto hq_from = traits(td->vec_dot_type)->from_float;
     workers.run(n, [&](int j) { hq_from(hp + (size_t) j * n_ff, hqp + (size_t) j * h_bytes, n_ff); });
-#if defined(STRATA_NVFP4_VNNI)
-    if (fp4_d) {
+#if defined(STRATA_CPU_DOTS)
+    if (d_k == kFp4) {
         ready_h.resize((size_t) n * nb_d);
         for (int j = 0; j < n; ++j)
             make_ready((const block_q8_0*) (hqp + (size_t) j * h_bytes), nb_d, ready_h.data() + (size_t) j * nb_d);
+    } else if (d_k == kIq4nl || d_k == kQ50) {
+        ready_32.resize((size_t) n * nb_d);
+        for (int j = 0; j < n; ++j)
+            make_ready32((const block_q8_0*) (hqp + (size_t) j * h_bytes), 2 * nb_d, ready_32.data() + (size_t) j * nb_d);
     }
     const Ready* readyhp = ready_h.data();
+    const Ready32* ready32p = ready_32.data();
 #endif
 
     if (timed) pt[3] = PClock::now();
@@ -528,9 +620,17 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
             for (int u = 0; u < n_run; ++u) {
                 const uint8_t* down = experts[byp[runp[u]]].down + (size_t) r * d_row;
                 for (int i = runp[u]; i < runp[u + 1]; ++i) {
-#if defined(STRATA_NVFP4_VNNI)
-                    if (fp4_d) {
-                        s[byp[i]] = fp4_dot1((const block_nvfp4*) down, readyhp + (size_t) byp[i] * nb_d, nb_d);
+#if defined(STRATA_CPU_DOTS)
+                    if (d_k == kFp4) {
+                        s[byp[i]] = dk->fp4_dot1((const block_nvfp4*) down, readyhp + (size_t) byp[i] * nb_d, nb_d);
+                        continue;
+                    }
+                    if (d_k == kIq4nl) {
+                        s[byp[i]] = dk->iq4nl_dot1((const block_iq4_nl*) down, ready32p + (size_t) byp[i] * nb_d, 2 * nb_d);
+                        continue;
+                    }
+                    if (d_k == kQ50) {
+                        s[byp[i]] = dk->q50_dot1((const block_q5_0*) down, ready32p + (size_t) byp[i] * nb_d, 2 * nb_d);
                         continue;
                     }
 #endif
@@ -550,12 +650,24 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
         pt[4] = PClock::now();
         prof.calls[n] += 1;
         for (int i = 0; i < 4; ++i) prof.ph[n][i] += us_between(pt[i], pt[i + 1]);
+        if (gu_type >= 0 && gu_type < 64) {
+            double* bt = prof.by_type[gu_type];
+            bt[0] += 1;
+            bt[1] += n;
+            bt[2] += us_between(pt[0], pt[4]);
+        }
         if (++prof.all % 20000 == 0)
             for (int k = 1; k <= 8; ++k)
                 if (prof.calls[k] > 0)
                     std::fprintf(stderr, "INK_CPU_PROF %d experts: %6.0f calls, prep %5.1f  gate_up %6.1f  hq %5.1f  down %6.1f us\n",
                                  k, prof.calls[k], prof.ph[k][0] / prof.calls[k], prof.ph[k][1] / prof.calls[k],
                                  prof.ph[k][2] / prof.calls[k], prof.ph[k][3] / prof.calls[k]);
+        if (prof.all % 20000 == 0)
+            for (int k = 0; k < 64; ++k)
+                if (prof.by_type[k][0] > 0)
+                    std::fprintf(stderr, "INK_CPU_PROF type %2d (%s): %6.0f calls, %6.0f experts, %6.1f us a call, %6.1f us an expert\n",
+                                 k, ggml_type_name((ggml_type) k), prof.by_type[k][0], prof.by_type[k][1],
+                                 prof.by_type[k][2] / prof.by_type[k][0], prof.by_type[k][2] / prof.by_type[k][1]);
         if (prof.all % 20000 == 0)
             for (int k = 1; k <= 2; ++k)
                 if (prof.calls[k] > 0)

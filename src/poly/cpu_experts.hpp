@@ -64,6 +64,10 @@ struct Act {
     float beta = 0.f, lb = 0.f;
 };
 
+/// Tests and benchmarks: every product through ggml-cpu's own dot products (true), or through this file's kernels
+/// where the CPU and the format have one (false, the default; STRATA_CPU_GGML=1 starts it at true).
+void cpu_experts_use_ggml(bool on);
+
 /// Checks that ggml-cpu has a dot product for both types.  Call once per layer format at load.
 bool cpu_expert_types_ok(int gu_type, int d_type, int n_embd, int n_ff, std::string& err);
 

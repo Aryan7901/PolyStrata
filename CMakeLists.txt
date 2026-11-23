@@ -2258,6 +2258,11 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
                                                    ${_strata_gpu_include_directories})
   target_link_libraries(poly_dsv4_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   # the pool of the CPU experts, without a model
+  # times cpu_experts() like a decode, in any layer's formats; --check compares the own kernels with ggml-cpu's
+  # products.  Run by hand: poly_cpu_expert_bench GU_TYPE [D_TYPE] [experts_per_call] [threads] [calls] [--check]
+  add_executable(poly_cpu_expert_bench EXCLUDE_FROM_ALL src/poly/cpu_expert_bench.cpp src/poly/cpu_experts.cpp)
+  target_include_directories(poly_cpu_expert_bench PRIVATE ${_strata_gg}/include)
+  target_link_libraries(poly_cpu_expert_bench PRIVATE ggml-cpu ggml-base Threads::Threads)
   add_executable(poly_workers_test src/poly/workers_test.cpp src/poly/cpu_experts.cpp)
   target_include_directories(poly_workers_test PRIVATE ${_strata_gg}/include)
   target_link_libraries(poly_workers_test PRIVATE ggml-cpu ggml-base Threads::Threads)
