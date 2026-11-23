@@ -2,6 +2,7 @@
 // instruction set that has a byte dot product.  cpu_experts.cpp includes this file inside a namespace per set, with
 //   KT              the functions' target attribute
 //   DPBUSD(a, u, s) a plus the sums of each four products of u's unsigned bytes and s's signed ones (vpdpbusd)
+//   DPWSSD(a, b, c) a plus the sums of each two products of b's and c's signed 16-bit values (vpdpwssd)
 // The sets compute the same integers and the same float operations in the same order, so the same bits: the AVX-512
 // VNNI build (Zen 4, which has no AVX-VNNI) gives what the AVX-VNNI one gives.
 //
@@ -195,4 +196,120 @@ KT float q50_dot1(const block_q5_0* w, const Ready32* r, int nb) {
     return hsum8(_mm256_add_ps(a0, a1));
 }
 
-const Dots kDots = {STRATA_DOTS_NAME, fp4_dot2, fp4_dot1, iq4xs_dot2, iq4nl_dot1, q50_dot1};
+// ---- Q4_K and Q5_K x Q8_K -----------------------------------------------------------------------------------------
+// ggml's products (ggml_vec_dot_q4_K_q8_K, ggml_vec_dot_q5_K_q8_K) multiply a sub-block's 32 codes with maddubs, its
+// scale in with madd, and add.  Here one vpdpbusd multiplies and sums each four codes, and one vpdpwssd multiplies
+// those sums by the scale and adds them in: the scale in each lane's low 16 bits and 0 in the high ones, as a sum of
+// four fits 16 bits (31 * 128 * 4).  Every lane holds ggml's integer, and the mins and the float operations are
+// ggml's in ggml's order: the same bits as ggml's AVX2 products.
+
+template <bool kQ5> using KBlock = std::conditional_t<kQ5, block_q5_K, block_q4_K>;
+
+// ggml's unpacking of the 6-bit scales: u[0..1] the 8 sub-blocks' scales, u[2..3] their mins, a byte each
+inline void k_scales(const uint8_t* s12, uint32_t u[4]) {
+    constexpr uint32_t kmask1 = 0x3f3f3f3f, kmask2 = 0x0f0f0f0f, kmask3 = 0x03030303;
+    std::memcpy(u, s12, 12);
+    u[3] = ((u[2] >> 4) & kmask2) | (((u[1] >> 6) & kmask3) << 4);
+    const uint32_t uaux = u[1] & kmask1;
+    u[1] = (u[2] & kmask2) | (((u[0] >> 6) & kmask3) << 4);
+    u[2] = uaux;
+    u[0] &= kmask1;
+}
+
+// bit B of each byte of qh at bit 4 (16 in the code), the others 0.  A 16-bit shift by at most 4 moves no bit the
+// mask keeps across a byte.
+template <int B> KT inline __m256i k_bit4(__m256i qh) {
+    __m256i v = qh;
+    if constexpr (B < 4) v = _mm256_slli_epi16(qh, 4 - B);
+    else if constexpr (B > 4) v = _mm256_srli_epi16(qh, B - 4);
+    return _mm256_and_si256(v, _mm256_set1_epi8(0x10));
+}
+
+// values 64J .. 64J + 63 of a super-block (sub-blocks 2J and 2J + 1, the low and high nibbles of qs[32J ..)) into
+// the scaled sums s; sc: lane t the scale of sub-block t
+template <int J, bool kQ5>
+KT inline __m256i k_step(__m256i s, const uint8_t* qs, __m256i qh, const int8_t* q8, __m256i sc) {
+    const __m256i m4 = _mm256_set1_epi8(0x0f);
+    const __m256i q = _mm256_loadu_si256((const __m256i*) (qs + 32 * J));
+    __m256i lo = _mm256_and_si256(q, m4);
+    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m4);
+    if constexpr (kQ5) {
+        lo = _mm256_or_si256(lo, k_bit4<2 * J>(qh));
+        hi = _mm256_or_si256(hi, k_bit4<2 * J + 1>(qh));
+    }
+    const __m256i z = _mm256_setzero_si256();
+    const __m256i y0 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * J));
+    const __m256i y1 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * J + 32));
+    s = DPWSSD(s, DPBUSD(z, lo, y0), _mm256_permutevar8x32_epi32(sc, _mm256_set1_epi32(2 * J)));
+    return DPWSSD(s, DPBUSD(z, hi, y1), _mm256_permutevar8x32_epi32(sc, _mm256_set1_epi32(2 * J + 1)));
+}
+
+// one super-block of one row: d times its scaled sums into acc, its mins into acc_m (Q4_K) or summs (Q5_K), as
+// ggml's.  q8s: the activation's sums of each sub-block (bsums by twos).
+template <bool kQ5>
+KT inline void k_block(const KBlock<kQ5>& x, const block_q8_K& y, __m128i q8s, __m256& acc, __m128& acc_m,
+                       float& summs) {
+    const float d = y.d * _cvtsh_ss(x.d);
+    const float dmin = -y.d * _cvtsh_ss(x.dmin);
+    uint32_t u[4];
+    k_scales(x.scales, u);
+    const __m256i ms = _mm256_cvtepu8_epi16(_mm_set_epi32((int) u[3], (int) u[2], (int) u[1], (int) u[0]));
+    const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(ms, 1), q8s);
+    if constexpr (kQ5) {
+        const __m128i z = _mm_setzero_si128();
+        summs += dmin * _mm_extract_epi32(_mm_hadd_epi32(_mm_hadd_epi32(prod, z), z), 0);
+    } else {
+        acc_m = _mm_fmadd_ps(_mm_set1_ps(dmin), _mm_cvtepi32_ps(prod), acc_m);
+    }
+    const __m256i sc = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(ms));
+    __m256i qh = _mm256_setzero_si256();
+    if constexpr (kQ5) qh = _mm256_loadu_si256((const __m256i*) x.qh);
+    __m256i s = _mm256_setzero_si256();
+    s = k_step<0, kQ5>(s, x.qs, qh, y.qs, sc);
+    s = k_step<1, kQ5>(s, x.qs, qh, y.qs, sc);
+    s = k_step<2, kQ5>(s, x.qs, qh, y.qs, sc);
+    s = k_step<3, kQ5>(s, x.qs, qh, y.qs, sc);
+    acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(s), acc);
+}
+
+KT inline __m128i k_q8s(const block_q8_K& y) {
+    const __m256i b = _mm256_loadu_si256((const __m256i*) y.bsums);
+    return _mm_hadd_epi16(_mm256_castsi256_si128(b), _mm256_extracti128_si256(b, 1));
+}
+
+template <bool kQ5> KT inline float k_total(__m256 acc, __m128 acc_m, float summs) {
+    if constexpr (kQ5) {
+        return hsum8(acc) + summs;
+    } else {
+        acc_m = _mm_add_ps(acc_m, _mm_movehl_ps(acc_m, acc_m));
+        acc_m = _mm_add_ss(acc_m, _mm_movehdup_ps(acc_m));
+        return hsum8(acc) + _mm_cvtss_f32(acc_m);
+    }
+}
+
+// rows w0 and w1 (nb super-blocks each) against one activation
+template <bool kQ5>
+KT void k_dot2(const KBlock<kQ5>* w0, const KBlock<kQ5>* w1, const block_q8_K* y, int nb, float* s0, float* s1) {
+    __m256 a0 = _mm256_setzero_ps(), a1 = _mm256_setzero_ps();
+    __m128 m0 = _mm_setzero_ps(), m1 = _mm_setzero_ps();
+    float sm0 = 0.f, sm1 = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const __m128i q8s = k_q8s(y[i]);
+        k_block<kQ5>(w0[i], y[i], q8s, a0, m0, sm0);
+        k_block<kQ5>(w1[i], y[i], q8s, a1, m1, sm1);
+    }
+    *s0 = k_total<kQ5>(a0, m0, sm0);
+    *s1 = k_total<kQ5>(a1, m1, sm1);
+}
+
+template <bool kQ5>
+KT float k_dot1(const KBlock<kQ5>* w, const block_q8_K* y, int nb) {
+    __m256 a = _mm256_setzero_ps();
+    __m128 m = _mm_setzero_ps();
+    float sm = 0.f;
+    for (int i = 0; i < nb; ++i) k_block<kQ5>(w[i], y[i], k_q8s(y[i]), a, m, sm);
+    return k_total<kQ5>(a, m, sm);
+}
+
+const Dots kDots = {STRATA_DOTS_NAME, fp4_dot2, fp4_dot1, iq4xs_dot2, iq4nl_dot1, q50_dot1,
+                    k_dot2<false>, k_dot2<true>, k_dot1<false>, k_dot1<true>};

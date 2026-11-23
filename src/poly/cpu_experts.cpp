@@ -15,6 +15,7 @@
 #include <immintrin.h>
 #include <mutex>
 #include <numeric>
+#include <type_traits>
 
 namespace strata::poly {
 namespace {
@@ -113,8 +114,20 @@ struct block_q5_0 {
     uint8_t qh[4];        // the fifth bit of value j at bit j
     uint8_t qs[16];       // the low four: values j (low nibble) and j + 16 (high)
 };
+struct block_q4_K {
+    uint16_t d, dmin;
+    uint8_t scales[12];   // the 8 sub-blocks' 6-bit scales and mins (ggml's get_scale_min_k4)
+    uint8_t qs[128];      // 64 values at a time: sub-block 2j in the low nibbles of qs[32j ..), 2j + 1 in the high
+};
+struct block_q5_K {
+    uint16_t d, dmin;
+    uint8_t scales[12];
+    uint8_t qh[32];       // the fifth bit of value l of sub-block s: bit s of qh[l]
+    uint8_t qs[128];      // the low four, as Q4_K's
+};
 static_assert(sizeof(block_nvfp4) == 36 && sizeof(block_q8_0) == 34 && sizeof(block_q8_K) == 292 &&
-                  sizeof(block_iq4_xs) == 136 && sizeof(block_iq4_nl) == 18 && sizeof(block_q5_0) == 22,
+                  sizeof(block_iq4_xs) == 136 && sizeof(block_iq4_nl) == 18 && sizeof(block_q5_0) == 22 &&
+                  sizeof(block_q4_K) == 144 && sizeof(block_q5_K) == 176,
               "ggml's block layouts");
 
 // NVFP4 x Q8_0 on a byte dot product (VNNI).  ggml's product (ggml_vec_dot_nvfp4_q8_0) reorders the activation's
@@ -213,25 +226,33 @@ struct Dots {
     void (*iq4xs_dot2)(const block_iq4_xs*, const block_iq4_xs*, const ReadyK4*, int, float*, float*);
     float (*iq4nl_dot1)(const block_iq4_nl*, const Ready32*, int);
     float (*q50_dot1)(const block_q5_0*, const Ready32*, int);
+    void (*q4k_dot2)(const block_q4_K*, const block_q4_K*, const block_q8_K*, int, float*, float*);
+    void (*q5k_dot2)(const block_q5_K*, const block_q5_K*, const block_q8_K*, int, float*, float*);
+    float (*q4k_dot1)(const block_q4_K*, const block_q8_K*, int);
+    float (*q5k_dot1)(const block_q5_K*, const block_q8_K*, int);
 };
 
 // compiled for these sets whatever the unit's flags (the engine is built for any x86-64), used where the CPU has them
 namespace avx_vnni {   // Intel from Alder Lake, AMD from Zen 5
 #define KT __attribute__((target("avx2,fma,f16c,avxvnni")))
 #define DPBUSD(a, u, s) _mm256_dpbusd_avx_epi32(a, u, s)
+#define DPWSSD(a, b, c) _mm256_dpwssd_avx_epi32(a, b, c)
 #define STRATA_DOTS_NAME "AVX-VNNI"
 #include "cpu_dots.inc"
 #undef KT
 #undef DPBUSD
+#undef DPWSSD
 #undef STRATA_DOTS_NAME
 }  // namespace avx_vnni
 namespace avx512_vnni {   // the same products on 256-bit AVX-512 VNNI: Zen 4, Intel server parts without AVX-VNNI
 #define KT __attribute__((target("avx2,fma,f16c,avx512f,avx512vl,avx512bw,avx512vnni")))
 #define DPBUSD(a, u, s) _mm256_dpbusd_epi32(a, u, s)
+#define DPWSSD(a, b, c) _mm256_dpwssd_epi32(a, b, c)
 #define STRATA_DOTS_NAME "AVX-512 VNNI"
 #include "cpu_dots.inc"
 #undef KT
 #undef DPBUSD
+#undef DPWSSD
 #undef STRATA_DOTS_NAME
 }  // namespace avx512_vnni
 
@@ -249,7 +270,7 @@ const Dots* dots() {
         if (want && std::strcmp(want, "none") == 0) pick = nullptr;
         else if (want && std::strcmp(want, "avx512vnni") == 0) pick = v512 ? &avx512_vnni::kDots : nullptr;
         else if (want && std::strcmp(want, "avxvnni") == 0) pick = v256 ? &avx_vnni::kDots : nullptr;
-        std::fprintf(stderr, "strata-poly: CPU experts: %s byte dot products for NVFP4, IQ4_XS, IQ4_NL and Q5_0%s\n",
+        std::fprintf(stderr, "strata-poly: CPU experts: %s byte dot products for NVFP4, IQ4_XS, IQ4_NL, Q5_0, Q4_K and Q5_K%s\n",
                      pick ? pick->name : "no", pick ? "" : " (ggml's products)");
         return pick;
     }();
@@ -448,15 +469,22 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
 #if defined(STRATA_CPU_DOTS)
     // This file's products (cpu_dots.inc), where the CPU has a byte dot product: each token's activation made ready
     // once (Ready, ReadyK4), gate's and up's rows multiplied two at a time; the down rows against each expert's
-    // ready h (Ready, Ready32).  Others: ggml's.
+    // ready h (Ready, Ready32).  Q4_K and Q5_K read ggml's Q8_K activation as it is.  Others: ggml's.
     const Dots* const dk = g_use_ggml.load(std::memory_order_relaxed) ? nullptr : dots();
-    enum { kGgml, kFp4, kIq4xs, kIq4nl, kQ50 };
+    enum { kGgml, kFp4, kIq4xs, kIq4nl, kQ50, kQ4k, kQ5k };
+    const bool k_gu = tg->vec_dot_type == GGML_TYPE_Q8_K && n_embd % 256 == 0;
+    const bool k_d = td->vec_dot_type == GGML_TYPE_Q8_K && n_ff % 256 == 0;
     const bool same_gu = gu_type == u_type;
     const int gu_k = !dk || !same_gu ? kGgml
                      : gu_type == GGML_TYPE_NVFP4 && n_embd % 64 == 0 && tg->vec_dot_type == GGML_TYPE_Q8_0 ? kFp4
                      : gu_type == GGML_TYPE_IQ4_XS && n_embd % 256 == 0 && tg->vec_dot_type == GGML_TYPE_Q8_K ? kIq4xs
+                     : gu_type == GGML_TYPE_Q4_K && k_gu ? kQ4k
+                     : gu_type == GGML_TYPE_Q5_K && k_gu ? kQ5k
                      : kGgml;
-    const int d_k = !dk || td->vec_dot_type != GGML_TYPE_Q8_0 ? kGgml
+    const int d_k = !dk ? kGgml
+                    : d_type == GGML_TYPE_Q4_K && k_d ? kQ4k
+                    : d_type == GGML_TYPE_Q5_K && k_d ? kQ5k
+                    : td->vec_dot_type != GGML_TYPE_Q8_0 ? kGgml
                     : d_type == GGML_TYPE_NVFP4 && n_ff % 64 == 0 ? kFp4
                     : d_type == GGML_TYPE_IQ4_NL && n_ff % 64 == 0 ? kIq4nl
                     : d_type == GGML_TYPE_Q5_0 && n_ff % 64 == 0 ? kQ50
@@ -464,7 +492,7 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
     static thread_local std::vector<Ready> ready, ready_h;
     static thread_local std::vector<ReadyK4> ready_k4;
     static thread_local std::vector<Ready32> ready_32;
-    const int nb_gu = gu_k == kIq4xs ? n_embd / 256 : n_embd / 64, nb_d = n_ff / 64;
+    const int nb_gu = gu_k == kIq4xs || gu_k == kQ4k || gu_k == kQ5k ? n_embd / 256 : n_embd / 64, nb_d = n_ff / 64;
     if (gu_k == kFp4) {
         ready.resize((size_t) rows * nb_gu);
         for (int t = 0; t < rows; ++t)
@@ -548,6 +576,10 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                 } else if (gu_k == kIq4xs) {
                     dk->iq4xs_dot2((const block_iq4_xs*) gate, (const block_iq4_xs*) up,
                                    readyk4p + (size_t) experts[j].row * nb_gu, nb_gu, &g, &u);
+                } else if (gu_k == kQ4k) {
+                    dk->q4k_dot2((const block_q4_K*) gate, (const block_q4_K*) up, (const block_q8_K*) a, nb_gu, &g, &u);
+                } else if (gu_k == kQ5k) {
+                    dk->q5k_dot2((const block_q5_K*) gate, (const block_q5_K*) up, (const block_q8_K*) a, nb_gu, &g, &u);
                 } else
 #endif
                 {
@@ -631,6 +663,16 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                     }
                     if (d_k == kQ50) {
                         s[byp[i]] = dk->q50_dot1((const block_q5_0*) down, ready32p + (size_t) byp[i] * nb_d, 2 * nb_d);
+                        continue;
+                    }
+                    if (d_k == kQ4k) {
+                        s[byp[i]] = dk->q4k_dot1((const block_q4_K*) down,
+                                                 (const block_q8_K*) (hqp + (size_t) byp[i] * h_bytes), n_ff / 256);
+                        continue;
+                    }
+                    if (d_k == kQ5k) {
+                        s[byp[i]] = dk->q5k_dot1((const block_q5_K*) down,
+                                                 (const block_q8_K*) (hqp + (size_t) byp[i] * h_bytes), n_ff / 256);
                         continue;
                     }
 #endif

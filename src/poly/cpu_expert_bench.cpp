@@ -47,7 +47,10 @@ int main(int argc, char** argv) {
     const int per_call = args.size() > 2 ? std::atoi(args[2].c_str()) : 2;
     const int threads = args.size() > 3 ? std::atoi(args[3].c_str()) : 13;
     const int calls = args.size() > 4 ? std::atoi(args[4].c_str()) : 400;
-    const int n_embd = 2304, n_ff = 1152, pool = 160;
+    // Inkling 2's shape; POLY_BENCH_SHAPE=n_embd,n_ff another (2048,512: Tiel-Coder's, whose rows K-quants fit)
+    int n_embd = 2304, n_ff = 1152;
+    if (const char* sh = std::getenv("POLY_BENCH_SHAPE")) std::sscanf(sh, "%d,%d", &n_embd, &n_ff);
+    const int pool = 160;
     ggml_cpu_init();
     const size_t gu_row = ggml_row_size((ggml_type) gt, n_embd), d_row = ggml_row_size((ggml_type) dt, n_ff);
     const size_t gu = gu_row * n_ff, dn = d_row * n_embd, one = (2 * gu + dn + 63) / 64 * 64;
