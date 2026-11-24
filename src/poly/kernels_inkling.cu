@@ -387,13 +387,17 @@ __global__ void gemv_wide_kernel(GemvJobsT<W> jobs, int n_in, int n_out) {
 }
 
 // A warp's output o of R tokens: its lanes' products, then the warp's sum
-template <int R>
-__device__ __forceinline__ void gemv_short_row(const float* wr, const float* x, int n_in,
+// One weight as a float: as stored, or BF16 widened by a shift
+__device__ __forceinline__ float load_w1(const float* p) { return *p; }
+__device__ __forceinline__ float load_w1(const uint16_t* p) { return __uint_as_float((uint32_t) *p << 16); }
+
+template <int R, class W>
+__device__ __forceinline__ void gemv_short_row(const W* wr, const float* x, int n_in,
                                                int lane, float* acc) {
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
     for (int i = lane; i < n_in; i += WARP) {
-        const float wv = wr[i];
+        const float wv = load_w1(wr + i);
 #pragma unroll
         for (int r = 0; r < R; ++r) acc[r] += wv * x[(size_t) r * n_in + i];
     }
@@ -401,8 +405,8 @@ __device__ __forceinline__ void gemv_short_row(const float* wr, const float* x, 
     for (int r = 0; r < R; ++r) acc[r] = warp_sum(acc[r]);
 }
 
-template <int R>
-__global__ void gemv_short_kernel(GemvJobs jobs, int n_in, int n_out) {
+template <int R, class W>
+__global__ void gemv_short_kernel(GemvJobsT<W> jobs, int n_in, int n_out) {
     pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
     pdl_wait();
     const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
@@ -437,22 +441,24 @@ __global__ void gate_kernel(const float* cur, int cur_stride, const float* msg,
 // The controller's second product (its gain then its forget rows, 2n of them, of h) and its gate in one launch: a
 // warp takes an output o's gain and forget rows as gemv_short_kernel takes a row, and gates value o of each token.
 // Up to four controllers (blockIdx.y), each its own matrix, h, cur, msg and out.
-struct GateJobs {
-    const float* w[GEMV_JOBS];
+template <class W>
+struct GateJobsT {
+    const W* w[GEMV_JOBS];
     const float* h[GEMV_JOBS];
     const float* cur[GEMV_JOBS];
     const float* msg[GEMV_JOBS];
     float* out[GEMV_JOBS];
 };
+using GateJobs = GateJobsT<float>;
 
-template <int R>
-__global__ void gate_gemv_kernel(GateJobs jobs, int n_in, int n, int cur_stride, int msg_stride) {
+template <int R, class W>
+__global__ void gate_gemv_kernel(GateJobsT<W> jobs, int n_in, int n, int cur_stride, int msg_stride) {
     pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
     pdl_wait();
     const int o = blockIdx.x * (blockDim.x / WARP) + threadIdx.x / WARP, lane = threadIdx.x % WARP;
     if (o >= n) return;
     const int j = blockIdx.y;
-    const float* w = pick(jobs.w, j);
+    const W* w = pick(jobs.w, j);
     const float* h = pick(jobs.h, j);
     float g[R], f[R];
     gemv_short_row<R>(w + (size_t) o * n_in, h, n_in, lane, g);
@@ -3068,54 +3074,75 @@ void by_rows(int rows, F&& f) {
 }
 }  // namespace
 
+namespace {
+// The products of up to 4 jobs for weights of type W: float, or BF16 widened exactly (load_w4(), load_w1()).  The same
+// kernel for the same shape whatever W, so the same sums and bits.
+template <class W>
+bool gemv_jobs(const W* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out, int rows,
+               void* stream, const char* what) {
+    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || jobs < 1 || jobs > GEMV_JOBS) return false;
+    GemvJobsT<W> J{};
+    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.x[j] = x[j], J.y[j] = y[j];
+    const cudaStream_t st = cs(stream);
+    by_rows(rows, [&](auto rr) {
+        constexpr int R = decltype(rr)::value;
+        if (n_in >= 512)
+            launch_pdl(gemv_wide_kernel<R, W>, dim3(dim3(n_out, jobs)), dim3(256), 0, st, J, n_in, n_out);
+        else
+            launch_pdl(gemv_short_kernel<R, W>, dim3(dim3(grid(n_out, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n_out);
+    });
+    ck(what);
+    return true;
+}
+
+template <class W>
+bool gate_gemv_jobs(const W* const* w, const float* const* h, const float* const* cur, int cur_stride,
+                    const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
+                    void* stream, const char* what) {
+    // gemv_short_kernel's shape only: below it, the product is gemv_wide_kernel's and the sums are others
+    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || n_in >= 512 || jobs < 1 || jobs > GEMV_JOBS) return false;
+    GateJobsT<W> J{};
+    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.h[j] = h[j], J.cur[j] = cur[j], J.msg[j] = msg[j], J.out[j] = out[j];
+    const cudaStream_t st = cs(stream);
+    by_rows(rows, [&](auto rr) {
+        constexpr int R = decltype(rr)::value;
+        launch_pdl(gate_gemv_kernel<R, W>, dim3(dim3(grid(n, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n, cur_stride,
+                   msg_stride);
+    });
+    ck(what);
+    return true;
+}
+}  // namespace
+
 bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream) {
     return ink_gemv_f32_jobs(&w, &x, &y, 1, n_in, n_out, rows, stream);
 }
 
 bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out,
                        int rows, void* stream) {
-    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || jobs < 1 || jobs > GEMV_JOBS) return false;
-    GemvJobs J{};
-    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.x[j] = x[j], J.y[j] = y[j];
-    const cudaStream_t st = cs(stream);
-    by_rows(rows, [&](auto rr) {
-        constexpr int R = decltype(rr)::value;
-        if (n_in >= 512)
-            launch_pdl(gemv_wide_kernel<R, float>, dim3(dim3(n_out, jobs)), dim3(256), 0, st, J, n_in, n_out);
-        else launch_pdl(gemv_short_kernel<R>, dim3(dim3(grid(n_out, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n_out);
-    });
-    ck("ink_gemv_f32");
-    return true;
+    return gemv_jobs(w, x, y, jobs, n_in, n_out, rows, stream, "ink_gemv_f32");
 }
 
-// ink_gemv_f32()'s wide kernel on the widened weights: the same launch, products and sums, so the same bits
 bool ink_gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream) {
-    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || n_in < 512) return false;
-    GemvJobsT<uint16_t> J{};
-    J.w[0] = w, J.x[0] = x, J.y[0] = y;
-    const cudaStream_t st = cs(stream);
-    by_rows(rows, [&](auto rr) {
-        constexpr int R = decltype(rr)::value;
-        launch_pdl(gemv_wide_kernel<R, uint16_t>, dim3(dim3(n_out, 1)), dim3(256), 0, st, J, n_in, n_out);
-    });
-    ck("ink_gemv_bf16");
-    return true;
+    return ink_gemv_bf16_jobs(&w, &x, &y, 1, n_in, n_out, rows, stream);
+}
+
+bool ink_gemv_bf16_jobs(const uint16_t* const* w, const float* const* x, float* const* y, int jobs, int n_in,
+                        int n_out, int rows, void* stream) {
+    return gemv_jobs(w, x, y, jobs, n_in, n_out, rows, stream, "ink_gemv_bf16");
 }
 
 bool ink_gate_gemv(const float* const* w, const float* const* h, const float* const* cur, int cur_stride,
                    const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
                    void* stream) {
-    // gemv_short_kernel's shape only: below it, the product is gemv_wide_kernel's and the sums are others
-    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || n_in >= 512 || jobs < 1 || jobs > GEMV_JOBS) return false;
-    GateJobs J{};
-    for (int j = 0; j < jobs; ++j) J.w[j] = w[j], J.h[j] = h[j], J.cur[j] = cur[j], J.msg[j] = msg[j], J.out[j] = out[j];
-    const cudaStream_t st = cs(stream);
-    by_rows(rows, [&](auto rr) {
-        constexpr int R = decltype(rr)::value;
-        launch_pdl(gate_gemv_kernel<R>, dim3(dim3(grid(n, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n, cur_stride, msg_stride);
-    });
-    ck("ink_gate_gemv");
-    return true;
+    return gate_gemv_jobs(w, h, cur, cur_stride, msg, msg_stride, out, jobs, n_in, n, rows, stream, "ink_gate_gemv");
+}
+
+bool ink_gate_gemv_bf16(const uint16_t* const* w, const float* const* h, const float* const* cur, int cur_stride,
+                        const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
+                        void* stream) {
+    return gate_gemv_jobs(w, h, cur, cur_stride, msg, msg_stride, out, jobs, n_in, n, rows, stream,
+                          "ink_gate_gemv_bf16");
 }
 
 void ink_mul_sigmoid_q8(float* acc, const float* g, int n, int rows, int g_stride, void* y_q8_1, void* stream) {

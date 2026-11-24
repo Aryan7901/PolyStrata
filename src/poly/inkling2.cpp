@@ -46,7 +46,7 @@ int Inkling2::file_layer(int il) const {
     return il - (passes_ - 1) * core;
 }
 
-Dev Inkling2::fused(int il, std::initializer_list<const char*> names, int64_t n_in) {
+Dev Inkling2::fused(int il, std::initializer_list<const char*> names, int64_t n_in, bool bf16) {
     std::vector<const TensorInfo*> ts;
     size_t bytes = 0;
     int64_t rows = 0;
@@ -62,19 +62,45 @@ Dev Inkling2::fused(int il, std::initializer_list<const char*> names, int64_t n_
         ts.push_back(t);
         bytes += home(*t).payload(*t);
         rows += (int64_t) (t->elements() / t->shape[0]);
+        bf16 = bf16 && exact_bf16(t);
     }
-    const Dev d{dense_ ? dense_ + dense_at_ : nullptr, ts.front()->type, (int) n_in, (int) rows};
-    dense_at_ += pad(bytes) + kTail;
+    // as BF16: each F32 value's high half, which is all of it
+    const size_t out = bf16 ? bytes / 2 : bytes;
+    const Dev d{dense_ ? dense_ + dense_at_ : nullptr, bf16 ? kTypeBF16 : ts.front()->type, (int) n_in, (int) rows};
+    dense_at_ += pad(out) + kTail;
+    if (bf16) bf16_max_ = std::max(bf16_max_, (size_t) n_in * (size_t) rows);
     if (!dense_) return d;
     if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for " + ts.front()->name);
     size_t at = 0;
+    std::vector<uint16_t> half;
     for (const TensorInfo* t : ts) {
         const size_t b = home(*t).payload(*t);
         uploaded_.emplace_back(home(*t).data(*t), b);
+        if (bf16) {
+            const uint32_t* v = (const uint32_t*) home(*t).data(*t);
+            half.resize(b / 4);
+            for (size_t i = 0; i < half.size(); ++i) half[i] = (uint16_t) (v[i] >> 16);
+            h2d((uint8_t*) d.p + at, half.data(), b / 2);
+            at += b / 2;
+            continue;
+        }
         h2d((uint8_t*) d.p + at, home(*t).data(*t), b);
         at += b;
     }
     return d;
+}
+
+bool Inkling2::bf16_exact_ok() const {
+    const int rows = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
+    return rows <= 8 || rows >= kStageRows;
+}
+
+bool Inkling2::loop_bf16() const {
+    static const bool on = [] {
+        const char* e = std::getenv("INK_LOOP_BF16");
+        return !(e && std::atoi(e) == 0);
+    }();
+    return on && bf16_exact_ok();
 }
 
 // The loop's message queries (loop_res_query, loop_kv_res_query: two rows a run of the core each) as one table, a
@@ -436,8 +462,9 @@ void Inkling2::load_layer(int il) {
             const std::string d = std::string("loop_") + kModule[m] + "_down.weight";
             const std::string g = std::string("loop_") + kModule[m] + "_gain.weight";
             const std::string f = std::string("loop_") + kModule[m] + "_forget.weight";
-            B.loop_down[m] = mat(d.c_str(), 2 * (int64_t) n_embd_, gate_rank_);
-            B.loop_gf[m] = fused(il, {g.c_str(), f.c_str()}, gate_rank_);
+            B.loop_down[m] = upload(tensor(il, d.c_str()), blk(B.file, d.c_str()), 2 * (int64_t) n_embd_, gate_rank_,
+                                    loop_bf16() ? kExactBF16 : kAnyMat);
+            B.loop_gf[m] = fused(il, {g.c_str(), f.c_str()}, gate_rank_, loop_bf16());
             if (B.loop_gf[m].n_out != 2 * n_embd_) throw std::runtime_error(blk(B.file, g.c_str()) + ": bad shape");
         }
     }
@@ -585,16 +612,22 @@ void Inkling2::assign_scratch() {
 // h = D [rms(x); rms(msg)].
 void Inkling2::control(Block& B, int m, float* x, const float* msg, int n) {
     ink_rms2(x, msg, ctl_, n_embd_, n, kMixEps, st_);
-    lin_f32(B.loop_down[m], ctl_, ctl_h_, n);
-    // G h, F h and the gate in one launch, where the product would be ink_gemv_f32's (lin_f32)
+    lin_exact(B.loop_down[m], ctl_, ctl_h_, n);
+    // G h, F h and the gate in one launch, where the product would be ink_gemv_f32's (lin_f32); a BF16 gf (loop_bf16())
+    // through the same kernel on its widened weights
     const Dev& gf = B.loop_gf[m];
-    const float* w = fp(gf);
     const float* h = ctl_h_;
     const float* cur = x;
-    if (gf.type == kTypeF32 && gf.scale == 1.0f && n < kStageRows &&
-        ink_gate_gemv(&w, &h, &cur, n_embd_, &msg, n_embd_, &x, 1, gf.n_in, n_embd_, n, st_))
-        return;
-    lin_f32(gf, ctl_h_, ctl_g_, n);
+    if (gf.scale == 1.0f && n < kStageRows) {
+        if (gf.type == kTypeF32) {
+            const float* w = fp(gf);
+            if (ink_gate_gemv(&w, &h, &cur, n_embd_, &msg, n_embd_, &x, 1, gf.n_in, n_embd_, n, st_)) return;
+        } else if (gf.type == kTypeBF16) {
+            const uint16_t* w = (const uint16_t*) gf.p;
+            if (ink_gate_gemv_bf16(&w, &h, &cur, n_embd_, &msg, n_embd_, &x, 1, gf.n_in, n_embd_, n, st_)) return;
+        }
+    }
+    lin_exact(gf, ctl_h_, ctl_g_, n);
     ink_gate(x, n_embd_, msg, n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, x, n_embd_, n, st_);
 }
 
@@ -602,38 +635,50 @@ void Inkling2::control(Block& B, int m, float* x, const float* msg, int n) {
 // in place: each step of the three in one launch where the products are ink_gemv_f32's (a few tokens), the same sums.
 void Inkling2::control3(Block& B, float* const* x, const float* const* msg, float* const* out, int n) {
     const size_t e = (size_t) n_embd_, rank = (size_t) std::max(gate_rank_, 1);
-    bool jobs = n < kStageRows;
-    for (int j = 0; j < 3; ++j)
-        for (const Dev* d : {&B.loop_down[j], &B.loop_gf[j]})
-            jobs = jobs && d->type == kTypeF32 && d->scale == 1.0f;
+    // one type for the three downs and one for the three gfs, each F32 or (loop_bf16()) BF16 of the same values
+    const uint32_t td = B.loop_down[0].type, tg = B.loop_gf[0].type;
+    bool jobs = n < kStageRows && (td == kTypeF32 || td == kTypeBF16) && (tg == kTypeF32 || tg == kTypeBF16);
+    for (int j = 0; j < 3; ++j) {
+        jobs = jobs && B.loop_down[j].type == td && B.loop_gf[j].type == tg;
+        for (const Dev* d : {&B.loop_down[j], &B.loop_gf[j]}) jobs = jobs && d->scale == 1.0f;
+    }
     if (!jobs) {   // a prompt batch: control()'s launches each, into out[j]
         for (int j = 0; j < 3; ++j) {
             ink_rms2(x[j], msg[j], ctl_, n_embd_, n, kMixEps, st_);
-            lin_f32(B.loop_down[j], ctl_, ctl_h_, n);
-            lin_f32(B.loop_gf[j], ctl_h_, ctl_g_, n);
+            lin_exact(B.loop_down[j], ctl_, ctl_h_, n);
+            lin_exact(B.loop_gf[j], ctl_h_, ctl_g_, n);
             ink_gate(x[j], n_embd_, msg[j], n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, out[j], n_embd_, n, st_);
         }
         return;
     }
     const float* xs[3] = {x[0], x[1], x[2]};
-    const float* down[3];
-    const float* gf[3];
+    const void* down[3];
+    const void* gf[3];
     const float* c[3];
     const float* hc[3];
     float* h[3];
     for (int j = 0; j < 3; ++j) {
-        down[j] = fp(B.loop_down[j]);
-        gf[j] = fp(B.loop_gf[j]);
+        down[j] = B.loop_down[j].p;
+        gf[j] = B.loop_gf[j].p;
         c[j] = ctl_ + (size_t) j * n * 2 * e;
         h[j] = ctl_h_ + (size_t) j * n * rank;
         hc[j] = h[j];
     }
     ink_rms2_jobs(xs, msg, 3, ctl_, n_embd_, n, kMixEps, st_);
-    if (!ink_gemv_f32_jobs(down, c, h, 3, B.loop_down[0].n_in, B.loop_down[0].n_out, n, st_))
-        for (int j = 0; j < 3; ++j) lin_f32(B.loop_down[j], c[j], h[j], n);
-    if (ink_gate_gemv(gf, hc, xs, n_embd_, msg, n_embd_, out, 3, B.loop_gf[0].n_in, n_embd_, n, st_)) return;
+    const int din = B.loop_down[0].n_in, dout = B.loop_down[0].n_out;
+    const bool downs = td == kTypeF32 ? ink_gemv_f32_jobs((const float* const*) down, c, h, 3, din, dout, n, st_)
+                                      : ink_gemv_bf16_jobs((const uint16_t* const*) down, c, h, 3, din, dout, n, st_);
+    if (!downs)
+        for (int j = 0; j < 3; ++j) lin_exact(B.loop_down[j], c[j], h[j], n);
+    const int gin = B.loop_gf[0].n_in;
+    const bool gated =
+        tg == kTypeF32
+            ? ink_gate_gemv((const float* const*) gf, hc, xs, n_embd_, msg, n_embd_, out, 3, gin, n_embd_, n, st_)
+            : ink_gate_gemv_bf16((const uint16_t* const*) gf, hc, xs, n_embd_, msg, n_embd_, out, 3, gin, n_embd_, n,
+                                 st_);
+    if (gated) return;
     for (int j = 0; j < 3; ++j) {
-        lin_f32(B.loop_gf[j], h[j], ctl_g_, n);
+        lin_exact(B.loop_gf[j], h[j], ctl_g_, n);
         ink_gate(x[j], n_embd_, msg[j], n_embd_, ctl_g_, ctl_g_ + n_embd_, 2 * n_embd_, out[j], n_embd_, n, st_);
     }
 }
@@ -1198,34 +1243,33 @@ void Inkling2::lin_f32(const Dev& w, const float* x, float* y, int n) {
     lin(w, x, y, n);
 }
 
+// A BF16 matrix (its F32 values cut exactly) gives the F32 one's bits: a few tokens through ink_gemv_bf16(), the
+// kernel ink_gemv_f32() takes for the shape on the widened weights, and other calls widen it into floats (lin()'s
+// wf_) for the F32 way.
+void Inkling2::lin_exact(const Dev& w, const float* x, float* y, int n) {
+    if (w.type != kTypeBF16) return lin_f32(w, x, y, n);
+    if (n < kStageRows && w.scale == 1.0f && ink_gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, n, st_))
+        return;
+    const size_t count = (size_t) w.n_in * (size_t) w.n_out;
+    if (!wf_ || count > bf16_max_) throw std::logic_error("a BF16 matrix of F32 values without room to widen it");
+    bf16_to_f32((const uint16_t*) w.p, wf_, count, st_);
+    Dev f = w;
+    f.p = wf_;
+    f.type = kTypeF32;
+    lin_f32(f, x, y, n);
+}
+
 bool Inkling2::router_bf16() const {
     static const bool on = [] {
         const char* e = std::getenv("INK_ROUTER_BF16");
         return !(e && std::atoi(e) == 0);
     }();
-    // a call of 9 to 31 tokens widens the router into wf_, which shared_scratch() gives only a scratch of kStageRows
-    // rows or more (rows_ as it will be set)
-    const int rows = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
-    return on && (rows <= 8 || rows >= kStageRows);
+    return on && bf16_exact_ok();
 }
 
-// The router's matrix on the experts' input; a prompt batch's through SGEMM.  A BF16 router (router_bf16(): its F32
-// values cut exactly) gives the F32 one's bits: a few tokens through ink_gemv_bf16(), ink_gemv_f32()'s kernel on the
-// widened weights, and other calls widen it into floats (lin()'s wf_) for the F32 way.
-void Inkling2::router_scores(const Layer& L, int n) {
-    const Dev& w = L.gate_inp;
-    if (w.type != kTypeBF16) return lin_f32(w, xn_, rl_, n);
-    if (n < kStageRows && w.scale == 1.0f &&
-        ink_gemv_bf16((const uint16_t*) w.p, xn_, rl_, w.n_in, w.n_out, n, st_))
-        return;
-    const size_t count = (size_t) w.n_in * (size_t) w.n_out;
-    if (!wf_ || count > bf16_max_) throw std::logic_error("a BF16 router without room to widen it");
-    bf16_to_f32((const uint16_t*) w.p, wf_, count, st_);
-    Dev f = w;
-    f.p = wf_;
-    f.type = kTypeF32;
-    lin_f32(f, xn_, rl_, n);
-}
+// The router's matrix on the experts' input (F32 or, router_bf16(), BF16 of the same values); a prompt batch's
+// through SGEMM.
+void Inkling2::router_scores(const Layer& L, int n) { lin_exact(L.gate_inp, xn_, rl_, n); }
 
 void Inkling2::moe_shared(const Layer&, int, int n) {
     ck(cudaMemsetAsync(fo_, 0, (size_t) n * n_embd_ * sizeof(float), cs(st_)), "experts");

@@ -114,8 +114,15 @@ private:
 
     void attention(Layer& L, Block& B, int n);
     /// Matrices of one input stacked as one (their rows one after the other), uploaded as they are: one product
-    /// for all of them.  The same type each, n_in values a row.
-    Dev fused(int il, std::initializer_list<const char*> names, int64_t n_in);
+    /// for all of them.  The same type each, n_in values a row.  bf16: F32 ones whose values are all BF16 ones
+    /// (exact_bf16()) go as BF16, the same values in half the bytes.
+    Dev fused(int il, std::initializer_list<const char*> names, int64_t n_in, bool bf16 = false);
+    /// The loop controllers (loop_*_down, gain and forget: F32 of BF16 values in Unsloth's files) as BF16, read with the
+    /// F32 ones' sums.  INK_LOOP_BF16=0 keeps them F32.
+    bool loop_bf16() const;
+    /// A BF16 matrix of exact F32 values can be multiplied with the F32 one's bits in every call this engine makes: a
+    /// call of 9 to 31 tokens widens it into wf_, which shared_scratch() gives only a scratch of kStageRows rows or more.
+    bool bf16_exact_ok() const;
     Dev msg_queries();
     /// The loop's message controller of module m on rows of x (n_embd a token, contiguous), in place.
     void control(Block& B, int m, float* x, const float* msg, int n);
@@ -145,6 +152,9 @@ private:
     void kv4_compare(const Block& B, int il, int n);
     /// lin() of an F32 matrix, a prompt batch through cuBLAS's SGEMM.
     void lin_f32(const Dev& w, const float* x, float* y, int n);
+    /// lin_f32() of an F32 matrix or of a BF16 one of exact F32 values, with the F32 one's bits: a few tokens through
+    /// ink_gemv_bf16(), other calls widened into wf_ for lin_f32().
+    void lin_exact(const Dev& w, const float* x, float* y, int n);
 
     std::vector<Block> blocks_;
     std::vector<uint8_t> swa_;

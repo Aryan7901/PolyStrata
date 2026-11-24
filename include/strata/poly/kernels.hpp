@@ -554,9 +554,11 @@ bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out,
 bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out,
                        int rows, void* stream);
 /// ink_gemv_f32() of a BF16 matrix whose values are F32 ones cut exactly (Engine::exact_bf16()): each weight widened by
-/// a shift, then ink_gemv_f32()'s kernel, products and sums, so the same bits as on the F32 matrix.  false (nothing
-/// done) where ink_gemv_f32() takes another kernel (n_in under 512) or for other shapes.
+/// a shift, then the kernel ink_gemv_f32() takes for the shape, with its products and sums, so the same bits as on the
+/// F32 matrix; false (nothing done) where ink_gemv_f32() would be.  _jobs: ink_gemv_f32_jobs()'s.
 bool ink_gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream);
+bool ink_gemv_bf16_jobs(const uint16_t* const* w, const float* const* x, float* const* y, int jobs, int n_in,
+                        int n_out, int rows, void* stream);
 /// The loop's message controllers after their first product, up to 4 in one launch: job j's g and f = w[j] h[j] (w:
 /// 2n rows of n_in, gain then forget; h: n_in values a row), then out[j] = ink_gate()'s (1 - tanh(f)) * cur[j] +
 /// tanh(g) * msg[j] (n values a row; cur and msg rows cur_stride and msg_stride apart; out n apart; out may be cur).
@@ -565,6 +567,10 @@ bool ink_gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_
 bool ink_gate_gemv(const float* const* w, const float* const* h, const float* const* cur, int cur_stride,
                    const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
                    void* stream);
+/// ink_gate_gemv() of BF16 matrices whose values are F32 ones cut exactly: the same kernel and bits.
+bool ink_gate_gemv_bf16(const uint16_t* const* w, const float* const* h, const float* const* cur, int cur_stride,
+                        const float* const* msg, int msg_stride, float* const* out, int jobs, int n_in, int n, int rows,
+                        void* stream);
 /// For each of `rows` rows of approximate logits (n of them, stride apart): the indices within `margin` of the row's
 /// largest into ids (cap a row; more are left out) and how many matched into count[row] (it may pass cap).
 /// scratch: ink_shortlist_floats(rows) floats.
