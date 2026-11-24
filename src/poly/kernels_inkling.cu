@@ -328,11 +328,14 @@ mix_few_kernel(const float* r, int r_stride, InkStates s, const float* query,
 constexpr int GEMV_ROWS = 8;
 constexpr int GEMV_JOBS = 4;
 
-struct GemvJobs {
-    const float* w[GEMV_JOBS];
+// W: float, or uint16_t for a BF16 matrix whose values are F32 ones cut exactly (Engine::exact_bf16())
+template <class W>
+struct GemvJobsT {
+    const W* w[GEMV_JOBS];
     const float* x[GEMV_JOBS];
     float* y[GEMV_JOBS];
 };
+using GemvJobs = GemvJobsT<float>;
 
 // a[j] of a kernel parameter's array: a select, where a[j] would copy the parameters to local memory to index them
 template <class T>
@@ -340,21 +343,29 @@ __device__ __forceinline__ T pick(const T (&a)[GEMV_JOBS], int j) {
     return j == 0 ? a[0] : j == 1 ? a[1] : j == 2 ? a[2] : a[3];
 }
 
-template <int R>
-__global__ void gemv_wide_kernel(GemvJobs jobs, int n_in, int n_out) {
+// Four weights as floats: as stored, or BF16 widened by a shift (the low 16 bits zero), the same values
+__device__ __forceinline__ float4 load_w4(const float* p) { return *(const float4*) p; }
+__device__ __forceinline__ float4 load_w4(const uint16_t* p) {
+    const uint2 u = *(const uint2*) p;   // p[0] in u.x's low half, p[1] in its high half
+    return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u), __uint_as_float(u.y << 16),
+                       __uint_as_float(u.y & 0xffff0000u));
+}
+
+template <int R, class W>
+__global__ void gemv_wide_kernel(GemvJobsT<W> jobs, int n_in, int n_out) {
     pdl_trigger();   // PDL (pdl.hpp): the next launch may start; nothing is read or written before the wait
     pdl_wait();
     __shared__ float red[R][8];
-    const float* w = pick(jobs.w, blockIdx.y);
+    const W* w = pick(jobs.w, blockIdx.y);
     const float* x = pick(jobs.x, blockIdx.y);
     float* y = pick(jobs.y, blockIdx.y);
     const int o = blockIdx.x;
-    const float* wr = w + (size_t) o * n_in;
+    const W* wr = w + (size_t) o * n_in;
     float acc[R];
 #pragma unroll
     for (int r = 0; r < R; ++r) acc[r] = 0.f;
     for (int i = threadIdx.x * 4; i < n_in; i += blockDim.x * 4) {
-        const float4 wv = *(const float4*) (wr + i);
+        const float4 wv = load_w4(wr + i);
 #pragma unroll
         for (int r = 0; r < R; ++r) {
             const float4 xv = *(const float4*) (x + (size_t) r * n_in + i);
@@ -3069,10 +3080,25 @@ bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* cons
     const cudaStream_t st = cs(stream);
     by_rows(rows, [&](auto rr) {
         constexpr int R = decltype(rr)::value;
-        if (n_in >= 512) launch_pdl(gemv_wide_kernel<R>, dim3(dim3(n_out, jobs)), dim3(256), 0, st, J, n_in, n_out);
+        if (n_in >= 512)
+            launch_pdl(gemv_wide_kernel<R, float>, dim3(dim3(n_out, jobs)), dim3(256), 0, st, J, n_in, n_out);
         else launch_pdl(gemv_short_kernel<R>, dim3(dim3(grid(n_out, 8), jobs)), dim3(8 * WARP), 0, st, J, n_in, n_out);
     });
     ck("ink_gemv_f32");
+    return true;
+}
+
+// ink_gemv_f32()'s wide kernel on the widened weights: the same launch, products and sums, so the same bits
+bool ink_gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream) {
+    if (rows < 1 || rows > GEMV_ROWS || n_in % 4 != 0 || n_in < 512) return false;
+    GemvJobsT<uint16_t> J{};
+    J.w[0] = w, J.x[0] = x, J.y[0] = y;
+    const cudaStream_t st = cs(stream);
+    by_rows(rows, [&](auto rr) {
+        constexpr int R = decltype(rr)::value;
+        launch_pdl(gemv_wide_kernel<R, uint16_t>, dim3(dim3(n_out, 1)), dim3(256), 0, st, J, n_in, n_out);
+    });
+    ck("ink_gemv_bf16");
     return true;
 }
 

@@ -60,6 +60,9 @@ protected:
     bool route_card(int il, int n, int32_t* ids, float* w) override;
     void moe_shared(const Layer& L, int il, int n) override;
     void router_scores(const Layer& L, int n) override;
+    // Both Unsloth files keep the routers (ffn_gate_inp, 28 MB) as F32 of BF16 values: as BF16 a token reads half of
+    // their bytes and gets the same scores.  INK_ROUTER_BF16=0 keeps them F32.
+    bool router_bf16() const override;
     void finish_logits(float* logits, int rows) override;
     void output_logits(const float* h, float* logits, int rows) override;
     bool output_in_vram() const override { return !head_short_; }

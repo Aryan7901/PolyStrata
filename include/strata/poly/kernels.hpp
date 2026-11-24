@@ -553,6 +553,10 @@ bool ink_gemv_f32(const float* w, const float* x, float* y, int n_in, int n_out,
 /// Up to 4 ink_gemv_f32()s of one shape in one launch, job j's w[j] x[j] into y[j]: each the same sums as alone.
 bool ink_gemv_f32_jobs(const float* const* w, const float* const* x, float* const* y, int jobs, int n_in, int n_out,
                        int rows, void* stream);
+/// ink_gemv_f32() of a BF16 matrix whose values are F32 ones cut exactly (Engine::exact_bf16()): each weight widened by
+/// a shift, then ink_gemv_f32()'s kernel, products and sums, so the same bits as on the F32 matrix.  false (nothing
+/// done) where ink_gemv_f32() takes another kernel (n_in under 512) or for other shapes.
+bool ink_gemv_bf16(const uint16_t* w, const float* x, float* y, int n_in, int n_out, int rows, void* stream);
 /// The loop's message controllers after their first product, up to 4 in one launch: job j's g and f = w[j] h[j] (w:
 /// 2n rows of n_in, gain then forget; h: n_in values a row), then out[j] = ink_gate()'s (1 - tanh(f)) * cur[j] +
 /// tanh(g) * msg[j] (n values a row; cur and msg rows cur_stride and msg_stride apart; out n apart; out may be cur).

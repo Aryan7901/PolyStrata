@@ -1198,8 +1198,34 @@ void Inkling2::lin_f32(const Dev& w, const float* x, float* y, int n) {
     lin(w, x, y, n);
 }
 
-// The router's F32 matrix on the experts' input; a prompt batch's through SGEMM.
-void Inkling2::router_scores(const Layer& L, int n) { lin_f32(L.gate_inp, xn_, rl_, n); }
+bool Inkling2::router_bf16() const {
+    static const bool on = [] {
+        const char* e = std::getenv("INK_ROUTER_BF16");
+        return !(e && std::atoi(e) == 0);
+    }();
+    // a call of 9 to 31 tokens widens the router into wf_, which shared_scratch() gives only a scratch of kStageRows
+    // rows or more (rows_ as it will be set)
+    const int rows = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
+    return on && (rows <= 8 || rows >= kStageRows);
+}
+
+// The router's matrix on the experts' input; a prompt batch's through SGEMM.  A BF16 router (router_bf16(): its F32
+// values cut exactly) gives the F32 one's bits: a few tokens through ink_gemv_bf16(), ink_gemv_f32()'s kernel on the
+// widened weights, and other calls widen it into floats (lin()'s wf_) for the F32 way.
+void Inkling2::router_scores(const Layer& L, int n) {
+    const Dev& w = L.gate_inp;
+    if (w.type != kTypeBF16) return lin_f32(w, xn_, rl_, n);
+    if (n < kStageRows && w.scale == 1.0f &&
+        ink_gemv_bf16((const uint16_t*) w.p, xn_, rl_, w.n_in, w.n_out, n, st_))
+        return;
+    const size_t count = (size_t) w.n_in * (size_t) w.n_out;
+    if (!wf_ || count > bf16_max_) throw std::logic_error("a BF16 router without room to widen it");
+    bf16_to_f32((const uint16_t*) w.p, wf_, count, st_);
+    Dev f = w;
+    f.p = wf_;
+    f.type = kTypeF32;
+    lin_f32(f, xn_, rl_, n);
+}
 
 void Inkling2::moe_shared(const Layer&, int, int n) {
     ck(cudaMemsetAsync(fo_, 0, (size_t) n * n_embd_ * sizeof(float), cs(st_)), "experts");

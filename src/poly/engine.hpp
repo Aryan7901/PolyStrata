@@ -491,6 +491,10 @@ protected:
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
     /// experts' input (xn_).
     virtual void router_scores(const Layer& L, int n);
+    /// The router (ffn_gate_inp) goes to VRAM as BF16 when its F32 values are all BF16 ones (upload()'s kExactBF16):
+    /// the same values in half the bytes.  An engine that says true computes router_scores() of such a router with
+    /// the F32 one's sums.  false (the default): as its file has it.
+    virtual bool router_bf16() const { return false; }
     /// What is done to `rows` rows of logits on the card before they are copied out.
     virtual void finish_logits(float* logits, int rows) { (void) logits, (void) rows; }
     /// Whether every token of a call needs the model's output (outputs()), and not only the last one's.
@@ -584,7 +588,11 @@ protected:
     float* pass_rows(int n);
     /// kGuessMat: quantized again to Q4_0, for a matrix only guesses are made with: a guess is checked, so a less
     /// exact one costs a wrong guess now and then and no token.
-    enum Want { kF32, kFloatMat, kAnyMat, kGuessMat };
+    /// kExactBF16: an F32 tensor all of whose values are BF16 ones (exact_bf16()) goes to VRAM as BF16, the same
+    /// values in half the bytes; any other as kAnyMat.
+    enum Want { kF32, kFloatMat, kAnyMat, kGuessMat, kExactBF16 };
+    /// The tensor is F32 and every value of it is a BF16 one (its low 16 bits are zero).
+    bool exact_bf16(const TensorInfo* t) const;
     Dev upload(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
                float (*fix)(float) = nullptr);
     Dev upload_as(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
