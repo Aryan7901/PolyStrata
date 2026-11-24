@@ -1591,9 +1591,64 @@ constexpr int PL_REL = ATT_REL + 1;    // a row's relative terms in shared memor
 // windowed runs (INK_PF_LONG=N changes it, 0: never); a shorter prompt's sums stay prefill_kernel's, bit for bit
 constexpr int64_t kPfLongFrom = 4096;
 
-template <int G>
+// INK_PF_I8=1 (a Q8_0 key cache: q8_0, k8v4): the scores' products on the int8 tensor cores (mma m16n8k32, s32 sums),
+// as SageAttention does them.  A query row is quantized to int8 with one scale (its largest value over 127), and a
+// tile's keys are quantized again from their four 32-value blocks to one scale a key (the largest of the four): a
+// score is the integer product times the two scales.  Not the fp16 kernel's sums: it moves the answers a little.
+// Measured (RTX 5060 Laptop, UD-IQ4_XS, k8v4): a full-attention batch of 1,024 tokens at ~80K positions 373 -> 311 ms,
+// a prompt read ~6% faster there; KL over 200 forced tokens within the engine's own run-to-run spread at 39K and 102K.
+constexpr int PL_LDI = ATT_DIM + 16;   // an int8 row in shared memory, in bytes: off the banks for ldmatrix
+// INK_PF_PV8=1 (a 4-bit value cache: k8v4): the values' product on the fp8 tensor cores (mma m16n8k32 e4m3, f32
+// sums), after SageAttention2.  A value is (code - 8) * its block's scale, and the codes, -8 to 7, are exact in e4m3:
+// the tile goes to shared memory as codes, transposed (a dimension a row of PL_KEYS positions, PV_LD bytes), and each
+// block's scale is folded into the probabilities instead.  For each 32-value block of the head, a row's
+// probabilities times the positions' scales are rounded to e4m3 at the row's own scale (its largest over 448), and
+// the tile's product is added in at that scale (a sum a tile, rescaled).  Rounding the probabilities to e4m3 moves
+// the answers a little.  SLOWER as it stands, an experiment: 373 -> 418 ms a batch at ~80K (and with INK_PF_I8, 374):
+// the four blocks' operands and their rescaling, and the byte-wise transposed tile, cost more on the CUDA cores than
+// the halved tensor work saves.  One scale a tile for the values would cut that, at the price of rounding them too.
+constexpr int PV_LD = PL_KEYS + 16;    // an fp8 row of the transposed value tile, in bytes: off the banks for ldmatrix
+
+template <int G, bool I8 = false, bool PV8 = false>
 constexpr size_t prefill_long_smem() {
-    return sizeof(__half) * (size_t) (PF_TOKENS * G + 2 * PL_KEYS) * PF_LD + sizeof(float) * (size_t) PF_TOKENS * G * PL_REL;
+    const size_t R = (size_t) PF_TOKENS * G;
+    const size_t q = I8 ? R * PL_LDI : sizeof(__half) * R * PF_LD;
+    const size_t k = I8 ? (size_t) PL_KEYS * PL_LDI : sizeof(__half) * (size_t) PL_KEYS * PF_LD;
+    const size_t v = PV8 ? (size_t) ATT_DIM * PV_LD + sizeof(float) * PL_KEYS * (ATT_DIM / 32)
+                         : sizeof(__half) * (size_t) PL_KEYS * PF_LD;
+    return q + k + v + sizeof(float) * (R * PL_REL + (I8 ? R + PL_KEYS : 0));
+}
+
+// Four floats as e4m3 bytes, a in the lowest (cvt.e4m3x2 puts its first operand in the upper byte)
+__device__ __forceinline__ uint32_t e4m3x4(float a, float b, float c, float d) {
+    uint16_t lo, hi;
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(lo) : "f"(b), "f"(a));
+    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;\n" : "=h"(hi) : "f"(d), "f"(c));
+    return (uint32_t) lo | (uint32_t) hi << 16;
+}
+
+// c += a b, e4m3 in and f32 sums (m16n8k32's layouts)
+__device__ __forceinline__ void mma16832_e4m3(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// The column of the A operand (and row of B) a tile position k takes: m16n8k32's A wants a thread's four
+// consecutive columns, which the score fragments it has hold as two pairs 8 apart; the product's sum does not mind
+// the order.  k = h*16 + nt*8 + q*2 + e  ->  h*16 + q*4 + nt*2 + e.
+__device__ __forceinline__ int pv_col(int k) {
+    const int h = k / 16, nt = (k % 16) / 8, q = (k % 8) / 2, e = k % 2;
+    return h * 16 + q * 4 + nt * 2 + e;
+}
+
+// c += a b, int8 in and int32 sums: a the 16 x 32 A fragment, b0 b1 the 32 x 8 B one (m16n8k32's layouts)
+__device__ __forceinline__ void mma16832_s8(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
 // 16 values of a cache row as read: Q8_0 codes (or 4-bit codes, in a.x and a.y) and their block's scale (bits), or
@@ -1616,21 +1671,37 @@ __device__ __forceinline__ void deq4(uint32_t x, __half2 d, uint32_t& lo, uint32
     hi = *(const uint32_t*) &hb;
 }
 
-template <int G, int KF, int VF>
+template <int G, int KF, int VF, bool I8 = false, bool PV8 = false>
 __global__ void __launch_bounds__(2 * G * WARP, G <= 3 ? 2 : 1)
 prefill_long_kernel(const float* __restrict__ q, int q_stride, const void* __restrict__ kcache,
                     const void* __restrict__ vcache, const uint16_t* __restrict__ ksc, const uint16_t* __restrict__ vsc,
                     const float* __restrict__ rel, int rel_stride, const float* __restrict__ table, int n_rel,
                     int extent, const float* __restrict__ sink, float* __restrict__ out, int heads, int kv_heads,
                     float scale, int64_t pos, int rows, int window, int ring) {
+    static_assert(!I8 || KF == KV8, "int8 scores take a Q8_0 key cache");
+    static_assert(!PV8 || VF == KV4, "fp8 values take a 4-bit value cache");
     constexpr int R = PF_TOKENS * G, NT = 2 * G * WARP, KT = PL_KEYS;
     constexpr int PIECES = 2 * KT * (ATT_DIM / 16);   // a tile's 16-value pieces: its keys', then its values'
     constexpr int PER = (PIECES + NT - 1) / NT;
     extern __shared__ __align__(16) unsigned char pl_smem[];
-    __half* qs = (__half*) pl_smem;          // R * PF_LD
-    __half* ks = qs + R * PF_LD;             // KT * PF_LD
-    __half* vs = ks + KT * PF_LD;            // KT * PF_LD
-    float* rs = (float*) (vs + KT * PF_LD);  // R * PL_REL
+    // The query rows (fp16: qs, PF_LD halves a row; I8: qi, PL_LDI bytes), the tile's keys (ks or ki), its values
+    // (fp16: vs, PF_LD halves a position; PV8: vt, PV_LD bytes a dimension, then vsd, a position's block scales), rs,
+    // and with I8 sqs (a query row's scale) and skr (a tile key's scale).  Both off: prefill_kernel's layout.
+    unsigned char* sp = pl_smem;
+    __half* qs = (__half*) sp;
+    int8_t* qi = (int8_t*) sp;
+    sp += I8 ? R * PL_LDI : sizeof(__half) * R * PF_LD;
+    __half* ks = (__half*) sp;
+    int8_t* ki = (int8_t*) sp;
+    sp += I8 ? KT * PL_LDI : sizeof(__half) * KT * PF_LD;
+    __half* vs = (__half*) sp;
+    uint8_t* vt = (uint8_t*) sp;
+    float* vsd = (float*) (sp + ATT_DIM * PV_LD);
+    sp += PV8 ? ATT_DIM * PV_LD + sizeof(float) * KT * (ATT_DIM / 32) : sizeof(__half) * KT * PF_LD;
+    float* rs = (float*) sp;                                                            // R * PL_REL
+    float* sqs = rs + R * PL_REL;                                                       // R (I8)
+    float* skr = sqs + R;                                                               // KT (I8)
+    (void) qs, (void) ks, (void) qi, (void) ki, (void) sqs, (void) skr, (void) vs, (void) vt, (void) vsd;
     const int kvh = blockIdx.x, t0 = blockIdx.y * PF_TOKENS;
     const int warp = threadIdx.x / WARP, lane = threadIdx.x % WARP;
     const size_t kv_row = (size_t) kv_heads * ATT_DIM;
@@ -1639,7 +1710,26 @@ prefill_long_kernel(const float* __restrict__ q, int q_stride, const void* __res
     const int64_t lo = window > 0 ? max((int64_t) 0, pos + t0 - window + 1) : 0;
     const bool whole = t_end - t0 == PF_TOKENS;
 
-    for (int i = threadIdx.x; i < R * ATT_DIM; i += NT) {
+    if constexpr (I8) {   // a warp a query row at a time: its largest value, then its codes (four a lane)
+        for (int r = warp; r < R; r += NT / WARP) {
+            const int g = r / PF_TOKENS, t = t0 + r % PF_TOKENS, h = kvh * G + g;
+            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+            if (t < rows) {
+                v = *(const float4*) (q + (size_t) t * q_stride + (size_t) h * ATT_DIM + lane * 4);
+                v.x *= scale, v.y *= scale, v.z *= scale, v.w *= scale;
+            }
+            float m = fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fmaxf(fabsf(v.z), fabsf(v.w)));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+            const float sq = m > 0.f ? m / 127.f : 1.f, inv = 1.f / sq;
+            const int c0 = __float2int_rn(v.x * inv), c1 = __float2int_rn(v.y * inv);
+            const int c2 = __float2int_rn(v.z * inv), c3 = __float2int_rn(v.w * inv);
+            *(uint32_t*) (qi + r * PL_LDI + lane * 4) =
+                (uint32_t) (c0 & 0xff) | (uint32_t) (c1 & 0xff) << 8 | (uint32_t) (c2 & 0xff) << 16 | (uint32_t) (c3 & 0xff) << 24;
+            if (lane == 0) sqs[r] = sq;
+        }
+    }
+    for (int i = threadIdx.x; i < (I8 ? 0 : R * ATT_DIM); i += NT) {
         const int r = i / ATT_DIM, d = i % ATT_DIM, g = r / PF_TOKENS, t = t0 + r % PF_TOKENS, h = kvh * G + g;
         const float v = t < rows ? q[(size_t) t * q_stride + (size_t) h * ATT_DIM + d] * scale : 0.f;
         qs[r * PF_LD + d] = __float2half(v);
@@ -1669,6 +1759,14 @@ prefill_long_kernel(const float* __restrict__ q, int q_stride, const void* __res
                     } else if (f == KV8) {
                         pc[i].a = *(const uint4*) ((const int8_t*) (side ? vcache : kcache) + at);
                         pc[i].d = (side ? vsc : ksc)[at / 32];
+                        if (I8 && !side) {   // the key's largest block scale, its one scale as int8 (float bits)
+                            const uint2 s4 = *(const uint2*) (ksc + (at - col) / 32);
+                            const float m = fmaxf(fmaxf(__half2float(__ushort_as_half((unsigned short) s4.x)),
+                                                        __half2float(__ushort_as_half((unsigned short) (s4.x >> 16)))),
+                                                  fmaxf(__half2float(__ushort_as_half((unsigned short) s4.y)),
+                                                        __half2float(__ushort_as_half((unsigned short) (s4.y >> 16)))));
+                            pc[i].b.x = __float_as_uint(m);
+                        }
                     } else {
                         const uint4* p = (const uint4*) ((const uint16_t*) (side ? vcache : kcache) + at);
                         pc[i].a = p[0];
@@ -1684,6 +1782,43 @@ prefill_long_kernel(const float* __restrict__ q, int q_stride, const void* __res
             const int c = threadIdx.x + i * NT;
             if (c < PIECES) {
                 const int side = c / (KT * 8), w = c % (KT * 8), k = w / 8, col = (w % 8) * 16;
+                if (I8 && !side) {   // the key's 16 codes again at its one scale: code * (block scale / key scale)
+                    const float sk = __uint_as_float(pc[i].b.x);
+                    const float fct = sk > 0.f ? __half2float(__ushort_as_half((unsigned short) pc[i].d)) / sk : 0.f;
+                    const uint32_t in[4] = {pc[i].a.x, pc[i].a.y, pc[i].a.z, pc[i].a.w};
+                    uint32_t o4[4];
+#pragma unroll
+                    for (int wd = 0; wd < 4; ++wd) {
+                        uint32_t packed = 0;
+#pragma unroll
+                        for (int b = 0; b < 4; ++b) {
+                            const int code = (int) (int8_t) (in[wd] >> (8 * b));
+                            const int r = max(-127, min(127, __float2int_rn((float) code * fct)));
+                            packed |= (uint32_t) (r & 0xff) << (8 * b);
+                        }
+                        o4[wd] = packed;
+                    }
+                    *(uint4*) (ki + k * PL_LDI + col) = make_uint4(o4[0], o4[1], o4[2], o4[3]);
+                    if (col == 0) skr[k] = sk;
+                    continue;
+                }
+                if (PV8 && side) {   // the position's 16 codes, as e4m3, down its column of the transposed tile
+                    const int pc_ = pv_col(k);
+#pragma unroll
+                    for (int wd = 0; wd < 2; ++wd) {
+                        const uint32_t x = wd ? pc[i].a.y : pc[i].a.x;   // values 2m and 2m + 1: nibbles m and m + 4
+                        float cv[8];
+#pragma unroll
+                        for (int e = 0; e < 8; ++e) cv[e] = (float) ((int) ((x >> (4 * (e / 2 + (e % 2) * 4))) & 15u) - 8);
+                        const uint32_t lo = e4m3x4(cv[0], cv[1], cv[2], cv[3]), hi = e4m3x4(cv[4], cv[5], cv[6], cv[7]);
+#pragma unroll
+                        for (int e = 0; e < 8; ++e)
+                            vt[(col + wd * 8 + e) * PV_LD + pc_] = (uint8_t) ((e < 4 ? lo : hi) >> (8 * (e % 4)));
+                    }
+                    if (col % 32 == 0)
+                        vsd[k * (ATT_DIM / 32) + col / 32] = __half2float(__ushort_as_half((unsigned short) pc[i].d));
+                    continue;
+                }
                 __half* dst = (side ? vs : ks) + k * PF_LD + col;
                 const int f = side ? VF : KF;
                 if (f == KV4) {
@@ -1729,18 +1864,45 @@ prefill_long_kernel(const float* __restrict__ q, int q_stride, const void* __res
         __syncthreads();
         if (kb + KT < hi) fetch(kb + KT);
         float s[KT / 8][4];
+        if constexpr (I8) {   // the integer products of the four 32-value slices, then times the row's and key's scales
+            int si[KT / 8][4];
 #pragma unroll
-        for (int nt = 0; nt < KT / 8; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+            for (int nt = 0; nt < KT / 8; ++nt) si[nt][0] = si[nt][1] = si[nt][2] = si[nt][3] = 0;
 #pragma unroll
-        for (int j = 0; j < ATT_DIM / 16; ++j) {   // a score's slices in prefill_kernel's order
-            uint32_t qa[4];
-            ldsm_x4(qa[0], qa[1], qa[2], qa[3], qs + (row0 + lane % 16) * PF_LD + j * 16 + (lane / 16) * 8);
+            for (int j = 0; j < ATT_DIM / 32; ++j) {
+                uint32_t qa[4];
+                ldsm_x4(qa[0], qa[1], qa[2], qa[3], qi + (row0 + lane % 16) * PL_LDI + j * 32 + (lane / 16) * 16);
 #pragma unroll
-            for (int np = 0; np < KT / 16; ++np) {
-                uint32_t b0, b1, b2, b3;
-                ldsm_x4(b0, b1, b2, b3, ks + (np * 16 + (lane / 16) * 8 + lane % 8) * PF_LD + j * 16 + ((lane / 8) % 2) * 8);
-                mma16816(s[2 * np], qa, b0, b1);
-                mma16816(s[2 * np + 1], qa, b2, b3);
+                for (int np = 0; np < KT / 16; ++np) {
+                    uint32_t b0, b1, b2, b3;
+                    ldsm_x4(b0, b1, b2, b3, ki + (np * 16 + (lane / 16) * 8 + lane % 8) * PL_LDI + j * 32 + ((lane / 8) % 2) * 16);
+                    mma16832_s8(si[2 * np], qa, b0, b1);
+                    mma16832_s8(si[2 * np + 1], qa, b2, b3);
+                }
+            }
+            const float sqa = sqs[row0 + lane / 4], sqb = sqs[row0 + lane / 4 + 8];
+#pragma unroll
+            for (int nt = 0; nt < KT / 8; ++nt)
+#pragma unroll
+                for (int e1 = 0; e1 < 2; ++e1) {
+                    const float kk = skr[nt * 8 + (lane % 4) * 2 + e1];
+                    s[nt][e1] = (float) si[nt][e1] * (sqa * kk);
+                    s[nt][2 + e1] = (float) si[nt][2 + e1] * (sqb * kk);
+                }
+        } else {
+#pragma unroll
+            for (int nt = 0; nt < KT / 8; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+#pragma unroll
+            for (int j = 0; j < ATT_DIM / 16; ++j) {   // a score's slices in prefill_kernel's order
+                uint32_t qa[4];
+                ldsm_x4(qa[0], qa[1], qa[2], qa[3], qs + (row0 + lane % 16) * PF_LD + j * 16 + (lane / 16) * 8);
+#pragma unroll
+                for (int np = 0; np < KT / 16; ++np) {
+                    uint32_t b0, b1, b2, b3;
+                    ldsm_x4(b0, b1, b2, b3, ks + (np * 16 + (lane / 16) * 8 + lane % 8) * PF_LD + j * 16 + ((lane / 8) % 2) * 8);
+                    mma16816(s[2 * np], qa, b0, b1);
+                    mma16816(s[2 * np + 1], qa, b2, b3);
+                }
             }
         }
         const bool fast = window <= 0 && whole && (pos + t0) - (kb + KT - 1) >= extent;
@@ -1833,16 +1995,61 @@ prefill_long_kernel(const float* __restrict__ q, int q_stride, const void* __res
                 o[dn][3] *= cb;
             }
         }
+        if constexpr (PV8) {   // a 32-value block of the head at a time: its own A operand and scale
+            static_assert(KT == 32, "a tile is one k32 step");
 #pragma unroll
-        for (int j = 0; j < KT / 16; ++j) {
-            const uint32_t pa_[4] = {pack_h2(s[2 * j][0], s[2 * j][1]), pack_h2(s[2 * j][2], s[2 * j][3]),
-                                     pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]), pack_h2(s[2 * j + 1][2], s[2 * j + 1][3])};
+            for (int gb = 0; gb < ATT_DIM / 32; ++gb) {
+                float pa[8], pb[8];   // this thread's positions nt * 8 + (lane % 4) * 2 + e1, as nt * 2 + e1
+                float mpa = 0.f, mpb = 0.f;
 #pragma unroll
-            for (int dn = 0; dn < ATT_DIM / 8; dn += 2) {
-                uint32_t b0, b1, b2, b3;
-                ldsm_x4_t(b0, b1, b2, b3, vs + (j * 16 + lane % 16) * PF_LD + (dn + lane / 16) * 8);
-                mma16816(o[dn], pa_, b0, b1);
-                mma16816(o[dn + 1], pa_, b2, b3);
+                for (int nt = 0; nt < KT / 8; ++nt)
+#pragma unroll
+                    for (int e1 = 0; e1 < 2; ++e1) {
+                        const float dv = vsd[(nt * 8 + (lane % 4) * 2 + e1) * (ATT_DIM / 32) + gb];
+                        pa[nt * 2 + e1] = s[nt][e1] * dv;
+                        pb[nt * 2 + e1] = s[nt][2 + e1] * dv;
+                        mpa = fmaxf(mpa, fabsf(pa[nt * 2 + e1]));
+                        mpb = fmaxf(mpb, fabsf(pb[nt * 2 + e1]));
+                    }
+                mpa = fmaxf(mpa, __shfl_xor_sync(0xffffffffu, mpa, 1));
+                mpa = fmaxf(mpa, __shfl_xor_sync(0xffffffffu, mpa, 2));
+                mpb = fmaxf(mpb, __shfl_xor_sync(0xffffffffu, mpb, 1));
+                mpb = fmaxf(mpb, __shfl_xor_sync(0xffffffffu, mpb, 2));
+                const float fa = mpa > 0.f ? 448.f / mpa : 0.f, fb = mpb > 0.f ? 448.f / mpb : 0.f;
+                const float ia = mpa / 448.f, ib = mpb / 448.f;
+                const uint32_t a[4] = {e4m3x4(pa[0] * fa, pa[1] * fa, pa[2] * fa, pa[3] * fa),
+                                       e4m3x4(pb[0] * fb, pb[1] * fb, pb[2] * fb, pb[3] * fb),
+                                       e4m3x4(pa[4] * fa, pa[5] * fa, pa[6] * fa, pa[7] * fa),
+                                       e4m3x4(pb[4] * fb, pb[5] * fb, pb[6] * fb, pb[7] * fb)};
+#pragma unroll
+                for (int dn = gb * 4; dn < gb * 4 + 4; dn += 2) {
+                    uint32_t b0, b1, b2, b3;
+                    ldsm_x4(b0, b1, b2, b3, vt + (dn * 8 + (lane / 16) * 8 + lane % 8) * PV_LD + ((lane / 8) % 2) * 16);
+                    float c0[4] = {0.f, 0.f, 0.f, 0.f}, c1[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma16832_e4m3(c0, a, b0, b1);
+                    mma16832_e4m3(c1, a, b2, b3);
+                    o[dn][0] += c0[0] * ia;
+                    o[dn][1] += c0[1] * ia;
+                    o[dn][2] += c0[2] * ib;
+                    o[dn][3] += c0[3] * ib;
+                    o[dn + 1][0] += c1[0] * ia;
+                    o[dn + 1][1] += c1[1] * ia;
+                    o[dn + 1][2] += c1[2] * ib;
+                    o[dn + 1][3] += c1[3] * ib;
+                }
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < KT / 16; ++j) {
+                const uint32_t pa_[4] = {pack_h2(s[2 * j][0], s[2 * j][1]), pack_h2(s[2 * j][2], s[2 * j][3]),
+                                         pack_h2(s[2 * j + 1][0], s[2 * j + 1][1]), pack_h2(s[2 * j + 1][2], s[2 * j + 1][3])};
+#pragma unroll
+                for (int dn = 0; dn < ATT_DIM / 8; dn += 2) {
+                    uint32_t b0, b1, b2, b3;
+                    ldsm_x4_t(b0, b1, b2, b3, vs + (j * 16 + lane % 16) * PF_LD + (dn + lane / 16) * 8);
+                    mma16816(o[dn], pa_, b0, b1);
+                    mma16816(o[dn + 1], pa_, b2, b3);
+                }
             }
         }
     }
@@ -2956,23 +3163,51 @@ void ink_attend(const float* q, int q_stride, const void* kcache, const void* vc
             return e ? (int64_t) std::atoll(e) : kPfLongFrom;
         }();
         const bool plong = long_from > 0 && pos + rows >= long_from;
+        // INK_PF_I8=1: the long kernel's scores on the int8 tensor cores where the keys are Q8_0; INK_PF_PV8=1: its
+        // values' product on the fp8 ones where the values are 4-bit (prefill_long_smem()).  Both off by default.
+        static const bool pf_i8 = [] {
+            const char* e = std::getenv("INK_PF_I8");
+            return e && std::atoi(e) == 1;
+        }();
+        static const bool pf_pv8 = [] {
+            const char* e = std::getenv("INK_PF_PV8");
+            return e && std::atoi(e) == 1;
+        }();
         const auto by_g = [&](bool use_long, float* dst) {
             by_g_kv([&](auto gq, auto kf, auto vf) {
                 constexpr int G = decltype(gq)::value, KF = decltype(kf)::value, VF = decltype(vf)::value;
+                // the long kernel with I8 and PV8 as asked, where the caches take them
+                const auto launch_long = [&](auto i8c, auto pv8c) {
+                    constexpr bool I8 = decltype(i8c)::value, PV8 = decltype(pv8c)::value;
+                    if constexpr ((!I8 || KF == KV8) && (!PV8 || VF == KV4)) {
+                        static bool raised_long = false;
+                        if (!raised_long) {
+                            cudaFuncSetAttribute(prefill_long_kernel<G, KF, VF, I8, PV8>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 (int) prefill_long_smem<G, I8, PV8>());
+                            cudaFuncSetAttribute(prefill_long_kernel<G, KF, VF, I8, PV8>,
+                                                 cudaFuncAttributePreferredSharedMemoryCarveout, cudaSharedmemCarveoutMaxShared);
+                            raised_long = true;
+                        }
+                        prefill_long_kernel<G, KF, VF, I8, PV8><<<gp, 2 * G * WARP, prefill_long_smem<G, I8, PV8>(), st>>>(
+                            q, q_stride, kcache, vcache, kscales, vscales, rel, rel_stride, table, n_rel, extent, sink,
+                            dst, heads, kv_heads, scale, pos, rows, window, ring);
+                    }
+                };
                 static bool raised = false;
                 if (!raised) {
                     cudaFuncSetAttribute(prefill_kernel<G, KF, VF>, cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
-                    cudaFuncSetAttribute(prefill_long_kernel<G, KF, VF>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                         (int) prefill_long_smem<G>());
-                    cudaFuncSetAttribute(prefill_long_kernel<G, KF, VF>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                                         cudaSharedmemCarveoutMaxShared);
                     raised = true;
                 }
-                if (use_long)
-                    prefill_long_kernel<G, KF, VF><<<gp, 2 * G * WARP, prefill_long_smem<G>(), st>>>(q, q_stride, kcache,
-                        vcache, kscales, vscales, rel, rel_stride, table, n_rel, extent, sink, dst, heads, kv_heads,
-                        scale, pos, rows, window, ring);
-                else
+                using T = std::true_type;
+                using F = std::false_type;
+                const bool i8 = pf_i8 && KF == KV8, pv8 = pf_pv8 && VF == KV4;
+                if (use_long) {
+                    if (i8 && pv8) launch_long(T{}, T{});
+                    else if (i8) launch_long(T{}, F{});
+                    else if (pv8) launch_long(F{}, T{});
+                    else launch_long(F{}, F{});
+                } else
                     prefill_kernel<G, KF, VF><<<gp, 2 * G * WARP, bytes, st>>>(q, q_stride, kcache, vcache, kscales,
                         vscales, rel, rel_stride, table, n_rel, extent, sink, dst, heads, kv_heads, scale, pos, rows,
                         window, ring);
