@@ -169,10 +169,18 @@ REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 
 
-def closed_with(text: str, think_end: str) -> str:
+INKLING_THOUGHT_END = "<|end_message|>"   # Inkling's thought is a message of its own; the next message is the model's
+
+
+def closed_with(text: str, think_end: str, inkling: bool = False) -> str:
     """REASONING_CLOSE or REASONING_WRAP_UP for a model whose thinking ends with think_end (OutputParser).  Gemma 4
     ends it with <channel|>, its answer right after: a </think> there is text inside the thought, and the model
-    thought on until max_tokens (Discussion 60)."""
+    thought on until max_tokens (Discussion 60).  Inkling 2 has no </think> either: its reasoning is a message,
+    <|content_thinking|> ... <|end_message|>, and the answer or a call is a message after it that the model opens
+    itself.  A </think> written there was text inside the thought: the parser took it as the end, the model thought
+    on, and the rest of the thought and the model's own end (as a literal </think>) reached the answer."""
+    if inkling:
+        return text.replace("\n" + THINK_END + "\n\n", INKLING_THOUGHT_END)
     return text if think_end == THINK_END else text.replace(THINK_END + "\n\n", think_end)
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
@@ -5238,7 +5246,8 @@ class Service:
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(closed_with(REASONING_CLOSE, parser.think_end), parse_special=True)
+                            extra = self.tok.encode(closed_with(REASONING_CLOSE, parser.think_end,
+                                                                parser.ink is not None), parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -5262,7 +5271,7 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = st["thinking_budget"] = None
-                            text = closed_with(REASONING_WRAP_UP, parser.think_end) + (force or "")
+                            text = closed_with(REASONING_WRAP_UP, parser.think_end, parser.ink is not None) + (force or "")
                         else:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                         force = None
